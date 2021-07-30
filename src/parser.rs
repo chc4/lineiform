@@ -30,6 +30,11 @@ pub enum BuiltIn {
   Divide,
   Equal,
   Not,
+  Let,
+  Set,
+  Get,
+  Do,
+  Loop,
 }
 
 /// We now wrap this type and a few other primitives into our Atom type.
@@ -38,9 +43,10 @@ pub enum BuiltIn {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Atom {
   Num(usize),
-  //Keyword(String),
+  Keyword(String),
   //Boolean(bool),
   BuiltIn(BuiltIn),
+  Unit,
 }
 
 /// The remaining half is Lists. We implement these as recursive Expressions.
@@ -70,21 +76,23 @@ pub enum Expr {
 /// we start by creating a parser for the built-in operator functions.
 fn parse_builtin_op<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'a str>> {
   // one_of matches one of the characters we give it
-  let (i, t) = one_of("+-*/=")(i)?;
-
-  // because we are matching single character tokens, we can do the matching logic
-  // on the returned value
-  Ok((
-    i,
-    match t {
-      '+' => BuiltIn::Plus,
-      '-' => BuiltIn::Minus,
-      '*' => BuiltIn::Times,
-      '/' => BuiltIn::Divide,
-      '=' => BuiltIn::Equal,
+  map(alt((tag("+"), tag("-"), tag("*"), tag("/"), tag("="),
+    tag("let"), tag("set"), tag("get"), tag("do"), tag("loop"))), |stem: &str|
+    // because we are matching single character tokens, we can do the matching logic
+    // on the returned value
+    match stem {
+      "+" => BuiltIn::Plus,
+      "-" => BuiltIn::Minus,
+      "*" => BuiltIn::Times,
+      "/" => BuiltIn::Divide,
+      "=" => BuiltIn::Equal,
+      "let" => BuiltIn::Let,
+      "set" => BuiltIn::Set,
+      "get" => BuiltIn::Get,
+      "do" => BuiltIn::Do,
+      "loop" => BuiltIn::Loop,
       _ => unreachable!(),
-    },
-  ))
+    })(i)
 }
 
 fn parse_builtin<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'a str>> {
@@ -112,12 +120,12 @@ fn parse_bool<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
 ///
 /// Put plainly: `preceded(tag(":"), cut(alpha1))` means that once we see the `:`
 /// character, we have to see one or more alphabetic chararcters or the input is invalid.
-//fn parse_keyword<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
-//  map(
-//    context("keyword", preceded(tag(":"), cut(alpha1))),
-//    |sym_str: &str| Atom::Keyword(sym_str.to_string()),
-//  )(i)
-//}
+fn parse_keyword<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
+  map(
+    context("keyword", preceded(tag(":"), cut(alpha1))),
+    |sym_str: &str| Atom::Keyword(sym_str.to_string()),
+  )(i)
+}
 
 /// Next up is number parsing. We're keeping it simple here by accepting any number (> 1)
 /// of digits but ending the program if it doesn't fit into an i32.
@@ -134,7 +142,7 @@ fn parse_atom<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
     parse_num,
     parse_bool,
     map(parse_builtin, Atom::BuiltIn),
-    //parse_keyword,
+    parse_keyword,
   ))(i)
 }
 

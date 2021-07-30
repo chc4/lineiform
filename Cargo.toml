@@ -11,6 +11,9 @@ nom = "7.0.0-alpha1"
 jemallocator = "0.3.2"
 thiserror = "1.0"
 enum-display-derive = "0.1.1"
+iced-x86 = "1.13.0"
+colored = "2.0.0"
+addr2line = "0.16.0"
 
 [profile.dev]
 opt-level = 1 # we use tailcalls a lot, which will blow the stack on O0
