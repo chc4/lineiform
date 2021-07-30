@@ -312,13 +312,13 @@ mod test {
         assert_eq!(compile_expr("
         (let :acc 1
         (let :i 0
-        (loop 100000 (do
+        (loop 10 (do
             (set :i (+ (get :i) 1))
             (if (= (get :i) 10)
                 (get :acc)
-            (set :acc (+ (get :acc) (get :i))))
+            (set :acc (* (get :acc) (get :i))))
         ))))
-        ")?(&mut Env::new())?, Atom::atom(2));
+        ")?(&mut Env::new())?, Atom::atom(362880));
         Ok(())
     }
 

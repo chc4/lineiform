@@ -13,7 +13,7 @@ thiserror = "1.0"
 enum-display-derive = "0.1.1"
 iced-x86 = "1.13.0"
 colored = "2.0.0"
-addr2line = "0.16.0"
+goblin = "0.4"
 
 [profile.dev]
 opt-level = 1 # we use tailcalls a lot, which will blow the stack on O0
