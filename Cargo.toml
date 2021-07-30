@@ -1,0 +1,23 @@
+[package]
+name = "simpl_calc"
+version = "0.1.0"
+authors = ["Charlie Cummings <chc4000@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nom = "7.0.0-alpha1"
+jemallocator = "0.3.2"
+thiserror = "1.0"
+enum-display-derive = "0.1.1"
+
+[profile.dev]
+opt-level = 1 # we use tailcalls a lot, which will blow the stack on O0
+
+[profile.release]
+lto = true
+debug = false
+opt-level = 3
+overflow-checks = true
+panic = "abort"
