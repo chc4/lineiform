@@ -1,6 +1,6 @@
 use thiserror::Error;
 use std::collections::HashMap;
-use crate::parser::{Atom, BuiltIn, Expr, parse_expr};
+use crate::parser::{Atom, BuiltIn, Expr, parse_expr, ListExpr};
 use std::error::Error as StdError;
 
 impl Atom {
@@ -75,7 +75,7 @@ pub enum CompileError {
     #[error("unknown data store error")]
     Unknown,
     #[error("couldn't compile quote expr {0}")]
-    QuoteCompile(crate::parser::ListExpr),
+    QuoteCompile(ListExpr),
 }
 pub fn compile_expr(src: &str) -> Result<ClosureExpr, CompileError> {
   parse_expr(src)
@@ -234,7 +234,18 @@ pub fn generate_closure(expr: Expr) -> Result<ClosureExpr, CompileError> {
                     },
                     _ => unimplemented!("unimplemented opcode {}", opcode)
                 },
+                box Expr::Quote(ref v) => {
+                    let v = v.clone();
+                    Ok(box move |e| {
+                        if let [head, body @ ..] = v.as_slice() {
+                            generate_closure(Expr::Application(box head.clone(), body.to_vec()))?(e)
+                        } else {
+                            Err(EvalError::DynamicFail(CompileError::QuoteCompile(ListExpr(v.to_vec()))))
+                        }
+                    })
+                },
                 box dynamic @ _ => {
+                    println!("??? {:?}", dynamic);
                     // We weren't able to build the closure from a constant expression
                     let op = generate_closure(*op.clone())?;
                     let args = args.clone().iter()
@@ -329,8 +340,7 @@ mod test {
         (let :f '(+ 1 2)
             ((get :f))
         )
-        ")?(&mut Env::new())?, Atom::atom(2));
+        ")?(&mut Env::new())?, Atom::atom(3));
         Ok(())
-
     }
 }
