@@ -39,10 +39,12 @@ pub enum BuiltIn {
 
 /// We now wrap this type and a few other primitives into our Atom type.
 /// Remember from before that Atoms form one half of our language.
+use std::num::Wrapping;
+pub type Int = Wrapping<usize>;
 
 #[derive(Debug, PartialEq, Clone, Display)]
 pub enum Atom {
-  Num(usize),
+  Num(Int),
   Keyword(String),
   //Boolean(bool),
   BuiltIn(BuiltIn),
@@ -72,7 +74,7 @@ pub enum Expr {
   Quote(Vec<Expr>),
 }
 impl Expr {
-    pub fn need_int(&mut self) -> Result<usize, crate::EvalError> {
+    pub fn need_int(&mut self) -> Result<Int, crate::EvalError> {
         match self {
             Expr::Constant(Atom::Num(u)) => Ok(*u),
             v => Err(crate::EvalError::TypeError("int", v._type()))
@@ -163,8 +165,8 @@ fn parse_builtin<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'a s
 /// Our boolean values are also constant, so we can do it the same way
 fn parse_bool<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
   alt((
-    map(tag("#t"), |_| Atom::Num(1)),
-    map(tag("#f"), |_| Atom::Num(0)),
+    map(tag("#t"), |_| Atom::Num(Wrapping(1))),
+    map(tag("#f"), |_| Atom::Num(Wrapping(0))),
   ))(i)
 }
 
@@ -185,7 +187,7 @@ fn parse_keyword<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>
 /// of digits but ending the program if it doesn't fit into an i32.
 fn parse_num<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
     map_res(digit1, |digit_str: &str| {
-      digit_str.parse::<usize>().map(Atom::Num)
+      digit_str.parse::<usize>().map(Wrapping).map(Atom::Num)
     })(i)
 }
 

@@ -1,10 +1,15 @@
 use thiserror::Error;
 use std::collections::HashMap;
-use crate::parser::{Atom, BuiltIn, Expr, parse_expr, ListExpr};
+use crate::parser::{self, Atom, BuiltIn, Expr, parse_expr, ListExpr};
 use std::error::Error as StdError;
+use std::num::Wrapping;
 
 impl Atom {
     fn atom(u: usize) -> Expr {
+        Expr::Constant(Atom::Num(Wrapping(u)))
+    }
+
+    fn atom_wrap(u: parser::Int) -> Expr {
         Expr::Constant(Atom::Num(u))
     }
 }
@@ -35,7 +40,7 @@ impl Env {
     }
 }
 
-pub trait ClosureFn = for<'a> Fn(&mut Env) -> Result<Expr, EvalError>;
+pub trait ClosureFn = Fn(&mut Env) -> Result<Expr, EvalError>;
 type ClosureFnPtr = *const (); // fn(&Self, &mut Env<'a>) -> Result<Atom, EvalError>
 pub(crate) type ClosureExpr = Box<
     dyn ClosureFn + Send + Sync,
@@ -92,7 +97,7 @@ pub fn generate_closure(expr: Expr) -> Result<ClosureExpr, CompileError> {
             let t = generate_closure(*t)?;
             let f = generate_closure(*f)?;
             Ok(box move |e| {
-                if cond(e)?.need_int()? == 0 {
+                if cond(e)?.need_int()? == Wrapping(0) {
                     f(e)
                 } else {
                     t(e)
@@ -124,7 +129,7 @@ pub fn generate_closure(expr: Expr) -> Result<ClosureExpr, CompileError> {
                             let x = generate_closure(x.clone())?;
                             let y = generate_closure(y.clone())?;
                             Ok(box move |e| {
-                                Ok(Atom::atom(
+                                Ok(Atom::atom_wrap(
                                         x(e)?.need_int()? + y(e)?.need_int()?
                                 ))
                             })
@@ -137,7 +142,7 @@ pub fn generate_closure(expr: Expr) -> Result<ClosureExpr, CompileError> {
                             let x = generate_closure(x.clone())?;
                             let y = generate_closure(y.clone())?;
                             Ok(box move |e| {
-                                Ok(Atom::atom(
+                                Ok(Atom::atom_wrap(
                                         x(e)?.need_int()? * y(e)?.need_int()?
                                 ))
                             })
@@ -150,7 +155,7 @@ pub fn generate_closure(expr: Expr) -> Result<ClosureExpr, CompileError> {
                             let x = generate_closure(x.clone())?;
                             let y = generate_closure(y.clone())?;
                             Ok(box move |e| {
-                                Ok(Atom::atom(
+                                Ok(Atom::atom_wrap(
                                         x(e)?.need_int()? / y(e)?.need_int()?
                                 ))
                             })
@@ -223,7 +228,7 @@ pub fn generate_closure(expr: Expr) -> Result<ClosureExpr, CompileError> {
                             Ok(box move |e| {
                                 let times = times(e)?.need_int()?;
                                 let mut v = Expr::Constant(Atom::Unit);
-                                for i in 0..times {
+                                for i in 0..times.0 {
                                     v = body(e)?;
                                 }
                                 Ok(v)

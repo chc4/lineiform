@@ -64,12 +64,19 @@ pub enum TracerError {
     Unsupported,
     #[error("can't find symbol for function {0:x}")]
     CantFindFunction(usize),
+    #[error("executable has no .needle section")]
+    NoNeedle,
 }
 
 use std::marker::PhantomPinned;
+use std::collections::HashMap;
+use std::sync::Arc;
 pub struct Tracer<'a> {
     buf: &'a [u8],
     elf: Elf<'a>,
+    base: Option<usize>,
+    /// Map for cacheing decompilation of functions
+    cache: HashMap<*const (), Arc<Vec<Instruction>>>,
     _pin: std::marker::PhantomPinned,
 }
 
@@ -92,51 +99,72 @@ impl<'a> Tracer<'a> {
         let mut t = Tracer {
             buf: buffer,
             elf: get_elf(buffer)?,
+            base: None,
+            cache: HashMap::new(),
             _pin: PhantomPinned,
         };
         Ok(t)
     }
 
     // It's either this or make everyone use a linker script, which sucks
-    pub fn get_base(&self) -> usize {
+    pub fn get_base(&mut self) -> Result<usize, TracerError> {
+        if let Some(b) = self.base {
+            return Ok(b);
+        }
         let needle = &NEEDLE as *const usize as usize;
         let needle_offset = self.elf.section_headers.iter()
             .filter(|section| {
                 let name = self.elf.shdr_strtab.get_at(section.sh_name);
                 name == Some(".needle")
-            }).next().unwrap().sh_addr as usize;
-        (needle - needle_offset)
+            }).next().ok_or(TracerError::NoNeedle)?.sh_addr as usize;
+        let base = needle - needle_offset;
+        self.base = Some(base);
+        Ok(base)
     }
 
     /// Get symbol for vaddr
-    fn get_symbol_from_vaddr(&self, f: usize) -> Option<Sym> {
+    pub fn get_symbol_from_vaddr(&self, f: usize) -> Option<Sym> {
         self.elf.syms.iter().filter(|sym|
             sym.st_value == (f as usize).try_into().unwrap()
         ).next()
     }
 
-    fn get_symbol_from_address(&self, f: *const ()) -> Option<Sym> {
-        let base = self.get_base();
-        let sym = self.get_symbol_from_vaddr(f as usize - base);
-        sym
+    /// Get symbol for address
+    pub fn get_symbol_from_address(&mut self, f: *const ()) -> Result<Sym, TracerError> {
+        let base = self.get_base()?;
+        let sym = self.get_symbol_from_vaddr(f as usize - base)
+            .ok_or(TracerError::CantFindFunction(f as usize))?;
+        Ok(sym)
     }
 
-    fn disassemble(&self, f: *const ()) -> Result<Vec<Instruction>, TracerError> {
-        let f_sym = self.get_symbol_from_address(f)
-            .ok_or(TracerError::CantFindFunction(f as usize))?;
+    pub fn disassemble(&mut self, f: *const ()) -> Result<Arc<Vec<Instruction>>, TracerError> {
+        let cache_hit = self.cache.get(&f);
+        if let Some(cache_hit) = cache_hit {
+            // Our function was in the cache - return our cached decompilation
+            return Ok(cache_hit.clone());
+        }
+        let f_sym = self.get_symbol_from_address(f)?;
         let mut decoder = Decoder::with_ip(
             if self.elf.is_64 { 64 } else { 32 },
-            &self.buf[f_sym.st_value as usize..(f_sym.st_value as usize+f_sym.st_size as usize)],
+            // We decode *from our own memory* instead of from the binary on disk
+            // in order to resolve PLT entries
+            unsafe {
+                core::slice::from_raw_parts(
+                    (self.base.unwrap()+(f_sym.st_value as usize)) as *const u8,
+                    f_sym.st_size as usize) as &[u8]
+            },
             f as u64, DecoderOptions::NONE);
 
         let mut all = Vec::with_capacity(f_sym.st_size as usize);
         for ins in &mut decoder {
             all.push(ins);
         }
-        Ok(all)
+        let entry = Arc::new(all);
+        self.cache.insert(f, entry.clone());
+        Ok(entry)
     }
 
-    fn format(&self, instructions: Vec<Instruction>) -> Result<(), TracerError> {
+    pub fn format(&self, instructions: &Vec<Instruction>) -> Result<(), TracerError> {
         let mut formatter = IntelFormatter::new();
         formatter.options_mut().set_first_operand_char_index(8);
         let mut output = MyFormatterOutput::new();
@@ -151,7 +179,6 @@ impl<'a> Tracer<'a> {
         }
         Ok(())
     }
-
 }
 
 fn get_elf<'a>(buf: &'a [u8]) -> Result<Elf<'a>, TracerError> {
@@ -172,34 +199,40 @@ fn get_color(s: &str, kind: FormatterTextKind) -> ColoredString {
     }
 }
 
+use core::hint::black_box;
+
+use core::num::Wrapping;
+#[inline(never)]
+pub fn mul_two(u: crate::parser::Int) -> crate::parser::Int {
+    u * Wrapping(2)
+}
+#[inline(never)]
+pub fn add_one(u: crate::parser::Int) -> crate::parser::Int {
+    mul_two(u + Wrapping(1)) + Wrapping(2)
+}
+
 #[cfg(test)]
 mod test {
     use crate::tracer::Tracer;
     use crate::tracer::TracerError;
-    use core::hint::black_box;
-
-    fn add_one(u: usize) -> usize {
-        black_box(u + 1) + 2
-    }
-
     #[test]
     fn can_find_base() -> Result<(), TracerError> {
-        assert_eq!(Tracer::new()?.get_base() != 0, true);
+        assert_eq!(Tracer::new()?.get_base()? != 0, true);
         Ok(())
     }
 
     #[test]
     fn can_resolve_function() -> Result<(), TracerError> {
         assert_eq!(Tracer::new()?.get_symbol_from_address(add_one as *const ())
-                   .is_some(), true);
+                   .is_ok(), true);
         Ok(())
     }
 
     #[test]
     fn can_disassemble_fn() -> Result<(), TracerError> {
-        let tracer = Tracer::new()?;
+        let mut tracer = Tracer::new()?;
         let instructions = tracer.disassemble(add_one as *const ())?;
-        tracer.format(instructions)?;
+        tracer.format(&instructions)?;
         Ok(())
     }
 }
