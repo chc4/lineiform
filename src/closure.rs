@@ -4,26 +4,8 @@ use crate::parser::{Atom, BuiltIn, Expr, parse_expr};
 use std::error::Error as StdError;
 
 impl Atom {
-    fn need_int(&mut self) -> Result<usize, EvalError> {
-        match self {
-            Atom::Num(u) => Ok(*u),
-            v => Err(EvalError::TypeError("int", v._type()))
-        }
-    }
-
-    fn need_keyword(&mut self) -> Result<String, EvalError> {
-        match self {
-            Atom::Keyword(u) => Ok(u.to_string()),
-            v => Err(EvalError::TypeError("keyword", v._type()))
-        }
-    }
-
-    fn _type(&self) -> &'static str {
-        match self {
-            Atom::Num(_) => "int",
-            Atom::BuiltIn(_) => "builtin",
-            _ => "unknown"
-        }
+    fn atom(u: usize) -> Expr {
+        Expr::Constant(Atom::Num(u))
     }
 }
 
@@ -37,10 +19,12 @@ pub enum EvalError {
     TypeError(&'static str, &'static str),
     #[error("runtime panic {0}")]
     Panic(&'static str),
+    #[error("compiling dynamic code failed: {0}")]
+    DynamicFail(#[from] CompileError),
 }
 
 pub struct Env {
-    pub variables: HashMap<String, Atom>,
+    pub variables: HashMap<String, Expr>,
 }
 
 impl Env {
@@ -51,7 +35,7 @@ impl Env {
     }
 }
 
-pub trait ClosureFn = for<'a> Fn(&mut Env) -> Result<Atom, EvalError>;
+pub trait ClosureFn = for<'a> Fn(&mut Env) -> Result<Expr, EvalError>;
 type ClosureFnPtr = *const (); // fn(&Self, &mut Env<'a>) -> Result<Atom, EvalError>
 pub(crate) type ClosureExpr = Box<
     dyn ClosureFn + Send + Sync,
@@ -90,6 +74,8 @@ pub enum CompileError {
     TooFew(BuiltIn, usize, usize),
     #[error("unknown data store error")]
     Unknown,
+    #[error("couldn't compile quote expr {0}")]
+    QuoteCompile(crate::parser::ListExpr),
 }
 pub fn compile_expr(src: &str) -> Result<ClosureExpr, CompileError> {
   parse_expr(src)
@@ -97,9 +83,10 @@ pub fn compile_expr(src: &str) -> Result<ClosureExpr, CompileError> {
     .and_then(|(_, exp)| generate_closure(exp))
 }
 
-pub fn generate_closure(e: Expr) -> Result<ClosureExpr, CompileError> {
-    match e {
-        Expr::Constant(a) => Ok(box move |e|{ Ok(a.clone()) }),
+pub fn generate_closure(expr: Expr) -> Result<ClosureExpr, CompileError> {
+    println!("application on {:?}", expr.clone());
+    match expr {
+        Expr::Constant(_) | Expr::Quote(_) => Ok(box move |e|{ Ok(expr.clone()) }),
         Expr::IfElse(cond, t, f) => {
             let cond = generate_closure(*cond)?;
             let t = generate_closure(*t)?;
@@ -113,14 +100,14 @@ pub fn generate_closure(e: Expr) -> Result<ClosureExpr, CompileError> {
             })
         },
         Expr::Application(op, mut args) => {
-            match op {
+            match op.clone() {
                 box Expr::Constant(Atom::BuiltIn(opcode)) => match opcode {
                     BuiltIn::Equal => {
                         if let [x, y] = args.as_slice() {
                             let x = generate_closure(x.clone())?;
                             let y = generate_closure(y.clone())?;
                             Ok(box move |e| {
-                                Ok(Atom::Num(
+                                Ok(Atom::atom(
                                         if x(e)?.need_int()? == y(e)?.need_int()? {
                                             1
                                         } else {
@@ -137,7 +124,7 @@ pub fn generate_closure(e: Expr) -> Result<ClosureExpr, CompileError> {
                             let x = generate_closure(x.clone())?;
                             let y = generate_closure(y.clone())?;
                             Ok(box move |e| {
-                                Ok(Atom::Num(
+                                Ok(Atom::atom(
                                         x(e)?.need_int()? + y(e)?.need_int()?
                                 ))
                             })
@@ -150,7 +137,7 @@ pub fn generate_closure(e: Expr) -> Result<ClosureExpr, CompileError> {
                             let x = generate_closure(x.clone())?;
                             let y = generate_closure(y.clone())?;
                             Ok(box move |e| {
-                                Ok(Atom::Num(
+                                Ok(Atom::atom(
                                         x(e)?.need_int()? * y(e)?.need_int()?
                                 ))
                             })
@@ -158,11 +145,26 @@ pub fn generate_closure(e: Expr) -> Result<ClosureExpr, CompileError> {
                             Err(CompileError::TooFew(opcode, 2, args.len()))
                         }
                     },
+                    BuiltIn::Divide => {
+                        if let [x, y] = args.as_slice() {
+                            let x = generate_closure(x.clone())?;
+                            let y = generate_closure(y.clone())?;
+                            Ok(box move |e| {
+                                Ok(Atom::atom(
+                                        x(e)?.need_int()? / y(e)?.need_int()?
+                                ))
+                            })
+                        } else {
+                            Err(CompileError::TooFew(opcode, 2, args.len()))
+                        }
+                    },
+
                     BuiltIn::Let => {
                         if let [name, val, cont] = args.as_slice() {
                             let name = generate_closure(name.clone())?;
                             let val = generate_closure(val.clone())?;
                             let cont = generate_closure(cont.clone())?;
+                            println!("build let");
                             Ok(box move |e| {
                                 let conc_name = &*name(e)?.need_keyword()?;
                                 let conc_value = val(e)?;
@@ -211,7 +213,7 @@ pub fn generate_closure(e: Expr) -> Result<ClosureExpr, CompileError> {
                         let mut comp_args = args.drain(..).map(|v| generate_closure(v) )
                             .collect::<Result<Vec<ClosureExpr>, _>>()?;
                         Ok(box move |e| {
-                            Ok(comp_args.iter().try_fold(Atom::Unit, |i, v| v(e))?)
+                            Ok(comp_args.iter().try_fold(Expr::Constant(Atom::Unit), |i, v| v(e))?)
                         })
                     },
                     BuiltIn::Loop => {
@@ -220,7 +222,7 @@ pub fn generate_closure(e: Expr) -> Result<ClosureExpr, CompileError> {
                             let body = generate_closure(body.clone())?;
                             Ok(box move |e| {
                                 let times = times(e)?.need_int()?;
-                                let mut v = Atom::Unit;
+                                let mut v = Expr::Constant(Atom::Unit);
                                 for i in 0..times {
                                     v = body(e)?;
                                 }
@@ -232,10 +234,22 @@ pub fn generate_closure(e: Expr) -> Result<ClosureExpr, CompileError> {
                     },
                     _ => unimplemented!("unimplemented opcode {}", opcode)
                 },
-                _ => unimplemented!("unimplemented application type")
+                box dynamic @ _ => {
+                    // We weren't able to build the closure from a constant expression
+                    let op = generate_closure(*op.clone())?;
+                    let args = args.clone().iter()
+                        .map(|elem| generate_closure(elem.clone()))
+                        .collect::<Result<Vec<ClosureExpr>, CompileError>>()?;
+                    Ok(box move |e| {
+                        let args = args.iter().map(|elem| elem(e))
+                            .collect::<Result<Vec<Expr>, EvalError>>()?;
+                        generate_closure(Expr::Application(box op(e)?, args))?(e)
+                    })
+                },
+                e @ _ => unimplemented!("unimplemented application type {:?}", e)
             }
         },
-        u @ _ => unimplemented!("unimplemented: {:?}", u),
+        _ => unimplemented!("unimplemented: {:?}", expr.clone()),
     }
 }
 
@@ -254,31 +268,31 @@ mod test {
 
     #[test]
     fn test_plus() -> Result<(), TestError> {
-        assert_eq!(compile_expr("(+ 1 2)")?(&mut Env::new())?, Atom::Num(3));
+        assert_eq!(compile_expr("(+ 1 2)")?(&mut Env::new())?, Atom::atom(3));
         Ok(())
     }
 
     #[test]
     fn test_plus_eval() -> Result<(), TestError> {
-        assert_eq!(compile_expr("(+ 1 (+ 2 3))")?(&mut Env::new())?, Atom::Num(6));
+        assert_eq!(compile_expr("(+ 1 (+ 2 3))")?(&mut Env::new())?, Atom::atom(6));
         Ok(())
     }
 
     #[test]
     fn test_let() -> Result<(), TestError> {
-        assert_eq!(compile_expr("(let :x 1 2)")?(&mut Env::new())?, Atom::Num(2));
+        assert_eq!(compile_expr("(let :x 1 2)")?(&mut Env::new())?, Atom::atom(2));
         Ok(())
     }
 
     #[test]
     fn test_get() -> Result<(), TestError> {
-        assert_eq!(compile_expr("(let :x 1 (get :x))")?(&mut Env::new())?, Atom::Num(1));
+        assert_eq!(compile_expr("(let :x 1 (get :x))")?(&mut Env::new())?, Atom::atom(1));
         Ok(())
     }
 
     #[test]
     fn test_set() -> Result<(), TestError> {
-        assert_eq!(compile_expr("(let :x 1 (do (set :x 2) (get :x)))")?(&mut Env::new())?, Atom::Num(2));
+        assert_eq!(compile_expr("(let :x 1 (do (set :x 2) (get :x)))")?(&mut Env::new())?, Atom::atom(2));
         Ok(())
     }
 
@@ -287,13 +301,36 @@ mod test {
         assert_eq!(compile_expr("
         (let :acc 1
         (let :i 0
-        (loop 10 (do
+        (loop 100000 (do
             (set :i (+ (get :i) 1))
             (if (= (get :i) 10)
                 (get :acc)
-            (set :acc (* (get :acc) (get :i))))
+            (set :acc (+ (get :acc) (get :i))))
         ))))
-        ")?(&mut Env::new())?, Atom::Num(2));
+        ")?(&mut Env::new())?, Atom::atom(2));
         Ok(())
+    }
+
+    #[test]
+    fn test_nom_example() -> Result<(), TestError> {
+        assert_eq!(compile_expr("
+        ((if (= (+ 3 (/ 9 3))
+                 (* 2 3))
+             *
+             /)
+          456 123)
+        ")?(&mut Env::new())?, Atom::atom(56088));
+        Ok(())
+    }
+
+    #[test]
+    fn test_dynamic_function() -> Result<(), TestError> {
+        assert_eq!(compile_expr("
+        (let :f '(+ 1 2)
+            ((get :f))
+        )
+        ")?(&mut Env::new())?, Atom::atom(2));
+        Ok(())
+
     }
 }

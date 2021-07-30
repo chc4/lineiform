@@ -40,7 +40,7 @@ pub enum BuiltIn {
 /// We now wrap this type and a few other primitives into our Atom type.
 /// Remember from before that Atoms form one half of our language.
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Display)]
 pub enum Atom {
   Num(usize),
   Keyword(String),
@@ -70,6 +70,60 @@ pub enum Expr {
   IfElse(Box<Expr>, Box<Expr>, Box<Expr>),
   /// '(3 (if (+ 3 3) 4 5) 7)
   Quote(Vec<Expr>),
+}
+impl Expr {
+    pub fn need_int(&mut self) -> Result<usize, crate::EvalError> {
+        match self {
+            Expr::Constant(Atom::Num(u)) => Ok(*u),
+            v => Err(crate::EvalError::TypeError("int", v._type()))
+        }
+    }
+
+    pub fn need_keyword(&mut self) -> Result<String, crate::EvalError> {
+        match self {
+            Expr::Constant(Atom::Keyword(u)) => Ok(u.to_string()),
+            v => Err(crate::EvalError::TypeError("keyword", v._type()))
+        }
+    }
+
+    pub fn _type(&self) -> &'static str {
+        match self {
+            Expr::Constant(Atom::Num(_)) => "int",
+            Expr::Constant(Atom::BuiltIn(_)) => "builtin",
+            _ => "unknown"
+        }
+    }
+}
+
+
+
+#[derive(Debug)]
+pub struct ListExpr(pub Vec<Expr>);
+impl Display for ListExpr {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let first = true;
+        for elem in &self.0 {
+            if first {
+                write!(fmt, "{}", elem)?;
+            } else {
+                write!(fmt, " {}", elem)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Display for Expr {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            Expr::Constant(a) => write!(fmt, "{}", a),
+            Expr::Application(func, body) => write!(fmt, "({} {})", func, ListExpr(body.clone())),
+            Expr::If(cond, body) => write!(fmt, "(if {} {})", cond, body),
+            Expr::IfElse(cond, t_body, f_body) => write!(fmt, "(if-else {} {} {})",
+                cond, t_body, f_body),
+            Expr::Quote(contents) => write!(fmt, "'({})", ListExpr(contents.clone()))
+        }
+    }
 }
 
 /// Continuing the trend of starting from the simplest piece and building up,

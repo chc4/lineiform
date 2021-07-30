@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert)]
+#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard)]
 extern crate nom;
 extern crate jemallocator;
 extern crate thiserror;
