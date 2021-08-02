@@ -1,15 +1,18 @@
 #![allow(unused_imports)]
+#![deny(unused_must_use)]
 #![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box)]
 extern crate nom;
 extern crate jemallocator;
 extern crate thiserror;
 #[macro_use]
 extern crate enum_display_derive;
-extern crate iced_x86;
+extern crate yaxpeax_arch;
+extern crate yaxpeax_x86;
 extern crate goblin;
 extern crate cranelift;
 extern crate cranelift_jit;
 extern crate cranelift_codegen;
+extern crate target_lexicon;
 use thiserror::Error;
 use std::fmt::Display;
 
@@ -22,7 +25,7 @@ use tracer::{Tracer, TracerError};
 mod block;
 use block::{Function, BlockError};
 mod lift;
-use lift::{State, Jit};
+use lift::{Jit, LiftError};
 
 use std::collections::HashMap;
 
@@ -36,6 +39,8 @@ enum MainError {
     Tracer(#[from] TracerError),
     #[error("block lifting error: {0}")]
     Block(#[from] BlockError),
+    #[error("lifting error: {0}")]
+    Lift(#[from] LiftError),
 }
 
 
@@ -60,13 +65,21 @@ fn main() -> Result<(), MainError> {
 
     let mut tracer = Tracer::new()?;
     use closure::ClosureFn;
-    let mut func = Function::new(&mut tracer, &clos)?;
+    //let mut func = Function::from_fn(&mut tracer, &clos)?;
+    use core::num::Wrapping;
+    extern "C" fn testcase(n: Wrapping<usize>) -> Wrapping<usize> {
+        n + Wrapping(1)
+    }
+    let mut func = Function::<usize, usize>::new(&mut tracer, testcase as *const ())?;
     println!("base @ {:x}", func.base as usize);
-    tracer.format(&func.instructions);
+    tracer.format(&func.instructions)?;
 
-    let jitted = Jit::lift(func);
+    let mut jitted = Jit::lift(func);
     jitted.format();
-    let new_func = jitted.lower();
+    let (new_func, new_size) = jitted.lower()?;
+    let new_func_dis = tracer.disassemble(new_func as *const (), new_size as usize)?;
+    println!("recompiled function:");
+    tracer.format(&new_func_dis)?;
 
     Ok(())
 }

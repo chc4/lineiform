@@ -1,6 +1,6 @@
 use crate::tracer::{self, Tracer};
-use iced_x86::Instruction;
 use std::sync::Arc;
+use yaxpeax_x86::long_mode::Instruction;
 
 pub enum VariableValue {
     u8(u8),
@@ -15,19 +15,17 @@ pub enum Value {
     Const(usize),
 }
 
-pub enum LiftedInstruction {
-    Native(Instruction), /// Any instruction we aren't able to lift to a better form
-    Mov { dest: Value, src: Value }, /// dest <- src
-    Add { dest: Value, src: Value }, /// dest += src
-    Call(Value),
-    Ret,
-}
-
 use std::ffi::c_void;
+/// Rust closures are rust-call calling convention only. This is a problem, since
+/// we want to lift them to Cranelift, and we don't know what registers are "live"
+/// at the start and end. We instead make it so that making a Function from an Fn
+/// actually starts the trace from the Trampoline call for the correct type,
+/// with it's call being extern "C". Rustc then emits a stdcall -> rust-call
+/// prologue and epilogue for us, which we can lift.
 extern "C" fn c_fn<A, O>(
-    cb: fn(data: *const c_void, A)->O, 
+    cb: extern fn(data: *const c_void, A)->O, // "rust-call", but adding that ICEs
     d: *const c_void,
-    a: A,
+    a: A
 ) -> O {
     cb(d, a)
 }
@@ -43,10 +41,12 @@ pub fn foo<A, O, F: Fn(A)->O>(callback: F, args: (A,)) {
     }
 }
 
+use std::marker::PhantomData;
 pub struct Function<ARG, OUT> {
-    pub base: fn(data: *const c_void, ARG)->OUT,
+    pub base: *const (),
     pub size: usize,
     pub instructions: Arc<Vec<Instruction>>,
+    _phantom: PhantomData<(ARG, OUT)>, //fn(data: *const c_void, ARG)->OUT
 }
 
 use thiserror::Error;
@@ -57,15 +57,24 @@ pub enum BlockError {
 }
 
 impl<A, O> Function<A, O> {
-    /// Create a new function via disassembling a function pointer
-    pub fn new<F: Fn(A)->O>(tracer: &mut Tracer, f: F) -> Result<Self, BlockError> {
-        let c: for<'a> extern "rust-call" fn(&'a F, (A,))->O = <F as Fn<(A,)>>::call;
-        let f_sym = tracer.get_symbol_from_address(c as *const ())?;
-        let instructions = tracer.disassemble(c as *const())?;
+    /// Create a new function via disassembling an Fn trait object
+    pub fn from_fn<F: Fn(A)->O>(tracer: &mut Tracer, f: F) -> Result<Self, BlockError> {
+        // Get the trait method for calling a Fn of this type
+        //let c: for<'a> extern "rust-call" fn(&'a F, (A,))->O = <F as Fn<(A,)>>::call;
+        //let base = unsafe { std::mem::transmute(c) };
+        // We have to start tracing at the trampoline, since we need to be able
+        // to lift the rust-call cconv prologue/epilogue.
+        Function::new(tracer, c_fn::<A,O> as *const ())
+    }
+
+    pub fn new(tracer: &mut Tracer, f: *const ()) -> Result<Self, BlockError> {
+        let f_sym = tracer.get_symbol_from_address(f)?;
+        let instructions = tracer.disassemble(f, f_sym.st_size as usize)?;
         Ok(Self {
-            base: unsafe { std::mem::transmute(c) },
+            base: f,
             size: f_sym.st_size as usize,
             instructions: instructions,
+            _phantom: PhantomData,
         })
     }
 }

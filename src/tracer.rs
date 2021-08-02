@@ -1,45 +1,41 @@
-// This example uses crate colored = "2.0.0"
-use colored::{ColoredString, Colorize};
-use iced_x86::{
-    Decoder, DecoderOptions, Formatter, FormatterOutput, FormatterTextKind, IntelFormatter,
-};
+// yaxpeax decoder example
+mod decoder {
+    use yaxpeax_arch::{Arch, AddressDisplay, Decoder, Reader, ReaderBuilder};
 
-// Custom formatter output that stores the output in a vector.
-struct MyFormatterOutput {
-    vec: Vec<(String, FormatterTextKind)>,
-}
+    pub fn decode_stream<
+        'data,
+        A: yaxpeax_arch::Arch,
+        U: ReaderBuilder<A::Address, A::Word>,
+    >(data: U) -> Vec<A::Instruction>
+        where A::Instruction: std::fmt::Display
+    {
+        let mut reader = ReaderBuilder::read_from(data);
+        let mut address: A::Address = reader.total_offset();
 
-impl MyFormatterOutput {
-    pub fn new() -> Self {
-        Self { vec: Vec::new() }
+        let decoder = A::Decoder::default();
+        let mut decode_res = decoder.decode(&mut reader);
+        let mut res = Vec::new();
+        loop {
+            match decode_res {
+                Ok(inst) => {
+                    println!("{}: {}", address.show(), inst);
+                    decode_res = decoder.decode(&mut reader);
+                    address = reader.total_offset();
+                    res.push(inst);
+                }
+                Err(e) => {
+                    println!("{}: decode error: {}", address.show(), e);
+                    break;
+                }
+            }
+        }
+        res
     }
 }
 
-impl FormatterOutput for MyFormatterOutput {
-    fn write(&mut self, text: &str, kind: FormatterTextKind) {
-        // This allocates a string. If that's a problem, just call print!() here
-        // instead of storing the result in a vector.
-        self.vec.push((String::from(text), kind));
-    }
-}
-
-//pub(crate) fn how_to_colorize_text() {
-//    let bytes = EXAMPLE_CODE;
-//    let mut decoder = Decoder::with_ip(EXAMPLE_CODE_BITNESS, bytes, EXAMPLE_CODE_RIP, DecoderOptions::NONE);
-//
-//    let mut formatter = IntelFormatter::new();
-//    formatter.options_mut().set_first_operand_char_index(8);
-//    let mut output = MyFormatterOutput::new();
-//    for instruction in &mut decoder {
-//        output.vec.clear();
-//        // The formatter calls output.write() which will update vec with text/colors
-//        formatter.format(&instruction, &mut output);
-//        for (text, kind) in output.vec.iter() {
-//            print!("{}", get_color(text.as_str(), *kind));
-//        }
-//        println!();
-//    }
-//}
+use yaxpeax_x86::amd64::{Arch as x86_64};
+use yaxpeax_arch::{ReaderBuilder, U8Reader};
+use yaxpeax_x86::long_mode::Instruction;
 
 // Getting the size of a closure in Rust is normally impossible.
 // We do it by using some section hacks:
@@ -66,6 +62,8 @@ pub enum TracerError {
     CantFindFunction(usize),
     #[error("executable has no .needle section")]
     NoNeedle,
+    #[error("couldn't write formatting")]
+    Format(#[from] std::fmt::Error),
 }
 
 use std::marker::PhantomPinned;
@@ -88,7 +86,6 @@ use goblin::elf::sym::Sym;
 use goblin::Object;
 use core::pin::Pin;
 use std::convert::TryInto;
-use iced_x86::Instruction;
 impl<'a> Tracer<'a> {
     // this should be a lazy_static 
     pub fn new() -> Result<Tracer<'static>, TracerError> {
@@ -137,45 +134,28 @@ impl<'a> Tracer<'a> {
         Ok(sym)
     }
 
-    pub fn disassemble(&mut self, f: *const ()) -> Result<Arc<Vec<Instruction>>, TracerError> {
+    pub fn disassemble(&mut self, f: *const (), f_size: usize) -> Result<Arc<Vec<Instruction>>, TracerError> {
         let cache_hit = self.cache.get(&f);
         if let Some(cache_hit) = cache_hit {
             // Our function was in the cache - return our cached decompilation
             return Ok(cache_hit.clone());
         }
-        let f_sym = self.get_symbol_from_address(f)?;
-        let mut decoder = Decoder::with_ip(
-            if self.elf.is_64 { 64 } else { 32 },
-            // We decode *from our own memory* instead of from the binary on disk
-            // in order to resolve PLT entries
-            unsafe {
-                core::slice::from_raw_parts(
-                    (self.base.unwrap()+(f_sym.st_value as usize)) as *const u8,
-                    f_sym.st_size as usize) as &[u8]
-            },
-            f as u64, DecoderOptions::NONE);
-
-        let mut all = Vec::with_capacity(f_sym.st_size as usize);
-        for ins in &mut decoder {
-            all.push(ins);
-        }
+        let all = decoder::decode_stream::<x86_64, _>(unsafe {
+            core::slice::from_raw_parts(
+                f as *const u8,
+                f_size as usize) as &[u8]
+        });
         let entry = Arc::new(all);
         self.cache.insert(f, entry.clone());
         Ok(entry)
     }
 
     pub fn format(&self, instructions: &Vec<Instruction>) -> Result<(), TracerError> {
-        let mut formatter = IntelFormatter::new();
-        formatter.options_mut().set_first_operand_char_index(8);
-        let mut output = MyFormatterOutput::new();
+        let mut fmt = String::new();
         for instruction in instructions {
-            output.vec.clear();
-            // The formatter calls output.write() which will update vec with text/colors
-            formatter.format(&instruction, &mut output);
-            for (text, kind) in output.vec.iter() {
-                print!("{}", get_color(text.as_str(), *kind));
-            }
-            println!();
+            instruction.write_to(&mut fmt)?;
+            println!("{}", fmt);
+            fmt.clear();
         }
         Ok(())
     }
@@ -188,17 +168,6 @@ fn get_elf<'a>(buf: &'a [u8]) -> Result<Elf<'a>, TracerError> {
         Err(TracerError::Unsupported)
     }
 }
-
-fn get_color(s: &str, kind: FormatterTextKind) -> ColoredString {
-    match kind {
-        FormatterTextKind::Directive | FormatterTextKind::Keyword => s.bright_yellow(),
-        FormatterTextKind::Prefix | FormatterTextKind::Mnemonic => s.bright_red(),
-        FormatterTextKind::Register => s.bright_blue(),
-        FormatterTextKind::Number => s.bright_cyan(),
-        _ => s.white(),
-    }
-}
-
 use core::hint::black_box;
 
 use core::num::Wrapping;
@@ -231,7 +200,8 @@ mod test {
     #[test]
     fn can_disassemble_fn() -> Result<(), TracerError> {
         let mut tracer = Tracer::new()?;
-        let instructions = tracer.disassemble(add_one as *const ())?;
+        let sym = tracer.get_symbol_from_address(add_one as *const ())?;
+        let instructions = tracer.disassemble(add_one as *const (), sym.st_size as usize)?;
         tracer.format(&instructions)?;
         Ok(())
     }

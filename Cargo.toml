@@ -11,19 +11,16 @@ nom = "7.0.0-alpha1"
 jemallocator = "0.3.2"
 thiserror = "1.0"
 enum-display-derive = "0.1.1"
-colored = "2.0.0"
 goblin = "0.4"
+lazy_static = "1.4.0"
+yaxpeax-x86 = "1.0.4"
+yaxpeax-arch = "0.2.5"
 
 cranelift = "0.75.0"
 cranelift-codegen = "0.75.0"
 cranelift-jit = "0.75.0"
 cranelift-module = "0.75.0"
-
-[dependencies.iced-x86]
-version = "1.13.0"
-default-features = false
-# See below for all features
-features = ["std", "decoder", "encoder", "block_encoder", "intel"]
+target-lexicon = "0.12.1"
 
 [profile.dev]
 opt-level = 2 # we use tailcalls a lot, which will blow the stack on O0
