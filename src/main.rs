@@ -68,8 +68,14 @@ fn main() -> Result<(), MainError> {
     //let mut func = Function::from_fn(&mut tracer, &clos)?;
     use core::num::Wrapping;
     use core::hint::black_box;
-    extern "C" fn testcase(n: Wrapping<usize>) -> Wrapping<usize> {
-        black_box(n + Wrapping(1)) + Wrapping(2)
+    #[repr(C)]
+    #[derive(Debug, PartialEq)]
+    struct Oversized {
+        a: Wrapping<usize>,
+        b: Wrapping<usize>,
+    }
+    extern "C" fn testcase(n: Wrapping<usize>) -> Oversized {
+        Oversized { a: black_box(n + Wrapping(1)) + Wrapping(2), b: n }
     }
     let mut func = Function::<usize, usize>::new(&mut tracer, testcase as *const ())?;
     println!("base @ {:x}", func.base as usize);
@@ -82,6 +88,9 @@ fn main() -> Result<(), MainError> {
     let new_func_dis = tracer.disassemble(new_func as *const (), new_size as usize)?;
     println!("recompiled function:");
     tracer.format(&new_func_dis)?;
+    let callable: extern "C" fn(Wrapping<usize>) -> Oversized =
+        unsafe { core::mem::transmute(new_func) };
+    assert_eq!(testcase(Wrapping(5)), callable(Wrapping(5)));
 
     Ok(())
 }

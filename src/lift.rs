@@ -117,6 +117,7 @@ impl Target {
                 ]);
                 self.outputs.append(&mut vec![
                     Location::Reg(RegSpec::rax()),
+                    Location::Reg(RegSpec::rdx()),
                 ]);
                 Ok(())
             },
@@ -143,7 +144,7 @@ impl<A, O> Jit<A, O> {
             ctx.func.signature.params.push(AbiParam::new(arg));
         }
 
-        let return_layout = vec![int]; // hardcode int return type
+        let return_layout = vec![int,int]; // hardcode int return type
         for ret in return_layout.clone() {
             ctx.func.signature.returns.push(AbiParam::new(ret));
         }
