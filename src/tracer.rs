@@ -18,13 +18,13 @@ mod decoder {
         loop {
             match decode_res {
                 Ok(inst) => {
-                    println!("{}: {}", address.show(), inst);
+                    //println!("{}: {}", address.show(), inst);
                     decode_res = decoder.decode(&mut reader);
                     address = reader.total_offset();
                     res.push(inst);
                 }
                 Err(e) => {
-                    println!("{}: decode error: {}", address.show(), e);
+                    //println!("{}: decode error: {}", address.show(), e);
                     break;
                 }
             }
@@ -172,11 +172,11 @@ use core::hint::black_box;
 
 use core::num::Wrapping;
 #[inline(never)]
-pub fn mul_two(u: crate::parser::Int) -> crate::parser::Int {
+pub fn mul_two(u: Wrapping<usize>) -> Wrapping<usize> {
     u * Wrapping(2)
 }
 #[inline(never)]
-pub fn add_one(u: crate::parser::Int) -> crate::parser::Int {
+pub fn add_one(u: Wrapping<usize>) -> Wrapping<usize> {
     mul_two(u + Wrapping(1)) + Wrapping(2)
 }
 

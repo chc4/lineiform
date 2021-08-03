@@ -1,5 +1,4 @@
 use crate::tracer::{self, Tracer};
-use crate::closure::ClosureFn;
 
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
@@ -49,7 +48,7 @@ pub enum LiftError {
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
 pub enum Location {
     Reg(RegSpec),
-    //Stack(u8), // TODO: if we ever support x86_32, we need these
+    Stack(usize), // TODO: if we ever support x86_32, we need these
 }
 
 struct Context {
@@ -102,7 +101,7 @@ impl Target {
         let builder = isa::lookup(trip)?;
         let mut settings = settings::builder();
         // Configure Cranelift compilation options
-        settings.set("opt_level", "none")?;
+        settings.set("opt_level", "speed_and_size")?;
         let flags = settings::Flags::new(settings);
         Ok(builder.finish(flags))
     }
@@ -194,6 +193,7 @@ impl<A, O> Jit<A, O> {
             context: variables,
             module: &mut self.module,
             idx: &mut idx,
+            stack_idx: 0,
         };
 
         for inst in self.f.instructions.iter() {
@@ -267,6 +267,7 @@ struct FunctionTranslator<'a> {
     context: Context,
     module: &'a mut Module,
     idx: &'a mut usize,
+    stack_idx: usize,
 }
 
 impl<'a> FunctionTranslator<'a> {
@@ -278,15 +279,43 @@ impl<'a> FunctionTranslator<'a> {
                 Ok(())
             },
             Opcode::INC => {
+                // TODO: set flags
                 let val = self.resolve(inst.operand(0));
                 let one = self.builder.ins().iconst(self.int, 1);
                 let inced = self.builder.ins().iadd(val, one);
                 self.store(inst.operand(0), inced);
                 Ok(())
             },
+            Opcode::ADD => {
+                // TODO: set flags
+                let left = self.resolve(inst.operand(0));
+                let right = self.resolve(inst.operand(1));
+                let added = self.builder.ins().iadd(left, right);
+                self.store(inst.operand(0), added);
+                Ok(())
+            },
             Opcode::LEA => {
                 let val = self.effective_address(inst.operand(1))?;
                 self.store(inst.operand(0), val);
+                Ok(())
+            },
+            Opcode::PUSH => {
+                // TODO: figure out if we need to tell cranelift to allocate a stack
+                // slot? if we just symbolize the stack variable then jumping to
+                // native code might not work.
+                // push eax
+                let val = self.resolve(inst.operand(0)); // get eax
+                let sp = self.get(Location::Stack(self.stack_idx)); // [rsp]
+                self.builder.def_var(sp, val); // [rsp] = eax
+                self.stack_idx += 1; // rsp++
+                Ok(())
+            },
+            Opcode::POP => {
+                // pop eax
+                let sp = self.get(Location::Stack(self.stack_idx)); // [rsp]
+                let sp = self.builder.use_var(sp);
+                self.store(inst.operand(0), sp); // eax = [rsp]
+                self.stack_idx -= 1;
                 Ok(())
             },
             Opcode::RETURN => {
@@ -345,7 +374,15 @@ impl<'a> FunctionTranslator<'a> {
                 let reg = self.get(Location::Reg(r));
                 self.builder.use_var(reg)
             },
-            _ => unimplemented!()
+            Operand::RegDeref(const { RegSpec::rsp() }) => {
+                let sp = self.get(Location::Stack(self.stack_idx));
+                self.builder.use_var(sp)
+            },
+            Operand::ImmediateI8(c) => {
+                let c = self.builder.ins().iconst(self.int, i64::from(c));
+                c
+            },
+            _ => unimplemented!("resolve for {:?}", loc)
         }
     }
 
@@ -355,7 +392,11 @@ impl<'a> FunctionTranslator<'a> {
                 let reg = self.get(Location::Reg(r));
                 self.builder.def_var(reg, val)
             },
-            _ => unimplemented!()
+            Operand::RegDeref(const { RegSpec::rsp() }) => {
+                let sp = self.get(Location::Stack(self.stack_idx));
+                self.builder.def_var(sp, val)
+            }
+            _ => unimplemented!("store for {} ({:?}) = {:?}", loc, loc, val)
         }
     }
 
