@@ -73,9 +73,10 @@ fn main() -> Result<(), MainError> {
     struct Oversized {
         a: Wrapping<usize>,
         b: Wrapping<usize>,
+        c: Wrapping<usize>
     }
     extern "C" fn testcase(n: Wrapping<usize>) -> Oversized {
-        Oversized { a: black_box(n + Wrapping(1)) + Wrapping(2), b: n }
+        Oversized { a: black_box(n + Wrapping(1)) + Wrapping(2), b: n, c: n + Wrapping(15) }
     }
     let mut func = Function::<usize, usize>::new(&mut tracer, testcase as *const ())?;
     println!("base @ {:x}", func.base as usize);

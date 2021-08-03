@@ -397,6 +397,16 @@ impl<'a> FunctionTranslator<'a> {
                 let sp = self.get(Location::Stack(self.stack_idx));
                 self.builder.def_var(sp, val)
             }
+            Operand::RegDeref(r) => {
+                let reg = self.get(Location::Reg(r));
+                let reg_val = self.builder.use_var(reg);
+                self.builder.ins().store(MemFlags::new(), val, reg_val, 0);
+            },
+            Operand::RegDisp(r, o) => {
+                let reg = self.get(Location::Reg(r));
+                let reg_val = self.builder.use_var(reg);
+                self.builder.ins().store(MemFlags::new(), val, reg_val, o);
+            },
             _ => unimplemented!("store for {} ({:?}) = {:?}", loc, loc, val)
         }
     }
