@@ -9,6 +9,7 @@ use cranelift_codegen::ir::types::Type;
 use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
 
 use std::collections::HashMap;
+use std::convert::TryInto;
 
 use thiserror::Error;
 #[derive(Error, Debug)]
@@ -316,7 +317,7 @@ impl<'a> FunctionTranslator<'a> {
                 let sp = self.get(Location::Stack(self.stack_idx)); // [rsp]
                 let sp = self.builder.use_var(sp);
                 self.store(inst.operand(0), sp); // eax = [rsp]
-                self.stack_idx -= 1;
+                self.stack_idx -= 1; // rsp--
                 Ok(())
             },
             Opcode::RETURN => {
@@ -397,6 +398,19 @@ impl<'a> FunctionTranslator<'a> {
                 let sp = self.get(Location::Stack(self.stack_idx));
                 self.builder.def_var(sp, val)
             }
+            Operand::RegDisp(const { RegSpec::rsp() }, o) => {
+                // We turn [rsp-8] into Stack(stack_idx - 1) - we count
+                // stack slots up from 0.
+                assert_eq!(o <= 0, true); // Make sure it's negative
+                assert_eq!(o % 8, 0); // Make sure it aligns
+                let stack_off: usize = (o.unsigned_abs() / 8).try_into().unwrap();
+                let sp = self.get(Location::Stack(self.stack_idx - stack_off));
+                self.builder.def_var(sp, val)
+            }
+            Operand::RegDeref(const { RegSpec::esp() } | const { RegSpec::sp() })
+            | Operand::RegDisp(const { RegSpec::esp() } | const { RegSpec::sp()}, _) => {
+                unimplemented!("non-native stack size");
+            },
             Operand::RegDeref(r) => {
                 let reg = self.get(Location::Reg(r));
                 let reg_val = self.builder.use_var(reg);

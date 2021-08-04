@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
-#![deny(unused_must_use)]
-#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, inline_const)]
+#![deny(unused_must_use, improper_ctypes_definitions)]
+#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, inline_const, inherent_associated_types, associated_type_bounds)]
 //extern crate nom;
 extern crate jemallocator;
 extern crate thiserror;
@@ -26,6 +26,8 @@ mod block;
 use block::{Function, BlockError};
 mod lift;
 use lift::{Jit, LiftError};
+mod lineiform;
+use lineiform::{Lineiform};
 
 use std::collections::HashMap;
 
@@ -44,6 +46,7 @@ enum MainError {
 }
 
 
+use core::hint::black_box;
 fn main() -> Result<(), MainError> {
     println!("Hello, world!");
     let mut f = std::fs::File::open("/proc/self/maps").unwrap();
@@ -63,11 +66,37 @@ fn main() -> Result<(), MainError> {
 //    println!("clos: {:?}", clos(&mut env)?);
 //    println!("clos: {:?}", clos2(&mut env)?);
 
+    pub trait TestFn = Fn(usize) -> usize;
+    pub(crate) type TestExpr = Box<
+        dyn TestFn + Send + Sync,
+    >;
+    use core::cell::RefCell;
+    use core::cell::Cell;
+    use std::sync::Arc;
+    let one: TestExpr = box move |e: usize| {
+        if black_box(true) == true { 1 } else { 0 }
+    };
+    let mut jit = Lineiform::new();
+    let five: TestExpr = box jit.speedup(move |e: usize| {
+        let mut acc = e;
+        for i in 0..5 {
+            acc += one(e);
+        }
+        return acc;
+    });
+    let eval = five(0);
+    assert_eq!(eval, 5);
+    let eval2 = five(1);
+    assert_eq!(eval2, 6);
+
+    Ok(())
+}
+
+fn test_jit() -> Result<(), MainError> {
     let mut tracer = Tracer::new()?;
     //use closure::ClosureFn;
     //let mut func = Function::from_fn(&mut tracer, &clos)?;
     use core::num::Wrapping;
-    use core::hint::black_box;
     #[repr(C)]
     #[derive(Debug, PartialEq)]
     struct Oversized {
@@ -76,8 +105,13 @@ fn main() -> Result<(), MainError> {
         c: Wrapping<usize>
     }
     extern "C" fn testcase(n: Wrapping<usize>) -> Oversized {
-        Oversized { a: black_box(n + Wrapping(1)) + Wrapping(2), b: n, c: n + Wrapping(15) }
+        Oversized {
+            a: black_box(n + Wrapping(1)) + Wrapping(2),
+            b: n,
+            c: n + Wrapping(15)
+        }
     }
+
     let mut func = Function::<usize, usize>::new(&mut tracer, testcase as *const ())?;
     println!("base @ {:x}", func.base as usize);
     tracer.format(&func.instructions)?;

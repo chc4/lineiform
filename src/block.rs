@@ -56,15 +56,31 @@ pub enum BlockError {
     Decompile(#[from] tracer::TracerError),
 }
 
+///! When we lift an Fn(A)->O closure, we actually lift c_fn::<A,O>, which takes
+///the Fn::call variant for the closure, and a *const c_void closure object, along
+///with a tuple of actual arguments.
+///This is an extern C function, because we need a stable ABI - but making it
+///extern C means that when we *lower* the function back down, we are emitting
+///the extern C prototype function to call! Because if you are using this as
+///a JIT for a closure generator compiler you need to return a *closure* for your
+///function. E.g. `Lineiform::jit(box move |a: A| -> O { o }) -> Fn(A, Output=O)`
+///Which means we need to have a Rust->SystemV->Rust ABI dance: we provide a
+///rust-call interface, which calls our extern C tracing trampoline/lift result,
+///which calls whatever Rust closure body we inlined. We can at least hope that
+///the last inlining reduces register waste.
+///Maybe in the future Rust will allow for custom calling convention of closures,
+///but the issue has ~0 traffic and no RFC, so I'm not holding my breath...
 impl<A, O> Function<A, O> {
     /// Create a new function via disassembling an Fn trait object
     pub fn from_fn<F: Fn(A)->O>(tracer: &mut Tracer, f: F) -> Result<Self, BlockError> {
         // Get the trait method for calling a Fn of this type
-        //let c: for<'a> extern "rust-call" fn(&'a F, (A,))->O = <F as Fn<(A,)>>::call;
+        let c: for<'a> extern "rust-call" fn(&'a F, (A,))->O = <F as Fn<(A,)>>::call;
+        let c: extern fn(data: *const c_void, A)->O = unsafe { std::mem::transmute(c) };
         //let base = unsafe { std::mem::transmute(c) };
         // We have to start tracing at the trampoline, since we need to be able
         // to lift the rust-call cconv prologue/epilogue.
         Function::new(tracer, c_fn::<A,O> as *const ())
+            //.assume_args(vec![c, callback as *const _ as *const c_void]);
     }
 
     pub fn new(tracer: &mut Tracer, f: *const ()) -> Result<Self, BlockError> {
