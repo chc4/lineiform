@@ -1,6 +1,7 @@
 use crate::tracer::{self, Tracer};
 use std::sync::Arc;
 use yaxpeax_x86::long_mode::Instruction;
+use yaxpeax_x86::long_mode::RegSpec;
 
 pub enum VariableValue {
     u8(u8),
@@ -42,10 +43,12 @@ pub fn foo<A, O, F: Fn(A)->O>(callback: F, args: (A,)) {
 }
 
 use std::marker::PhantomData;
+use crate::lift::Location;
 pub struct Function<ARG, OUT> {
     pub base: *const (),
     pub size: usize,
     pub instructions: Arc<Vec<Instruction>>,
+    pub pinned: Vec<(Location, usize)>,
     _phantom: PhantomData<(ARG, OUT)>, //fn(data: *const c_void, ARG)->OUT
 }
 
@@ -79,8 +82,16 @@ impl<A, O> Function<A, O> {
         //let base = unsafe { std::mem::transmute(c) };
         // We have to start tracing at the trampoline, since we need to be able
         // to lift the rust-call cconv prologue/epilogue.
-        Function::new(tracer, c_fn::<A,O> as *const ())
-            //.assume_args(vec![c, callback as *const _ as *const c_void]);
+        Ok(Function::new(tracer, c_fn::<A,O> as *const ())?
+            .assume_args(vec![
+                (Location::Reg(RegSpec::rdi()), c as usize),
+                (Location::Reg(RegSpec::rsi()), &f as *const _ as *const c_void as usize)
+            ]))
+    }
+
+    pub fn assume_args(mut self, pinning: Vec<(Location, usize)>) -> Self {
+        self.pinned = pinning;
+        self
     }
 
     pub fn new(tracer: &mut Tracer, f: *const ()) -> Result<Self, BlockError> {
@@ -90,6 +101,7 @@ impl<A, O> Function<A, O> {
             base: f,
             size: f_sym.st_size as usize,
             instructions: instructions,
+            pinned: Vec::new(),
             _phantom: PhantomData,
         })
     }

@@ -9,7 +9,7 @@ use cranelift_codegen::ir::types::Type;
 use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
 
 use std::collections::HashMap;
-use std::convert::TryInto;
+use std::convert::{TryInto, TryFrom};
 
 use thiserror::Error;
 #[derive(Error, Debug)]
@@ -52,8 +52,70 @@ pub enum Location {
     Stack(usize), // TODO: if we ever support x86_32, we need these
 }
 
+#[derive(Clone)]
+pub enum JitVariable {
+    Variable(Variable),
+    Known(JitValue),
+}
+impl JitVariable {
+    pub fn val(&mut self, builder: &mut FunctionBuilder) -> JitValue {
+        match self {
+            JitVariable::Variable(var) => JitValue::Value(builder.use_var(*var)),
+            JitVariable::Known(val) => val.clone(),
+        }
+    }
+}
+
+use std::rc::Rc;
+#[derive(Debug, Clone)]
+pub enum JitValue {
+    /// An SSA value
+    Value(Value),
+    /// A reference to a value, plus an offset into it
+    Ref { base: Rc<JitValue>, offset: usize },
+    /// A frozen memory region. We can inline values from it safely.
+    Frozen { addr: *const u8, size: usize },
+    /// A statically known value.
+    Const(usize),
+}
+
+impl JitValue {
+    /// Get a Cranelift SSA Value for this JitValue. Don't use this if you can
+    /// help it, since it erases statically known values and harms optimizations.
+    pub fn into_ssa(&self, int: Type, builder: &mut FunctionBuilder) -> Value {
+        use JitValue::*;
+        match self {
+            Value(val) => val.clone(),
+            Const(c) => {
+                builder.ins().iconst(int, i64::try_from(*c as isize).unwrap())
+            },
+            Frozen { .. } => unimplemented!("into_ssa for frozen"),
+            Ref { base, offset } => {
+                match **base {
+                    Value(_) => unimplemented!("ref to unsupported"),
+                    Const(c) => unimplemented!("ref to const"), // XXX: constant pool
+                    Frozen { addr, size } => {
+                        builder.ins().iconst(int, i64::try_from(
+                            ((addr as usize) + offset) as isize).unwrap()
+                        )
+                    },
+                    Ref { .. } => unimplemented!("ref to ref unsupported"),
+                }
+            },
+        }
+    }
+}
+
 struct Context {
-    bound: HashMap<Location, Variable>,
+    // XXX: this probably can't only use Variable! if we pin a frozen environment,
+    // we can only assume that the *direct* contents of that environment are
+    // valid. This is because we can't ban interior mutability in the closed
+    // environment - we will have a custom allocator that we will put the closures
+    // in that mean that Mutex<usize> can't mutate the value without crashing,
+    // but a Mutex<&usize> we have to make sure we don't inline env->&usize->1
+    // and have it changed. We probably need an enum, and have a Frozen enum that
+    // always dereferences to a NonFrozen variant, and only const prop Frozen.
+    bound: HashMap<Location, JitVariable>,
 }
 
 pub struct Jit<A, O> {
@@ -186,7 +248,7 @@ impl<A, O> Jit<A, O> {
 
         let mut idx = 0; // Why do we need to do this instead of asking cranelift for
         // a fresh variable??
-        let mut variables = Self::make_variables(&mut builder, &mut idx, entry_block, &self.argument_layout);
+        let mut variables = Self::make_variables(&mut builder, &mut idx, entry_block, int, &self.argument_layout, &self.f.pinned);
         builder.seal_block(entry_block);
 
         let mut function_translator = FunctionTranslator {
@@ -201,26 +263,39 @@ impl<A, O> Jit<A, O> {
         for inst in self.f.instructions.iter() {
             function_translator.emit(inst)?;
         }
+        println!("jit output: \n{}", function_translator.builder.display(None));
         function_translator.builder.finalize();
         Ok(())
     }
 
     fn make_variables<'a>(builder: &mut FunctionBuilder<'a>, idx: &mut usize, entry_block: Block,
-        arg_vars: &Vec<Type>) -> Context
+        int: Type, arg_vars: &Vec<Type>, pinned_values: &Vec<(Location, usize)>) -> Context
     {
-        let args = HOST.arguments.iter().enumerate()
-            .map(|(i, arg)| {
+        // First, we make a variable for all of our pinned locations containing
+        // the fed-in value.
+        let mut ctx: HashMap<Location, JitVariable> = HashMap::new();
+        for pinned in pinned_values.iter() {
+            println!("adding pinned value {:?} = {}", pinned.0, pinned.1);
+            ctx.insert(pinned.0.clone(), JitVariable::Known(JitValue::Const(pinned.1)));
+        }
+        // Then, for all the arguments to the function, we create a variable for
+        // the ABI register *unless* it has already been pinned.
+        // If we pin argument 0 = 1234 in SystemV for example, we want to compile
+        // a function with RDI *always* set to 1234, and throw away the actual
+        // argument.
+        for (i, arg) in HOST.arguments.iter().enumerate() {
+            ctx.entry(arg.clone()).or_insert_with(|| {
                 println!("adding argument {:?}", arg);
                 let val = builder.block_params(entry_block)[i];
                 let var = Variable::new(*idx);
                 *idx = *idx + 1;
                 builder.declare_var(var, arg_vars[i]);
                 builder.def_var(var, val);
-                //builder.set_val_label(val, format!("{}", arg));
-                (arg.clone(), var)
-            }).collect::<HashMap<_,_>>();
+                JitVariable::Variable(var)
+            });
+        }
         Context {
-            bound: args,
+            bound: ctx,
         }
     }
 
@@ -274,25 +349,25 @@ struct FunctionTranslator<'a> {
 
 impl<'a> FunctionTranslator<'a> {
     fn emit(&mut self, inst: &Instruction) -> Result<(), LiftError> {
+        println!("emitting for {}", inst);
         match inst.opcode() {
             Opcode::MOV => {
-                let val = self.resolve(inst.operand(1));
+                let val = self.value(inst.operand(1));
                 self.store(inst.operand(0), val);
                 Ok(())
             },
             Opcode::INC => {
                 // TODO: set flags
-                let val = self.resolve(inst.operand(0));
-                let one = self.builder.ins().iconst(self.int, 1);
-                let inced = self.builder.ins().iadd(val, one);
+                let val = self.value(inst.operand(0));
+                let inced = self.add(val, JitValue::Const(1));
                 self.store(inst.operand(0), inced);
                 Ok(())
             },
             Opcode::ADD => {
                 // TODO: set flags
-                let left = self.resolve(inst.operand(0));
-                let right = self.resolve(inst.operand(1));
-                let added = self.builder.ins().iadd(left, right);
+                let left = self.value(inst.operand(0));
+                let right = self.value(inst.operand(1));
+                let added = self.add(left, right);
                 self.store(inst.operand(0), added);
                 Ok(())
             },
@@ -306,24 +381,22 @@ impl<'a> FunctionTranslator<'a> {
                 // slot? if we just symbolize the stack variable then jumping to
                 // native code might not work.
                 // push eax
-                let val = self.resolve(inst.operand(0)); // get eax
-                let sp = self.get(Location::Stack(self.stack_idx)); // [rsp]
-                self.builder.def_var(sp, val); // [rsp] = eax
+                let val = self.value(inst.operand(0)); // get rax
+                self.store(Operand::RegDeref(RegSpec::rsp()), val); // [rsp] = rax
                 self.stack_idx += 1; // rsp++
                 Ok(())
             },
             Opcode::POP => {
-                // pop eax
-                let sp = self.get(Location::Stack(self.stack_idx)); // [rsp]
-                let sp = self.builder.use_var(sp);
-                self.store(inst.operand(0), sp); // eax = [rsp]
+                // pop rax
+                let sp = self.value(Operand::RegDeref(RegSpec::rsp())); // [rsp]
+                self.store(inst.operand(0), sp); // rax = [rsp]
                 self.stack_idx -= 1; // rsp--
                 Ok(())
             },
             Opcode::RETURN => {
                 let return_values: Vec<Value> = HOST.outputs.iter().map(|r_val| {
-                    let var = self.get(r_val.clone());
-                    self.builder.use_var(var)
+                    let mut var = self.get(r_val.clone());
+                    var.val(self.builder).into_ssa(self.int, self.builder)
                 }).collect();
                 self.builder.ins().return_(&return_values[..]);
                 Ok(())
@@ -334,96 +407,143 @@ impl<'a> FunctionTranslator<'a> {
         }
     }
 
-    fn effective_address(&mut self, loc: Operand) -> Result<Value, LiftError> {
+    fn effective_address(&mut self, loc: Operand) -> Result<JitValue, LiftError> {
         println!("lea of {}", loc);
         match loc {
             Operand::RegDeref(r) => {
                 unimplemented!();
             },
             Operand::RegDisp(r, disp) => {
-                let reg = self.get(Location::Reg(r));
-                let reg_use = self.builder.use_var(reg);
-                let disp = self.builder.ins().iconst(self.int, i64::from(disp));
-                Ok(self.builder.ins().iadd(reg_use, disp))
+                let reg = self.get(Location::Reg(r)).val(self.builder);
+                Ok(self.add(reg, JitValue::Const(disp as u32 as usize)))
             }
             _ => unimplemented!()
         }
     }
 
-    pub fn get(&mut self, loc: Location) -> Variable {
+    pub fn get(&mut self, loc: Location) -> JitVariable {
         // If we didn't already have the register bound to a variable,
         // create a fresh one and return it.
         let idx = &mut self.idx;
         let builder = &mut self.builder;
         let int = self.int;
-        *self.context.bound.entry(loc).or_insert_with(|| {
+        self.context.bound.entry(loc).or_insert_with(|| {
             let fresh = Variable::new(**idx);
             **idx = **idx + 1;
             // FIXME: registers should be the correct width
             builder.declare_var(fresh, int);
-            fresh.clone()
-        })
+            JitVariable::Variable(fresh)
+        }).clone()
     }
 
-    /// Resolve an instruction operand into an SSA value.
+    /// Resolve an instruction operand into JitValue.
     /// If we have `mov eax, ecx`, we want to resolve ecx to either a use of the
     /// existing ecx variable in our context, or create a new one and use that.
     /// This has to handle *all* operand types, however: if there's an `[ecx]` we need
     /// to emit a deref instruction and return the value result of that as well.
-    pub fn resolve(&mut self, loc: Operand) -> Value {
+    pub fn value(&mut self, loc: Operand) -> JitValue {
         match loc {
             Operand::Register(r) => {
-                let reg = self.get(Location::Reg(r));
-                self.builder.use_var(reg)
+                self.get(Location::Reg(r)).val(self.builder)
             },
             Operand::RegDeref(const { RegSpec::rsp() }) => {
-                let sp = self.get(Location::Stack(self.stack_idx));
-                self.builder.use_var(sp)
+                self.get(Location::Stack(self.stack_idx)).val(self.builder)
             },
             Operand::ImmediateI8(c) => {
-                let c = self.builder.ins().iconst(self.int, i64::from(c));
-                c
+                JitValue::Const(c as u8 as usize)
             },
-            _ => unimplemented!("resolve for {:?}", loc)
+            _ => unimplemented!("value for {:?}", loc)
         }
     }
 
-    pub fn store(&mut self, loc: Operand, val: Value) {
-        match loc {
-            Operand::Register(r) => {
-                let reg = self.get(Location::Reg(r));
-                self.builder.def_var(reg, val)
-            },
+    pub fn store(&mut self, loc: Operand, val: JitValue) {
+        // The key to look up for the operand in our context.
+        let key = match loc {
+            Operand::Register(r) => Location::Reg(r),
             Operand::RegDeref(const { RegSpec::rsp() }) => {
-                let sp = self.get(Location::Stack(self.stack_idx));
-                self.builder.def_var(sp, val)
-            }
+                Location::Stack(self.stack_idx)
+            },
             Operand::RegDisp(const { RegSpec::rsp() }, o) => {
                 // We turn [rsp-8] into Stack(stack_idx - 1) - we count
                 // stack slots up from 0.
                 assert_eq!(o <= 0, true); // Make sure it's negative
                 assert_eq!(o % 8, 0); // Make sure it aligns
-                let stack_off: usize = (o.unsigned_abs() / 8).try_into().unwrap();
-                let sp = self.get(Location::Stack(self.stack_idx - stack_off));
-                self.builder.def_var(sp, val)
-            }
-            Operand::RegDeref(const { RegSpec::esp() } | const { RegSpec::sp() })
-            | Operand::RegDisp(const { RegSpec::esp() } | const { RegSpec::sp()}, _) => {
-                unimplemented!("non-native stack size");
+                let stack_off: usize = (o.unsigned_abs() / 8)
+                    .try_into().unwrap();
+                Location::Stack(self.stack_idx - stack_off)
             },
-            Operand::RegDeref(r) => {
-                let reg = self.get(Location::Reg(r));
-                let reg_val = self.builder.use_var(reg);
-                self.builder.ins().store(MemFlags::new(), val, reg_val, 0);
+            Operand::RegDeref(r) => Location::Reg(r),
+            Operand::RegDisp(r, o) => Location::Reg(r),
+            _ => unimplemented!("unimplemented key for {:?}", loc),
+        };
+        match val {
+            // If we're just setting a variable to a value, we copy the value in
+            JitValue::Frozen { .. } | JitValue::Const(_) => {
+                // XXX: this can't just do this. [rax+8] = frozen needs to
+                // freeze some constant memory map we keep as well.
+                //unimplemented!("fix this");
+                self.context.bound.entry(key).insert(JitVariable::Known(val));
             },
-            Operand::RegDisp(r, o) => {
-                let reg = self.get(Location::Reg(r));
-                let reg_val = self.builder.use_var(reg);
-                self.builder.ins().store(MemFlags::new(), val, reg_val, o);
+            // If we're setting a v
+            JitValue::Value(val) => {
+                match loc {
+                    // rax = val becomes a redefine for the register
+                    Operand::Register(_)
+                    // [rsp] = val becomes a redefine for the current stack
+                    | Operand::RegDeref(const { RegSpec::rsp() })
+                    // [rsp-8] = val becomes a redefine for the stack slot
+                    | Operand::RegDisp(const { RegSpec::rsp() }, _) => {
+                        let var = Variable::new(*self.idx);
+                        *self.idx = *self.idx + 1;
+                        self.builder.declare_var(var, self.int);
+                        self.builder.def_var(var, val);
+                        self.context.bound.insert(key,
+                            JitVariable::Variable(var));
+                    },
+                    Operand::RegDeref(const { RegSpec::esp() } | const { RegSpec::sp() })
+                    | Operand::RegDisp(const { RegSpec::esp() } | const { RegSpec::sp()}, _) => {
+                        unimplemented!("non-native stack size");
+                    },
+                    Operand::RegDeref(r) => {
+                        // [rax] = val becomes a store to the contents of register
+                        let reg_val = self.get(key)
+                            .val(self.builder).into_ssa(self.int, self.builder);
+                        self.builder.ins().store(MemFlags::new(), val, reg_val, 0);
+                    },
+                    Operand::RegDisp(r, o) => {
+                        let reg_val = self.get(key)
+                            .val(self.builder).into_ssa(self.int, self.builder);
+                        self.builder.ins().store(MemFlags::new(), val, reg_val, o);
+                    },
+                    _ => unimplemented!("store for {} ({:?}) = {:?}", loc, loc, val)
+                }
             },
-            _ => unimplemented!("store for {} ({:?}) = {:?}", loc, loc, val)
+            _ => unimplemented!("unknown store for {:?}", val),
         }
     }
 
-
+    /// Get left+right for JitValues. Treats `left` as a distinct memory region
+    /// if it is frozen: `left+8` gives back a 
+    pub fn add(&mut self, left: JitValue, right: JitValue) -> JitValue {
+        // XXX: set flags
+        use JitValue::*;
+        match (left, right) {
+            (Value(val_left), Value(val_right)) => {
+                Value(self.builder.ins().iadd(val_left, val_right))
+            },
+            (ref_val @ Ref { .. }, Value(ssa))
+            | (Value(ssa), ref_val @ Ref { .. }) => {
+                let v_ptr = ref_val.into_ssa(self.int, self.builder);
+                Value(self.builder.ins().iadd(v_ptr, ssa))
+            },
+            (Ref { base, offset}, Const(c))
+            | (Const(c), Ref { base, offset }) => {
+                Ref { base: base, offset: offset + c }
+            },
+            (Const(left_c), Const(right_c)) => {
+                Const(left_c + right_c)
+            },
+            (left, right) => unimplemented!("unimplemented add {:?} {:?}", left, right)
+        }
+    }
 }

@@ -50,8 +50,8 @@ use core::hint::black_box;
 fn main() -> Result<(), MainError> {
     println!("Hello, world!");
     let mut f = std::fs::File::open("/proc/self/maps").unwrap();
-    let out = std::io::stdout();
-    std::io::copy(&mut f, &mut out.lock()).unwrap();
+    //let out = std::io::stdout();
+    //std::io::copy(&mut f, &mut out.lock()).unwrap();
 
 //    let (s, sexpr) = parse_expr("(+ 1 (+ 2 3))")
 //        .map_err(|e| MainError::Compile(CompileError::Parse(format!("{}", e).into())))?;
@@ -70,25 +70,40 @@ fn main() -> Result<(), MainError> {
     pub(crate) type TestExpr = Box<
         dyn TestFn + Send + Sync,
     >;
-    use core::cell::RefCell;
-    use core::cell::Cell;
     use std::sync::Arc;
+    use std::sync::Mutex;
+    let external = Arc::new(Mutex::new(1));
     let one: TestExpr = box move |e: usize| {
         if black_box(true) == true { 1 } else { 0 }
     };
-    let mut jit = Lineiform::new();
-    let five: TestExpr = box jit.speedup(move |e: usize| {
+    let five: TestExpr = box move |e: usize| {
         let mut acc = e;
         for i in 0..5 {
             acc += one(e);
         }
         return acc;
-    });
+    };
     let eval = five(0);
     assert_eq!(eval, 5);
     let eval2 = five(1);
     assert_eq!(eval2, 6);
 
+    use core::num::Wrapping;
+    extern "C" fn test(a: Wrapping<usize>, b: Wrapping<usize>) -> Wrapping<usize> {
+        a + Wrapping(2)
+    }
+
+    use crate::lift::Location;
+    use yaxpeax_x86::long_mode::RegSpec;
+    let mut tracer = Tracer::new()?;
+    let assumed_test = Function::<(usize, usize), usize>::new(&mut tracer, test as *const ())?
+        .assume_args(vec![(Location::Reg(RegSpec::rdi()), 3)]);
+    let mut lifted = Jit::lift(assumed_test);
+    let (lowered_test, size) = lifted.lower()?;
+    unsafe {
+        let jitted_pinned_test = std::mem::transmute::<_, extern "C" fn(usize, usize)->usize>(lowered_test);
+        assert_eq!(jitted_pinned_test(1, 2), 5);
+    }
     Ok(())
 }
 
