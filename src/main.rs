@@ -32,7 +32,7 @@ use lineiform::{Lineiform};
 use std::collections::HashMap;
 
 #[derive(Error, Debug)]
-enum MainError {
+pub enum MainError {
     //#[error("failed to compile: {0}")]
     //Compile(#[from] CompileError),
     //#[error("failed to evaluate: {0}")]
@@ -143,4 +143,31 @@ fn test_jit() -> Result<(), MainError> {
     assert_eq!(testcase(Wrapping(5)), callable(Wrapping(5)));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    pub fn test_can_pin_argument() -> Result<(), crate::MainError> {
+        use core::num::Wrapping;
+        extern "C" fn test(a: Wrapping<usize>, b: Wrapping<usize>) -> Wrapping<usize> {
+            a + Wrapping(2)
+        }
+
+        use crate::lift::*;
+        use crate::tracer::Tracer;
+        use crate::block::Function;
+        use yaxpeax_x86::long_mode::RegSpec;
+        let mut tracer = Tracer::new()?;
+        let assumed_test = Function::<(usize, usize), usize>::new(&mut tracer, test as *const ())?
+            .assume_args(vec![(Location::Reg(RegSpec::rdi()), 3)]);
+        let mut lifted = Jit::lift(assumed_test);
+        let (lowered_test, size) = lifted.lower()?;
+        unsafe {
+            let jitted_pinned_test = std::mem::transmute::<_, extern "C" fn(usize, usize)->usize>(lowered_test);
+            assert_eq!(jitted_pinned_test(1, 2), 5);
+        }
+        Ok(())
+    }
+
 }

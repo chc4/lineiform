@@ -46,7 +46,8 @@ pub enum LiftError {
 /// SSA variable map. When we create a function, we enter all the calling convention's
 /// inputs into a store, and when we decode x86 and lift it we try and fetch the
 /// "variable" that operand corrosponds to.
-#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+use std::fmt::Display;
+#[derive(Clone, Hash, PartialEq, Eq, Debug, Display)]
 pub enum Location {
     Reg(RegSpec),
     Stack(usize), // TODO: if we ever support x86_32, we need these
@@ -170,7 +171,6 @@ impl Target {
     }
 
     fn fill_in_out(&mut self) -> Result<(), LiftError> {
-        println!("register info {}", self.target_isa.register_info().display_regunit(0));
         match self.triple.architecture {
             Architecture::X86_64 => {
                 self.arguments.append(&mut vec![
@@ -202,12 +202,13 @@ impl<A, O> Jit<A, O> {
 
         let mut ctx = module.make_context();
         ctx.func.signature.call_conv = isa::CallConv::SystemV;
-        let argument_layout = vec![ptr, ptr, int]; // hardcode self, int argument first
+        //let argument_layout = vec![ptr, ptr, int]; // hardcode self, int argument first
+        let argument_layout = vec![int, int]; // hardcode self, int argument first
         for arg in argument_layout.clone() {
             ctx.func.signature.params.push(AbiParam::new(arg));
         }
 
-        let return_layout = vec![int,int]; // hardcode int return type
+        let return_layout = vec![int]; // hardcode int return type
         for ret in return_layout.clone() {
             ctx.func.signature.returns.push(AbiParam::new(ret));
         }
@@ -258,6 +259,7 @@ impl<A, O> Jit<A, O> {
             module: &mut self.module,
             idx: &mut idx,
             stack_idx: 0,
+            return_layout: &mut self.return_layout,
         };
 
         for inst in self.f.instructions.iter() {
@@ -275,7 +277,7 @@ impl<A, O> Jit<A, O> {
         // the fed-in value.
         let mut ctx: HashMap<Location, JitVariable> = HashMap::new();
         for pinned in pinned_values.iter() {
-            println!("adding pinned value {:?} = {}", pinned.0, pinned.1);
+            println!("adding pinned value {} = {}", pinned.0, pinned.1);
             ctx.insert(pinned.0.clone(), JitVariable::Known(JitValue::Const(pinned.1)));
         }
         // Then, for all the arguments to the function, we create a variable for
@@ -283,13 +285,14 @@ impl<A, O> Jit<A, O> {
         // If we pin argument 0 = 1234 in SystemV for example, we want to compile
         // a function with RDI *always* set to 1234, and throw away the actual
         // argument.
-        for (i, arg) in HOST.arguments.iter().enumerate() {
-            ctx.entry(arg.clone()).or_insert_with(|| {
-                println!("adding argument {:?}", arg);
+        for (i, arg_ty) in arg_vars.iter().enumerate() {
+            let arg_slot = &HOST.arguments[i];
+            ctx.entry(arg_slot.clone()).or_insert_with(|| {
+                println!("adding argument {}", arg_slot);
                 let val = builder.block_params(entry_block)[i];
                 let var = Variable::new(*idx);
                 *idx = *idx + 1;
-                builder.declare_var(var, arg_vars[i]);
+                builder.declare_var(var, *arg_ty);
                 builder.def_var(var, val);
                 JitVariable::Variable(var)
             });
@@ -345,6 +348,7 @@ struct FunctionTranslator<'a> {
     module: &'a mut Module,
     idx: &'a mut usize,
     stack_idx: usize,
+    return_layout: &'a mut Vec<Type>,
 }
 
 impl<'a> FunctionTranslator<'a> {
@@ -394,10 +398,13 @@ impl<'a> FunctionTranslator<'a> {
                 Ok(())
             },
             Opcode::RETURN => {
-                let return_values: Vec<Value> = HOST.outputs.iter().map(|r_val| {
-                    let mut var = self.get(r_val.clone());
-                    var.val(self.builder).into_ssa(self.int, self.builder)
-                }).collect();
+                let r_layout = self.return_layout.clone();
+                let return_values: Vec<Value> = r_layout.iter().enumerate()
+                    .map(|(i, r_ty)| {
+                        let r_val = &HOST.outputs[i];
+                        let mut var = self.get(r_val.clone());
+                        var.val(self.builder).into_ssa(self.int, self.builder)
+                    }).collect();
                 self.builder.ins().return_(&return_values[..]);
                 Ok(())
             },
@@ -408,7 +415,6 @@ impl<'a> FunctionTranslator<'a> {
     }
 
     fn effective_address(&mut self, loc: Operand) -> Result<JitValue, LiftError> {
-        println!("lea of {}", loc);
         match loc {
             Operand::RegDeref(r) => {
                 unimplemented!();
@@ -547,3 +553,5 @@ impl<'a> FunctionTranslator<'a> {
         }
     }
 }
+
+

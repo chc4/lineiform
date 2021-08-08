@@ -192,7 +192,7 @@ mod test {
 
     #[test]
     fn can_resolve_function() -> Result<(), TracerError> {
-        assert_eq!(Tracer::new()?.get_symbol_from_address(add_one as *const ())
+        assert_eq!(Tracer::new()?.get_symbol_from_address(crate::tracer::add_one as *const ())
                    .is_ok(), true);
         Ok(())
     }
@@ -200,8 +200,8 @@ mod test {
     #[test]
     fn can_disassemble_fn() -> Result<(), TracerError> {
         let mut tracer = Tracer::new()?;
-        let sym = tracer.get_symbol_from_address(add_one as *const ())?;
-        let instructions = tracer.disassemble(add_one as *const (), sym.st_size as usize)?;
+        let sym = tracer.get_symbol_from_address(crate::tracer::add_one as *const ())?;
+        let instructions = tracer.disassemble(crate::tracer::add_one as *const (), sym.st_size as usize)?;
         tracer.format(&instructions)?;
         Ok(())
     }
