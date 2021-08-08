@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 #![deny(unused_must_use, improper_ctypes_definitions)]
-#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, inline_const, inherent_associated_types, associated_type_bounds)]
+#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, inline_const, inherent_associated_types, associated_type_bounds, let_chains)]
 //extern crate nom;
 extern crate jemallocator;
 extern crate thiserror;
@@ -167,6 +167,15 @@ mod test {
             let jitted_pinned_test = std::mem::transmute::<_, extern "C" fn(usize, usize)->usize>(lowered_test);
             assert_eq!(jitted_pinned_test(1, 2), 5);
         }
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_can_optimize_closure() -> Result<(), crate::MainError> {
+        let a = 1;
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        let clos = jit.speedup(move |()| { black_box(a) + 2 });
         Ok(())
     }
 

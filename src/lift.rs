@@ -10,6 +10,7 @@ use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
 
 use std::collections::HashMap;
 use std::convert::{TryInto, TryFrom};
+use core::num::Wrapping;
 
 use thiserror::Error;
 #[derive(Error, Debug)]
@@ -42,6 +43,8 @@ pub enum LiftError {
 //    }
 //}
 
+const STACK_TOP: usize = 0xFFFF_FFFF_FFFF_FFF0;
+
 /// We use these locations essentially as the keys of an x86 operand -> Cranelift
 /// SSA variable map. When we create a function, we enter all the calling convention's
 /// inputs into a store, and when we decode x86 and lift it we try and fetch the
@@ -73,11 +76,14 @@ pub enum JitValue {
     /// An SSA value
     Value(Value),
     /// A reference to a value, plus an offset into it
-    Ref { base: Rc<JitValue>, offset: usize },
+    Ref(Rc<JitValue>,usize),
+    /// A memory region we use to represent the stack: `sub rsp, 0x8` becomes
+    /// a manipulation a Ref to this, and load/stores can be concretized.
+    Stack,
     /// A frozen memory region. We can inline values from it safely.
     Frozen { addr: *const u8, size: usize },
     /// A statically known value.
-    Const(usize),
+    Const(Wrapping<usize>),
 }
 
 impl JitValue {
@@ -88,10 +94,10 @@ impl JitValue {
         match self {
             Value(val) => val.clone(),
             Const(c) => {
-                builder.ins().iconst(int, i64::try_from(*c as isize).unwrap())
+                builder.ins().iconst(int, i64::try_from(c.0 as isize).unwrap())
             },
             Frozen { .. } => unimplemented!("into_ssa for frozen"),
-            Ref { base, offset } => {
+            Ref(base, offset) => {
                 match **base {
                     Value(_) => unimplemented!("ref to unsupported"),
                     Const(c) => unimplemented!("ref to const"), // XXX: constant pool
@@ -100,9 +106,11 @@ impl JitValue {
                             ((addr as usize) + offset) as isize).unwrap()
                         )
                     },
-                    Ref { .. } => unimplemented!("ref to ref unsupported"),
+                    Ref(_, _) => unimplemented!("ref to ref unsupported"),
+                    Stack => unimplemented!("stack val"),
                 }
             },
+            Stack => unimplemented!("raw stack value? how did you get here"),
         }
     }
 }
@@ -258,7 +266,6 @@ impl<A, O> Jit<A, O> {
             context: variables,
             module: &mut self.module,
             idx: &mut idx,
-            stack_idx: 0,
             return_layout: &mut self.return_layout,
         };
 
@@ -278,7 +285,8 @@ impl<A, O> Jit<A, O> {
         let mut ctx: HashMap<Location, JitVariable> = HashMap::new();
         for pinned in pinned_values.iter() {
             println!("adding pinned value {} = {}", pinned.0, pinned.1);
-            ctx.insert(pinned.0.clone(), JitVariable::Known(JitValue::Const(pinned.1)));
+            ctx.insert(pinned.0.clone(),
+                JitVariable::Known(JitValue::Const(Wrapping(pinned.1))));
         }
         // Then, for all the arguments to the function, we create a variable for
         // the ABI register *unless* it has already been pinned.
@@ -297,6 +305,15 @@ impl<A, O> Jit<A, O> {
                 JitVariable::Variable(var)
             });
         }
+        // We add a "concrete" stack pointer as well - this means that manipulating
+        // the stack by a constant value is tracked, and we can constant fold
+        // load/stores.
+        ctx.insert(Location::Reg(RegSpec::rsp()),
+            JitVariable::Known(JitValue::Ref(
+                Rc::new(JitValue::Stack),
+                STACK_TOP
+            ))
+        );
         Context {
             bound: ctx,
         }
@@ -347,7 +364,6 @@ struct FunctionTranslator<'a> {
     context: Context,
     module: &'a mut Module,
     idx: &'a mut usize,
-    stack_idx: usize,
     return_layout: &'a mut Vec<Type>,
 }
 
@@ -363,7 +379,7 @@ impl<'a> FunctionTranslator<'a> {
             Opcode::INC => {
                 // TODO: set flags
                 let val = self.value(inst.operand(0));
-                let inced = self.add(val, JitValue::Const(1));
+                let inced = self.add(val, JitValue::Const(Wrapping(1)));
                 self.store(inst.operand(0), inced);
                 Ok(())
             },
@@ -372,6 +388,14 @@ impl<'a> FunctionTranslator<'a> {
                 let left = self.value(inst.operand(0));
                 let right = self.value(inst.operand(1));
                 let added = self.add(left, right);
+                self.store(inst.operand(0), added);
+                Ok(())
+            },
+            Opcode::SUB => {
+                // TODO: set flags
+                let left = self.value(inst.operand(0));
+                let right = self.value(inst.operand(1));
+                let added = self.sub(left, right);
                 self.store(inst.operand(0), added);
                 Ok(())
             },
@@ -387,15 +411,26 @@ impl<'a> FunctionTranslator<'a> {
                 // push eax
                 let val = self.value(inst.operand(0)); // get rax
                 self.store(Operand::RegDeref(RegSpec::rsp()), val); // [rsp] = rax
-                self.stack_idx += 1; // rsp++
+                self.shift_stack(-1);
                 Ok(())
             },
             Opcode::POP => {
                 // pop rax
                 let sp = self.value(Operand::RegDeref(RegSpec::rsp())); // [rsp]
                 self.store(inst.operand(0), sp); // rax = [rsp]
-                self.stack_idx -= 1; // rsp--
+                self.shift_stack(1);
                 Ok(())
+            },
+            Opcode::JMP => {
+                unimplemented!("jmp to {}", inst.operand(0))
+            },
+            Opcode::CALL => {
+                let target = inst.operand(0);
+                let val = self.value(target);
+                if let JitValue::Const(c) = val {
+                    unimplemented!("static call: {:x}", c);
+                }
+                unimplemented!("call to {} ({:?})", inst.operand(0), val);
             },
             Opcode::RETURN => {
                 let r_layout = self.return_layout.clone();
@@ -421,9 +456,25 @@ impl<'a> FunctionTranslator<'a> {
             },
             Operand::RegDisp(r, disp) => {
                 let reg = self.get(Location::Reg(r)).val(self.builder);
-                Ok(self.add(reg, JitValue::Const(disp as u32 as usize)))
+                Ok(self.add(reg, JitValue::Const(Wrapping(disp as u8 as usize))))
             }
             _ => unimplemented!()
+        }
+    }
+
+    pub fn shift_stack(&mut self, slots: isize) {
+        let stack_reg = self.value(Operand::Register(RegSpec::rsp()));
+        match stack_reg {
+            JitValue::Ref(ref base, offset)
+                if let JitValue::Stack = **base =>
+            {
+                assert_eq!(offset % 8, 0);
+                println!("shifting stack 0x{:x}", offset);
+                let new_stack = self.add(stack_reg,
+                    JitValue::Const(Wrapping((slots * 8) as usize)));
+                self.store(Operand::Register(RegSpec::rsp()), new_stack);
+            }
+            _ => unimplemented!("non-concrete stack!!"),
         }
     }
 
@@ -442,6 +493,21 @@ impl<'a> FunctionTranslator<'a> {
         }).clone()
     }
 
+    pub fn stack(&mut self) -> usize {
+        let sp = self.get(Location::Reg(RegSpec::rsp()));
+        match sp {
+            JitVariable::Known(JitValue::Ref(base, offset))
+                if let JitValue::Stack = *base =>
+            {
+                println!("current stack @ 0x{:x}", offset);
+                assert!(offset <= STACK_TOP);
+                assert_eq!(offset % 8, 0);
+                offset
+            },
+            _ => unimplemented!("non-concrete stack??"),
+        }
+    }
+
     /// Resolve an instruction operand into JitValue.
     /// If we have `mov eax, ecx`, we want to resolve ecx to either a use of the
     /// existing ecx variable in our context, or create a new one and use that.
@@ -453,10 +519,17 @@ impl<'a> FunctionTranslator<'a> {
                 self.get(Location::Reg(r)).val(self.builder)
             },
             Operand::RegDeref(const { RegSpec::rsp() }) => {
-                self.get(Location::Stack(self.stack_idx)).val(self.builder)
+                let sp = self.stack();
+                self.get(Location::Stack(sp)).val(self.builder)
+            },
+            Operand::RegDisp(const { RegSpec::rsp() }, o) => {
+                // [rsp-8] becomes Stack(self.stack() + 1)
+                assert_eq!(o % 8, 0);
+                let slot = Wrapping(self.stack() as isize) + Wrapping(o as isize);
+                self.get(Location::Stack(slot.0 as usize)).val(self.builder)
             },
             Operand::ImmediateI8(c) => {
-                JitValue::Const(c as u8 as usize)
+                JitValue::Const(Wrapping(c as u8 as usize))
             },
             _ => unimplemented!("value for {:?}", loc)
         }
@@ -465,18 +538,30 @@ impl<'a> FunctionTranslator<'a> {
     pub fn store(&mut self, loc: Operand, val: JitValue) {
         // The key to look up for the operand in our context.
         let key = match loc {
+            Operand::Register(const { RegSpec::rsp() }) => {
+                // sub rsp, 0x8 gets the stack as the value of rsp,
+                // which means it becomes e.g. STACK_TOP-8 after a push.
+                // we just get the offset from STACK_TOP, and move stack
+                match val {
+                    JitValue::Ref(ref base,offset) if let JitValue::Stack = **base => {
+                        assert!(offset <= STACK_TOP);
+                        assert_eq!(offset % 8, 0);
+                        Location::Reg(RegSpec::rsp())
+                    }
+                    _ => unimplemented!("non-concrete stack! {:?}", val),
+                }
+            },
             Operand::Register(r) => Location::Reg(r),
             Operand::RegDeref(const { RegSpec::rsp() }) => {
-                Location::Stack(self.stack_idx)
+                Location::Stack(self.stack())
             },
             Operand::RegDisp(const { RegSpec::rsp() }, o) => {
-                // We turn [rsp-8] into Stack(stack_idx - 1) - we count
+                // We turn [rsp-8] into Stack(stack - 1) - we count
                 // stack slots up from 0.
-                assert_eq!(o <= 0, true); // Make sure it's negative
-                assert_eq!(o % 8, 0); // Make sure it aligns
-                let stack_off: usize = (o.unsigned_abs() / 8)
-                    .try_into().unwrap();
-                Location::Stack(self.stack_idx - stack_off)
+                assert_eq!(o % 8, 0);
+                let sp = Wrapping(self.stack() as isize) + Wrapping(o as isize);
+                println!("stack {} = {:x}", loc, sp.0 as usize);
+                Location::Stack(sp.0 as usize)
             },
             Operand::RegDeref(r) => Location::Reg(r),
             Operand::RegDisp(r, o) => Location::Reg(r),
@@ -484,7 +569,7 @@ impl<'a> FunctionTranslator<'a> {
         };
         match val {
             // If we're just setting a variable to a value, we copy the value in
-            JitValue::Frozen { .. } | JitValue::Const(_) => {
+            JitValue::Frozen { .. } | JitValue::Const(_) | JitValue::Ref(_,_) => {
                 // XXX: this can't just do this. [rax+8] = frozen needs to
                 // freeze some constant memory map we keep as well.
                 //unimplemented!("fix this");
@@ -534,17 +619,18 @@ impl<'a> FunctionTranslator<'a> {
         // XXX: set flags
         use JitValue::*;
         match (left, right) {
+            // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
             (Value(val_left), Value(val_right)) => {
                 Value(self.builder.ins().iadd(val_left, val_right))
             },
-            (ref_val @ Ref { .. }, Value(ssa))
-            | (Value(ssa), ref_val @ Ref { .. }) => {
+            (ref_val @ Ref(_,_), Value(ssa))
+            | (Value(ssa), ref_val @ Ref(_,_)) => {
                 let v_ptr = ref_val.into_ssa(self.int, self.builder);
                 Value(self.builder.ins().iadd(v_ptr, ssa))
             },
-            (Ref { base, offset}, Const(c))
-            | (Const(c), Ref { base, offset }) => {
-                Ref { base: base, offset: offset + c }
+            (Ref(base, offset), Const(c))
+            | (Const(c), Ref(base, offset)) => {
+                Ref(base, (Wrapping(offset) + c).0)
             },
             (Const(left_c), Const(right_c)) => {
                 Const(left_c + right_c)
@@ -552,6 +638,31 @@ impl<'a> FunctionTranslator<'a> {
             (left, right) => unimplemented!("unimplemented add {:?} {:?}", left, right)
         }
     }
+
+    pub fn sub(&mut self, left: JitValue, right: JitValue) -> JitValue {
+        // XXX: set flags
+        use JitValue::*;
+        match (left, right) {
+            // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
+            (Value(val_left), Value(val_right)) => {
+                Value(self.builder.ins().isub(val_left, val_right))
+            },
+            (ref_val @ Ref(_,_), Value(ssa))
+            | (Value(ssa), ref_val @ Ref(_,_)) => {
+                let v_ptr = ref_val.into_ssa(self.int, self.builder);
+                Value(self.builder.ins().isub(v_ptr, ssa))
+            },
+            (Ref(base, offset), Const(c))
+            | (Const(c), Ref(base, offset)) => {
+                Ref(base, (Wrapping(offset) - c).0)
+            },
+            (Const(left_c), Const(right_c)) => {
+                Const(left_c - right_c)
+            },
+            (left, right) => unimplemented!("unimplemented sub {:?} {:?}", left, right)
+        }
+    }
+
 }
 
 

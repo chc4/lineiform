@@ -80,7 +80,13 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
             unsafe { std::mem::transmute(call) };
         // We now compile c_fn(call, f_body, a: A) to a function that can throw
         // away call and f_body.
-        let mut func = Function::<A, O>::new(&mut self.tracer, c_fn::<A,O> as *const ()).unwrap();
+        use crate::lift::Location;
+        let mut func = Function::<A, O>::new(&mut self.tracer, c_fn::<A,O> as *const ())
+            .unwrap()
+            .assume_args(vec![
+                (Location::Reg(RegSpec::rdi()), call as usize),
+                (Location::Reg(RegSpec::rsi()), f_body as usize)
+            ]);
         let mut inlined = Jit::lift(func);
         //inlined.assume(vec![call as *const u8, f_body as *const u8]);
         let (inlined, _size) = inlined.lower().unwrap();
