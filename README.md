@@ -59,6 +59,7 @@ This has the small downside of causing segfaults if you have a `RefCell<usize>` 
 - [ ] Calls (we need to "concretize" the SSA value map, so that an external call has the correct registers/stack, and restore them afterwards)
 -- [ ] Lifting bailouts: if we hit an instruction we can't lift, we can instead bail out and emit a call to inside the original version of the function, so we can optimize only half of a complex function for example.
 -- [ ] Optimistic external calls: try to use DWARF to figure out calling convention + argument count for external functions, to avoid having to spill more registers/stack than we need!
+- [ ] Correct input/output function prototype detection: currently we just hardcode parameter/return value types, which is Bad.
 - [ ] Freezing allocator scheme
 -- [ ] *Freeing* from the frozen allocator (probably using crossbeam_epoch)
 - [ ] Smarter function size fetching (currently we only search `/proc/self/exe` for them! Which doesn't work if you have any dynamic linking lol)
