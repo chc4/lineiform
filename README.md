@@ -47,7 +47,7 @@ Currently, not much. You can create a JIT and optimize a closure, which does som
 
 # A freezing allocator
 Currently we inline loads from a reference to our closed environment. This is good, but it doesn't scale: we also want to inline *functions of functions* we call, which requires us to also inline loads for closures that we are closed over. We can't just recursively inline everything from our environment, however, because our upvalues may have interior mutability that would invalidate our compiled function.
-Instead, we can use a freezing allocator: all closures that are candidates for inlining you `jit.freeze(move |e: Env| { ... body ... })`, which copies it to a read-only memory region. We can then inline any loads from pointers that are inline the frozen memory region, allowing us to recursively inline environments from any closure starting point.
+Instead, we can use a freezing allocator: all closures that are candidates for inlining you `jit.freeze(move |e: Env| { ... body ... })`, which copies it to a read-only memory region. We can then inline any loads from pointers that are inside the frozen memory region, allowing us to recursively inline environments from any closure starting point.
 This has the small downside of causing segfaults if you have a `RefCell<usize>` in your environment and try to mutate it. That's a niche enough case, and easy enough to debug, that I'm just not going to worry about it: more complex interior mutable datastructures would be a pointer chase or more away, and so unfrozen and non-inlinable.
 
 # What Needs Work
