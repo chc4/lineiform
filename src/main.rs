@@ -95,10 +95,11 @@ fn main() -> Result<(), MainError> {
 
     use crate::lift::Location;
     use yaxpeax_x86::long_mode::RegSpec;
+    use crate::lift::JitValue;
     let mut tracer = Tracer::new()?;
     let assumed_test = Function::<(usize, usize), usize>::new(&mut tracer, test as *const ())?
-        .assume_args(vec![(Location::Reg(RegSpec::rdi()), 3)]);
-    let mut lifted = Jit::lift(assumed_test);
+        .assume_args(vec![(Location::Reg(RegSpec::rdi()), JitValue::Const(Wrapping(3)))]);
+    let mut lifted = Jit::lift(&mut tracer, assumed_test);
     let (lowered_test, size) = lifted.lower()?;
     unsafe {
         let jitted_pinned_test = std::mem::transmute::<_, extern "C" fn(usize, usize)->usize>(lowered_test);
@@ -131,7 +132,7 @@ fn test_jit() -> Result<(), MainError> {
     println!("base @ {:x}", func.base as usize);
     tracer.format(&func.instructions)?;
 
-    let mut jitted = Jit::lift(func);
+    let mut jitted = Jit::lift(&mut tracer, func);
     //
     jitted.format();
     let (new_func, new_size) = jitted.lower()?;
@@ -160,8 +161,9 @@ mod test {
         use yaxpeax_x86::long_mode::RegSpec;
         let mut tracer = Tracer::new()?;
         let assumed_test = Function::<(usize, usize), usize>::new(&mut tracer, test as *const ())?
-            .assume_args(vec![(Location::Reg(RegSpec::rdi()), 3)]);
-        let mut lifted = Jit::lift(assumed_test);
+            .assume_args(vec![
+                (Location::Reg(RegSpec::rdi()), JitValue::Const(Wrapping(3)))]);
+        let mut lifted = Jit::lift(&mut tracer, assumed_test);
         let (lowered_test, size) = lifted.lower()?;
         unsafe {
             let jitted_pinned_test = std::mem::transmute::<_, extern "C" fn(usize, usize)->usize>(lowered_test);
@@ -172,10 +174,12 @@ mod test {
 
     #[test]
     pub fn test_can_optimize_closure() -> Result<(), crate::MainError> {
-        let a = 1;
+        use core::num::Wrapping;
+        let a: Wrapping<usize> = Wrapping(1);
         let mut jit = crate::Lineiform::new();
         use core::hint::black_box;
-        let clos = jit.speedup(move |()| { black_box(a) + 2 });
+        let clos = jit.speedup(move |()| { black_box(a) + Wrapping(2) });
+        assert_eq!(clos(()), Wrapping(3));
         Ok(())
     }
 

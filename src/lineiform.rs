@@ -3,6 +3,9 @@ use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
 use std::collections::HashMap;
 use core::marker::PhantomData;
 use std::sync::Arc;
+use std::rc::Rc;
+use core::num::Wrapping;
+use crate::lift::JitValue;
 
 extern "C" fn c_fn<A, O>(
     cb: extern fn(data: *const c_void, A)->O, // "rust-call", but adding that ICEs
@@ -84,13 +87,19 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
         let mut func = Function::<A, O>::new(&mut self.tracer, c_fn::<A,O> as *const ())
             .unwrap()
             .assume_args(vec![
-                (Location::Reg(RegSpec::rdi()), call as usize),
-                (Location::Reg(RegSpec::rsi()), f_body as usize)
+                (Location::Reg(RegSpec::rdi()), JitValue::Const(Wrapping(call as usize))),
+                (Location::Reg(RegSpec::rsi()), JitValue::Ref(
+                        Rc::new(JitValue::Frozen {
+                            addr: &f as *const _ as *const u8,
+                            size: std::mem::size_of_val(&f),
+                        }), 0)
+                ),
             ]);
-        let mut inlined = Jit::lift(func);
+        let mut inlined = Jit::lift(&mut self.tracer, func);
         //inlined.assume(vec![call as *const u8, f_body as *const u8]);
         let (inlined, _size) = inlined.lower().unwrap();
         // TODO: cache this? idk what our key is
+        std::mem::forget(f); // don't run destructor for the closure
         FastFn { f: Some(unsafe { std::mem::transmute(inlined) }) }
     }
 }

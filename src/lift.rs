@@ -7,6 +7,7 @@ use crate::block::{Function};
 use cranelift_codegen::ir::types::Type;
 
 use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
+use yaxpeax_arch::LengthedInstruction;
 
 use std::collections::HashMap;
 use std::convert::{TryInto, TryFrom};
@@ -29,6 +30,10 @@ pub enum LiftError {
     UnimplementedInst(Instruction),
     #[error("error creating cranelift module {0}")]
     Module(#[from] cranelift_module::ModuleError),
+    #[error("disassembling call target {0}")]
+    Block(#[from] crate::block::BlockError),
+    #[error("tracer error {0}")]
+    Tracer(#[from] crate::tracer::TracerError),
 }
 
 //impl State {
@@ -127,7 +132,7 @@ struct Context {
     bound: HashMap<Location, JitVariable>,
 }
 
-pub struct Jit<A, O> {
+pub struct Jit<'a, A, O> {
     f: Function<A, O>,
     builder_context: FunctionBuilderContext,
     ctx: codegen::Context,
@@ -135,6 +140,7 @@ pub struct Jit<A, O> {
     module: JITModule,
     argument_layout: Vec<Type>,
     return_layout: Vec<Type>,
+    tracer: &'a mut Tracer<'static>,
 }
 
 use cranelift_codegen::ir::ArgumentLoc;
@@ -200,8 +206,8 @@ impl Target {
     }
 }
 
-impl<A, O> Jit<A, O> {
-    pub fn lift(f: Function<A, O>) -> Jit<A, O> {
+impl<'a, A, O> Jit<'a, A, O> {
+    pub fn lift(tracer: &'a mut Tracer<'static>, f: Function<A, O>) -> Jit<'a, A, O> {
         let builder = JITBuilder::new(cranelift_module::default_libcall_names());
         let module = JITModule::new(builder);
 
@@ -229,6 +235,7 @@ impl<A, O> Jit<A, O> {
             module,
             argument_layout,
             return_layout,
+            tracer,
         }
     }
 
@@ -261,32 +268,36 @@ impl<A, O> Jit<A, O> {
         builder.seal_block(entry_block);
 
         let mut function_translator = FunctionTranslator {
+            f: (self.f.base, self.f.size),
             int,
             builder: &mut builder,
             context: variables,
             module: &mut self.module,
             idx: &mut idx,
             return_layout: &mut self.return_layout,
+            tracer: &mut self.tracer,
         };
 
+        let mut ip = self.f.base as usize;
         for inst in self.f.instructions.iter() {
-            function_translator.emit(inst)?;
+            function_translator.emit(ip, inst)?;
+            ip += inst.len().to_const() as usize;
         }
         println!("jit output: \n{}", function_translator.builder.display(None));
         function_translator.builder.finalize();
         Ok(())
     }
 
-    fn make_variables<'a>(builder: &mut FunctionBuilder<'a>, idx: &mut usize, entry_block: Block,
-        int: Type, arg_vars: &Vec<Type>, pinned_values: &Vec<(Location, usize)>) -> Context
+    fn make_variables<'b>(builder: &mut FunctionBuilder<'b>, idx: &mut usize, entry_block: Block,
+        int: Type, arg_vars: &Vec<Type>, pinned_values: &Vec<(Location, JitValue)>) -> Context
     {
         // First, we make a variable for all of our pinned locations containing
         // the fed-in value.
         let mut ctx: HashMap<Location, JitVariable> = HashMap::new();
         for pinned in pinned_values.iter() {
-            println!("adding pinned value {} = {}", pinned.0, pinned.1);
+            println!("adding pinned value {} = {:?}", pinned.0, pinned.1);
             ctx.insert(pinned.0.clone(),
-                JitVariable::Known(JitValue::Const(Wrapping(pinned.1))));
+                JitVariable::Known(pinned.1.clone()));
         }
         // Then, for all the arguments to the function, we create a variable for
         // the ABI register *unless* it has already been pinned.
@@ -359,42 +370,44 @@ impl<A, O> Jit<A, O> {
 // We can't hold a FunctionBuilder and the FunctionBuilderCtx in the same struct,
 // so we need this helper struct for the Jit.
 struct FunctionTranslator<'a> {
+    f: (*const (), usize),
     int: Type,
     builder: &'a mut FunctionBuilder<'a>,
     context: Context,
     module: &'a mut Module,
     idx: &'a mut usize,
     return_layout: &'a mut Vec<Type>,
+    tracer: &'a mut Tracer<'static>,
 }
 
 impl<'a> FunctionTranslator<'a> {
-    fn emit(&mut self, inst: &Instruction) -> Result<(), LiftError> {
+    fn emit(&mut self, ip: usize, inst: &Instruction) -> Result<(), LiftError> {
         println!("emitting for {}", inst);
         match inst.opcode() {
             Opcode::MOV => {
-                let val = self.value(inst.operand(1));
+                let val = self.value(ip, inst.operand(1));
                 self.store(inst.operand(0), val);
                 Ok(())
             },
             Opcode::INC => {
                 // TODO: set flags
-                let val = self.value(inst.operand(0));
+                let val = self.value(ip, inst.operand(0));
                 let inced = self.add(val, JitValue::Const(Wrapping(1)));
                 self.store(inst.operand(0), inced);
                 Ok(())
             },
             Opcode::ADD => {
                 // TODO: set flags
-                let left = self.value(inst.operand(0));
-                let right = self.value(inst.operand(1));
+                let left = self.value(ip, inst.operand(0));
+                let right = self.value(ip, inst.operand(1));
                 let added = self.add(left, right);
                 self.store(inst.operand(0), added);
                 Ok(())
             },
             Opcode::SUB => {
                 // TODO: set flags
-                let left = self.value(inst.operand(0));
-                let right = self.value(inst.operand(1));
+                let left = self.value(ip, inst.operand(0));
+                let right = self.value(ip, inst.operand(1));
                 let added = self.sub(left, right);
                 self.store(inst.operand(0), added);
                 Ok(())
@@ -409,25 +422,57 @@ impl<'a> FunctionTranslator<'a> {
                 // slot? if we just symbolize the stack variable then jumping to
                 // native code might not work.
                 // push eax
-                let val = self.value(inst.operand(0)); // get rax
+                let val = self.value(ip, inst.operand(0)); // get rax
                 self.store(Operand::RegDeref(RegSpec::rsp()), val); // [rsp] = rax
                 self.shift_stack(-1);
                 Ok(())
             },
             Opcode::POP => {
                 // pop rax
-                let sp = self.value(Operand::RegDeref(RegSpec::rsp())); // [rsp]
+                let sp = self.value(ip, Operand::RegDeref(RegSpec::rsp())); // [rsp]
                 self.store(inst.operand(0), sp); // rax = [rsp]
                 self.shift_stack(1);
                 Ok(())
             },
             Opcode::JMP => {
-                unimplemented!("jmp to {}", inst.operand(0))
+                let target: JitValue = match inst.operand(0) {
+                    absolute @ (Operand::Register(_) | Operand::RegDisp(_, _)) => {
+                        self.value(ip, absolute)
+                    },
+                    relative @ Operand::ImmediateI8(_) => {
+                        let target_val = self.value(ip, relative);
+                        self.add(JitValue::Const(Wrapping(ip)), target_val)
+                    },
+                    _ => unimplemented!("jump target operand {}", inst.operand(0)),
+                };
+                if let JitValue::Const(c) = target {
+                    println!("known jump location: 0x{:x}", c.0);
+                    if c.0 >= (self.f.0 as usize) && c.0 <= (self.f.0 as usize) + self.f.1 {
+                        unimplemented!("internal jump");
+                    }
+                    let jump_target = Function::<(), ()>::new(self.tracer, c.0 as *const ())?;
+                    //self.tracer.format(&jump_target.instructions)?;
+                    // TODO: move this to a self.inline(f) method or whatever
+                    let outer = self.f.clone();
+                    self.f = (jump_target.base, jump_target.size);
+                    let mut inlined_ip = c.0;
+                    for inlined_inst in jump_target.instructions.iter() {
+                        self.emit(inlined_ip, inlined_inst)?;
+                        inlined_ip += inlined_inst.len().to_const() as usize;
+                    }
+                    self.f = outer;
+                    println!("emitted inlined jmp target :)");
+                    Ok(())
+                } else {
+                    unimplemented!("dynamic call");
+                }
             },
             Opcode::CALL => {
                 let target = inst.operand(0);
-                let val = self.value(target);
+                let val = self.value(ip, target);
                 if let JitValue::Const(c) = val {
+                    let body = Function::<(),()>::new(self.tracer, c.0 as *const ())?;
+                    self.tracer.format(&body.instructions)?;
                     unimplemented!("static call: {:x}", c);
                 }
                 unimplemented!("call to {} ({:?})", inst.operand(0), val);
@@ -463,13 +508,13 @@ impl<'a> FunctionTranslator<'a> {
     }
 
     pub fn shift_stack(&mut self, slots: isize) {
-        let stack_reg = self.value(Operand::Register(RegSpec::rsp()));
+        let stack_reg = self.value(0, Operand::Register(RegSpec::rsp()));
         match stack_reg {
             JitValue::Ref(ref base, offset)
                 if let JitValue::Stack = **base =>
             {
                 assert_eq!(offset % 8, 0);
-                println!("shifting stack 0x{:x}", offset);
+                //println!("shifting stack 0x{:x}", offset);
                 let new_stack = self.add(stack_reg,
                     JitValue::Const(Wrapping((slots * 8) as usize)));
                 self.store(Operand::Register(RegSpec::rsp()), new_stack);
@@ -499,7 +544,7 @@ impl<'a> FunctionTranslator<'a> {
             JitVariable::Known(JitValue::Ref(base, offset))
                 if let JitValue::Stack = *base =>
             {
-                println!("current stack @ 0x{:x}", offset);
+                //println!("current stack @ 0x{:x}", offset);
                 assert!(offset <= STACK_TOP);
                 assert_eq!(offset % 8, 0);
                 offset
@@ -513,8 +558,11 @@ impl<'a> FunctionTranslator<'a> {
     /// existing ecx variable in our context, or create a new one and use that.
     /// This has to handle *all* operand types, however: if there's an `[ecx]` we need
     /// to emit a deref instruction and return the value result of that as well.
-    pub fn value(&mut self, loc: Operand) -> JitValue {
+    pub fn value(&mut self, ip: usize, loc: Operand) -> JitValue {
         match loc {
+            Operand::Register(const { RegSpec::rip() }) => {
+                JitValue::Const(Wrapping(ip))
+            },
             Operand::Register(r) => {
                 self.get(Location::Reg(r)).val(self.builder)
             },
@@ -528,10 +576,35 @@ impl<'a> FunctionTranslator<'a> {
                 let slot = Wrapping(self.stack() as isize) + Wrapping(o as isize);
                 self.get(Location::Stack(slot.0 as usize)).val(self.builder)
             },
+            Operand::RegDeref(r) => {
+                let reg_val = self.get(Location::Reg(r)).val(self.builder);
+                match reg_val {
+                    JitValue::Ref(base, offset) => {
+                        // we are dereferencing a ref - we just get the data
+                        // it's pointing to!
+                        match &*base {
+                            JitValue::Frozen { addr, size } => {
+                                // we are dereferencing a pointer inside our
+                                // frozen region: we return the constant data
+                                if offset >= *size {
+                                    unimplemented!("read outside frozen memory region");
+                                }
+                                // XXX: self.load(width, jitvalue)?
+                                unsafe {
+                                    JitValue::Const(Wrapping(std::ptr::read::<usize>(
+                                        addr.offset(offset.try_into().unwrap()) as *const usize)))
+                                }
+                            },
+                            val @ _ => unimplemented!("value for ref to {:?}", val),
+                        }
+                    },
+                    _ => unimplemented!("deref to {:?}", reg_val),
+                }
+            },
             Operand::ImmediateI8(c) => {
                 JitValue::Const(Wrapping(c as u8 as usize))
             },
-            _ => unimplemented!("value for {:?}", loc)
+            _ => unimplemented!("value for {}", loc)
         }
     }
 

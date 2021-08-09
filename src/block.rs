@@ -2,6 +2,8 @@ use crate::tracer::{self, Tracer};
 use std::sync::Arc;
 use yaxpeax_x86::long_mode::Instruction;
 use yaxpeax_x86::long_mode::RegSpec;
+use crate::lift::JitValue;
+use std::num::Wrapping;
 
 pub enum VariableValue {
     u8(u8),
@@ -48,7 +50,7 @@ pub struct Function<ARG, OUT> {
     pub base: *const (),
     pub size: usize,
     pub instructions: Arc<Vec<Instruction>>,
-    pub pinned: Vec<(Location, usize)>,
+    pub pinned: Vec<(Location, JitValue)>,
     _phantom: PhantomData<(ARG, OUT)>, //fn(data: *const c_void, ARG)->OUT
 }
 
@@ -74,22 +76,7 @@ pub enum BlockError {
 ///Maybe in the future Rust will allow for custom calling convention of closures,
 ///but the issue has ~0 traffic and no RFC, so I'm not holding my breath...
 impl<A, O> Function<A, O> {
-    /// Create a new function via disassembling an Fn trait object
-    pub fn from_fn<F: Fn(A)->O>(tracer: &mut Tracer, f: F) -> Result<Self, BlockError> {
-        // Get the trait method for calling a Fn of this type
-        let c: for<'a> extern "rust-call" fn(&'a F, (A,))->O = <F as Fn<(A,)>>::call;
-        let c: extern fn(data: *const c_void, A)->O = unsafe { std::mem::transmute(c) };
-        //let base = unsafe { std::mem::transmute(c) };
-        // We have to start tracing at the trampoline, since we need to be able
-        // to lift the rust-call cconv prologue/epilogue.
-        Ok(Function::new(tracer, c_fn::<A,O> as *const ())?
-            .assume_args(vec![
-                (Location::Reg(RegSpec::rdi()), c as usize),
-                (Location::Reg(RegSpec::rsi()), &f as *const _ as *const c_void as usize)
-            ]))
-    }
-
-    pub fn assume_args(mut self, pinning: Vec<(Location, usize)>) -> Self {
+    pub fn assume_args(mut self, pinning: Vec<(Location, JitValue)>) -> Self {
         self.pinned = pinning;
         self
     }
