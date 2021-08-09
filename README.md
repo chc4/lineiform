@@ -53,15 +53,15 @@ This has the small downside of causing segfaults if you have a `RefCell<usize>` 
 # What Needs Work
 - [x] Disassembling functions
 - [x] Lifting x86 to Cranelift IR
--- [ ] Enough instructions that anything non-trivial doesn't crash
+    - [ ] Enough instructions that anything non-trivial doesn't crash
 - [ ] Branches
 - [ ] Loops
 - [ ] Calls (we need to "concretize" the SSA value map, so that an external call has the correct registers/stack, and restore them afterwards)
--- [ ] Lifting bailouts: if we hit an instruction we can't lift, we can instead bail out and emit a call to inside the original version of the function, so we can optimize only half of a complex function for example.
--- [ ] Optimistic external calls: try to use DWARF to figure out calling convention + argument count for external functions, to avoid having to spill more registers/stack than we need!
+    - [ ] Lifting bailouts: if we hit an instruction we can't lift, we can instead bail out and emit a call to inside the original version of the function, so we can optimize only half of a complex function for example.
+    - [ ] Optimistic external calls: try to use DWARF to figure out calling convention + argument count for external functions, to avoid having to spill more registers/stack than we need!
 - [ ] Correct input/output function prototype detection: currently we just hardcode parameter/return value types, which is Bad.
 - [ ] Freezing allocator scheme
--- [ ] *Freeing* from the frozen allocator (probably using crossbeam_epoch)
+    - [ ] *Freeing* from the frozen allocator (probably using crossbeam_epoch)
 - [ ] Smarter function size fetching (currently we only search `/proc/self/exe` for them! Which doesn't work if you have any dynamic linking lol)
 - [ ] Performance counters for the "optimized" Fn trait, so we only optimize over some threshold.
 - [ ] A `specialize` function: we can have a variant of `optimize` that also fixes a value from the *arguments* to the closure, to for example pin the type tag of an object to erase type checks. We can compile a variant for each concrete pinned value, and emit a jump table that dispatches to either the non-compiled generic version, or the specialized variant.
