@@ -8,7 +8,7 @@ A normal tree-walking interpreter in Rust looks like this: (pseudocode but not m
 fn eval(ast: Ast) -> usize {
     match ast {
         Literal(l) => l,
-        Add(left, right) => left + right,
+        Add(left, right) => eval(left) + eval(right),
     }
 }
 
@@ -31,7 +31,7 @@ fn eval(ast: Ast) -> EvalAst {
     }
 }
 
-let compiled_eval = eval(box Add(box Literal(1), box Literal(2)))
+let compiled_eval = eval(Add(Literal(1), Literal(2)))
 let env: Environment = ();
 compiled_eval(env) // 3
 ```
