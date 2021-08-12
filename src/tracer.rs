@@ -59,7 +59,7 @@ pub enum TracerError {
     #[error("unsupported platform: bluetech only supports linux")]
     Unsupported,
     #[error("can't find symbol for function {0:x}")]
-    CantFindFunction(usize),
+    CantFindFunction(usize, usize),
     #[error("executable has no .needle section")]
     NoNeedle,
     #[error("couldn't write formatting")]
@@ -121,8 +121,9 @@ impl<'a> Tracer<'a> {
 
     /// Get symbol for vaddr
     pub fn get_symbol_from_vaddr(&self, f: usize) -> Option<Sym> {
+        let addr = (f as usize).try_into().unwrap();
         self.elf.syms.iter().filter(|sym|
-            sym.st_value == (f as usize).try_into().unwrap()
+            sym.st_value >= addr && addr < sym.st_value + sym.st_size
         ).next()
     }
 
@@ -130,7 +131,7 @@ impl<'a> Tracer<'a> {
     pub fn get_symbol_from_address(&mut self, f: *const ()) -> Result<Sym, TracerError> {
         let base = self.get_base()?;
         let sym = self.get_symbol_from_vaddr(f as usize - base)
-            .ok_or(TracerError::CantFindFunction(f as usize))?;
+            .ok_or(TracerError::CantFindFunction(base, f as usize - base))?;
         Ok(sym)
     }
 
@@ -200,7 +201,7 @@ mod test {
     #[test]
     fn can_disassemble_fn() -> Result<(), TracerError> {
         let mut tracer = Tracer::new()?;
-        let sym = tracer.get_symbol_from_address(crate::tracer::add_one as *const ())?;
+        let sym = tracer.t_symbol_from_address(crate::tracer::add_one as *const ())?;
         let instructions = tracer.disassemble(crate::tracer::add_one as *const (), sym.st_size as usize)?;
         tracer.format(&instructions)?;
         Ok(())

@@ -34,21 +34,14 @@ pub enum LiftError {
     Block(#[from] crate::block::BlockError),
     #[error("tracer error {0}")]
     Tracer(#[from] crate::tracer::TracerError),
+    #[error("we hit a return to {0:x}")]
+    FunctionEnded(usize),
+    #[error("we didn't return to the callsite in our lifted function")]
+    TranslateOut(()),
 }
 
-//impl State {
-//    pub fn run<A, O: Fn<A>>(&mut self, f: fn(A) -> O, args: A) -> O {
-//        unimplemented!()
-//    }
-//
-//    pub fn partial_evaluate<A, O>(&mut self, f: Function<A, O>)
-//        -> Result<Vec<Instruction>, LiftError>
-//    {
-//        Ok(vec![])
-//    }
-//}
-
 const STACK_TOP: usize = 0xFFFF_FFFF_FFFF_FFF0;
+const STACK: RegSpec = RegSpec::rsp();
 
 /// We use these locations essentially as the keys of an x86 operand -> Cranelift
 /// SSA variable map. When we create a function, we enter all the calling convention's
@@ -57,8 +50,12 @@ const STACK_TOP: usize = 0xFFFF_FFFF_FFFF_FFF0;
 use std::fmt::Display;
 #[derive(Clone, Hash, PartialEq, Eq, Debug, Display)]
 pub enum Location {
+    /// A register value
     Reg(RegSpec),
-    Stack(usize), // TODO: if we ever support x86_32, we need these
+    /// A stack slot value. The `usize` is the "stack address" of it:
+    /// `push rax` will create a new Stack(STACK_TOP) entry if it's the first
+    /// stack operation, for example.
+    Stack(usize),
 }
 
 #[derive(Clone)]
@@ -83,7 +80,7 @@ pub enum JitValue {
     /// A reference to a value, plus an offset into it
     Ref(Rc<JitValue>,usize),
     /// A memory region we use to represent the stack: `sub rsp, 0x8` becomes
-    /// a manipulation a Ref to this, and load/stores can be concretized.
+    /// manipulating a Ref to this, and load/stores can be concretized.
     Stack,
     /// A frozen memory region. We can inline values from it safely.
     Frozen { addr: *const u8, size: usize },
@@ -121,14 +118,10 @@ impl JitValue {
 }
 
 struct Context {
-    // XXX: this probably can't only use Variable! if we pin a frozen environment,
-    // we can only assume that the *direct* contents of that environment are
-    // valid. This is because we can't ban interior mutability in the closed
-    // environment - we will have a custom allocator that we will put the closures
-    // in that mean that Mutex<usize> can't mutate the value without crashing,
-    // but a Mutex<&usize> we have to make sure we don't inline env->&usize->1
-    // and have it changed. We probably need an enum, and have a Frozen enum that
-    // always dereferences to a NonFrozen variant, and only const prop Frozen.
+    /// Our currently known execution environment. This holds values like `rax`
+    /// and stored stack values, mapping them to either constant propagated
+    /// values, or Cranelift SSA variables if they are unknown at compilation
+    /// time.
     bound: HashMap<Location, JitVariable>,
 }
 
@@ -141,6 +134,12 @@ pub struct Jit<'a, A, O> {
     argument_layout: Vec<Type>,
     return_layout: Vec<Type>,
     tracer: &'a mut Tracer<'static>,
+}
+
+enum EmitEffect {
+    Advance,
+    Jmp(usize),
+    Ret,
 }
 
 use cranelift_codegen::ir::ArgumentLoc;
@@ -216,8 +215,8 @@ impl<'a, A, O> Jit<'a, A, O> {
 
         let mut ctx = module.make_context();
         ctx.func.signature.call_conv = isa::CallConv::SystemV;
-        //let argument_layout = vec![ptr, ptr, int]; // hardcode self, int argument first
-        let argument_layout = vec![int, int]; // hardcode self, int argument first
+        let argument_layout = vec![ptr, ptr, int]; // hardcode self, int argument first
+        //let argument_layout = vec![int, int]; // hardcode self, int argument first
         for arg in argument_layout.clone() {
             ctx.func.signature.params.push(AbiParam::new(arg));
         }
@@ -265,9 +264,9 @@ impl<'a, A, O> Jit<'a, A, O> {
         let mut idx = 0; // Why do we need to do this instead of asking cranelift for
         // a fresh variable??
         let mut variables = Self::make_variables(&mut builder, &mut idx, entry_block, int, &self.argument_layout, &self.f.pinned);
-        builder.seal_block(entry_block);
 
         let mut function_translator = FunctionTranslator {
+            depth: 0,
             f: (self.f.base, self.f.size),
             int,
             builder: &mut builder,
@@ -279,10 +278,38 @@ impl<'a, A, O> Jit<'a, A, O> {
         };
 
         let mut ip = self.f.base as usize;
-        for inst in self.f.instructions.iter() {
-            function_translator.emit(ip, inst)?;
+        let mut stream = self.f.instructions.clone();
+        let mut i = 0;
+        'emit: loop {
+            let inst = stream.get(i);
+            if let None = inst {
+                // we ran out of inputs but didn't hit a ret!
+                return Err(LiftError::TranslateOut(()));
+            }
+            let inst = inst.unwrap();
             ip += inst.len().to_const() as usize;
-        }
+            i += 1;
+            let eff = function_translator.emit(ip, inst)?;
+            match eff {
+                EmitEffect::Advance => (),
+                EmitEffect::Jmp(target) => {
+                    // XXX: make sure this only works for *internal* jumps?
+                    // tailcalls need to become just a jmp to the target and stop
+                    let jump_target = Function::<A, O>::new(function_translator.tracer, target as *const ())?;
+                    //self.tracer.format(&jump_target.instructions)?;
+                    //self.inline(jump_target)?;
+                    println!("emitting inlined jmp target");
+                    stream = jump_target.instructions.clone();
+                    i = 0;
+                    ip = target;
+                },
+                // The actual end of our function - 
+                EmitEffect::Ret => {
+                    break 'emit;
+                },
+            };
+        };
+        function_translator.builder.seal_block(entry_block);
         println!("jit output: \n{}", function_translator.builder.display(None));
         function_translator.builder.finalize();
         Ok(())
@@ -319,7 +346,7 @@ impl<'a, A, O> Jit<'a, A, O> {
         // We add a "concrete" stack pointer as well - this means that manipulating
         // the stack by a constant value is tracked, and we can constant fold
         // load/stores.
-        ctx.insert(Location::Reg(RegSpec::rsp()),
+        ctx.insert(Location::Reg(STACK),
             JitVariable::Known(JitValue::Ref(
                 Rc::new(JitValue::Stack),
                 STACK_TOP
@@ -331,7 +358,7 @@ impl<'a, A, O> Jit<'a, A, O> {
     }
 
     pub fn lower(&mut self) -> Result<(*const u8, u32),LiftError> {
-        self.translate()?;
+        let translate_result = self.translate()?;
 
         let id = self.module.declare_function(
             "test function",
@@ -370,6 +397,7 @@ impl<'a, A, O> Jit<'a, A, O> {
 // We can't hold a FunctionBuilder and the FunctionBuilderCtx in the same struct,
 // so we need this helper struct for the Jit.
 struct FunctionTranslator<'a> {
+    depth: usize,
     f: (*const (), usize),
     int: Type,
     builder: &'a mut FunctionBuilder<'a>,
@@ -381,20 +409,18 @@ struct FunctionTranslator<'a> {
 }
 
 impl<'a> FunctionTranslator<'a> {
-    fn emit(&mut self, ip: usize, inst: &Instruction) -> Result<(), LiftError> {
+    fn emit(&mut self, ip: usize, inst: &Instruction) -> Result<EmitEffect, LiftError> {
         println!("emitting for {}", inst);
         match inst.opcode() {
             Opcode::MOV => {
                 let val = self.value(ip, inst.operand(1));
                 self.store(inst.operand(0), val);
-                Ok(())
             },
             Opcode::INC => {
                 // TODO: set flags
                 let val = self.value(ip, inst.operand(0));
                 let inced = self.add(val, JitValue::Const(Wrapping(1)));
                 self.store(inst.operand(0), inced);
-                Ok(())
             },
             Opcode::ADD => {
                 // TODO: set flags
@@ -402,7 +428,6 @@ impl<'a> FunctionTranslator<'a> {
                 let right = self.value(ip, inst.operand(1));
                 let added = self.add(left, right);
                 self.store(inst.operand(0), added);
-                Ok(())
             },
             Opcode::SUB => {
                 // TODO: set flags
@@ -410,31 +435,25 @@ impl<'a> FunctionTranslator<'a> {
                 let right = self.value(ip, inst.operand(1));
                 let added = self.sub(left, right);
                 self.store(inst.operand(0), added);
-                Ok(())
             },
             Opcode::LEA => {
                 let val = self.effective_address(inst.operand(1))?;
                 self.store(inst.operand(0), val);
-                Ok(())
             },
             Opcode::PUSH => {
-                // TODO: figure out if we need to tell cranelift to allocate a stack
-                // slot? if we just symbolize the stack variable then jumping to
-                // native code might not work.
                 // push eax
                 let val = self.value(ip, inst.operand(0)); // get rax
-                self.store(Operand::RegDeref(RegSpec::rsp()), val); // [rsp] = rax
-                self.shift_stack(-1);
-                Ok(())
+                self.store(Operand::RegDeref(STACK), val); // [rsp] = rax
+                self.shift_stack(-1); // rsp -= 8
             },
             Opcode::POP => {
                 // pop rax
-                let sp = self.value(ip, Operand::RegDeref(RegSpec::rsp())); // [rsp]
+                let sp = self.value(ip, Operand::RegDeref(STACK)); // [rsp]
                 self.store(inst.operand(0), sp); // rax = [rsp]
-                self.shift_stack(1);
-                Ok(())
+                self.shift_stack(1); // rsp += 8
             },
             Opcode::JMP => {
+                // Resolve the jump target (either absolute or relative)
                 let target: JitValue = match inst.operand(0) {
                     absolute @ (Operand::Register(_) | Operand::RegDisp(_, _)) => {
                         self.value(ip, absolute)
@@ -445,53 +464,81 @@ impl<'a> FunctionTranslator<'a> {
                     },
                     _ => unimplemented!("jump target operand {}", inst.operand(0)),
                 };
+                // If we know where the jump is going, we can try to inline
                 if let JitValue::Const(c) = target {
                     println!("known jump location: 0x{:x}", c.0);
+                    // If it's within our own function, it's an internal branch:
+                    // don't handle this for now.
                     if c.0 >= (self.f.0 as usize) && c.0 <= (self.f.0 as usize) + self.f.1 {
                         unimplemented!("internal jump");
                     }
-                    let jump_target = Function::<(), ()>::new(self.tracer, c.0 as *const ())?;
-                    //self.tracer.format(&jump_target.instructions)?;
-                    // TODO: move this to a self.inline(f) method or whatever
-                    let outer = self.f.clone();
-                    self.f = (jump_target.base, jump_target.size);
-                    let mut inlined_ip = c.0;
-                    for inlined_inst in jump_target.instructions.iter() {
-                        self.emit(inlined_ip, inlined_inst)?;
-                        inlined_ip += inlined_inst.len().to_const() as usize;
-                    }
-                    self.f = outer;
-                    println!("emitted inlined jmp target :)");
-                    Ok(())
+                    return Ok(EmitEffect::Jmp(c.0));
                 } else {
                     unimplemented!("dynamic call");
                 }
             },
             Opcode::CALL => {
-                let target = inst.operand(0);
-                let val = self.value(ip, target);
-                if let JitValue::Const(c) = val {
+                // Resolve the call target (either absolute or relative)
+                let target: JitValue = match inst.operand(0) {
+                    absolute @ (Operand::Register(_) | Operand::RegDisp(_, _)) => {
+                        self.value(ip, absolute)
+                    },
+                    relative @ (Operand::ImmediateI8(_)
+                        | Operand::ImmediateI16(_)
+                        | Operand::ImmediateI32(_)
+                    )=> {
+                        let target_val = self.value(ip, relative);
+                        self.add(JitValue::Const(Wrapping(ip)), target_val)
+                    },
+                    _ => unimplemented!("call target operand {}", inst.operand(0)),
+                };
+                if let JitValue::Const(c) = target {
+                    // we're inlining the call body into this function:
                     let body = Function::<(),()>::new(self.tracer, c.0 as *const ())?;
                     self.tracer.format(&body.instructions)?;
-                    unimplemented!("static call: {:x}", c);
+                    // `push rip`
+                    self.store(Operand::RegDeref(STACK),
+                        JitValue::Const(Wrapping(ip)));
+                    self.shift_stack(-1); // rsp -= 8
+                    // and then we just jump to the call target
+                    return Ok(EmitEffect::Jmp(c.0));
+                } else {
+                    unimplemented!("call to {} ({:?})", inst.operand(0), target)
                 }
-                unimplemented!("call to {} ({:?})", inst.operand(0), val);
             },
             Opcode::RETURN => {
-                let r_layout = self.return_layout.clone();
-                let return_values: Vec<Value> = r_layout.iter().enumerate()
-                    .map(|(i, r_ty)| {
-                        let r_val = &HOST.outputs[i];
-                        let mut var = self.get(r_val.clone());
-                        var.val(self.builder).into_ssa(self.int, self.builder)
-                    }).collect();
-                self.builder.ins().return_(&return_values[..]);
-                Ok(())
+                if inst.operand_present(0) {
+                    unimplemented!("return with stack pops");
+                }
+                // if we were trying to return to the value past the top of the
+                // stack, then we were returning out of our emitted function:
+                // we're all done jitting, and can tell cranelift to stop.
+                if self.stack() == STACK_TOP {
+                    let r_layout = self.return_layout.clone();
+                    let return_values: Vec<Value> = r_layout.iter().enumerate()
+                        .map(|(i, r_ty)| {
+                            let r_val = &HOST.outputs[i];
+                            let mut var = self.get(r_val.clone());
+                            var.val(self.builder).into_ssa(self.int, self.builder)
+                        }).collect();
+                    self.builder.ins().return_(&return_values[..]);
+                    return Ok(EmitEffect::Ret);
+                }
+                // inlined calls are just jumps - if we see a ret, we just
+                // jump back to the IP they pushed on the stack.
+                let new_rip = self.value(ip, Operand::RegDeref(STACK));
+                if let JitValue::Const(c) = new_rip {
+                    self.shift_stack(1);
+                    return Ok(EmitEffect::Jmp(c.0));
+                } else {
+                    unimplemented!("return to unknown location {:?}", new_rip);
+                }
             },
             _ => {
-                Err(LiftError::UnimplementedInst(inst.clone()))
+                return Err(LiftError::UnimplementedInst(inst.clone()))
             }
         }
+        Ok(EmitEffect::Advance)
     }
 
     fn effective_address(&mut self, loc: Operand) -> Result<JitValue, LiftError> {
@@ -507,8 +554,9 @@ impl<'a> FunctionTranslator<'a> {
         }
     }
 
+    /// Move the stack either up or down N slots. -1 becomes a -4 or -8
     pub fn shift_stack(&mut self, slots: isize) {
-        let stack_reg = self.value(0, Operand::Register(RegSpec::rsp()));
+        let stack_reg = self.value(0, Operand::Register(STACK));
         match stack_reg {
             JitValue::Ref(ref base, offset)
                 if let JitValue::Stack = **base =>
@@ -517,7 +565,7 @@ impl<'a> FunctionTranslator<'a> {
                 //println!("shifting stack 0x{:x}", offset);
                 let new_stack = self.add(stack_reg,
                     JitValue::Const(Wrapping((slots * 8) as usize)));
-                self.store(Operand::Register(RegSpec::rsp()), new_stack);
+                self.store(Operand::Register(STACK), new_stack);
             }
             _ => unimplemented!("non-concrete stack!!"),
         }
@@ -539,7 +587,7 @@ impl<'a> FunctionTranslator<'a> {
     }
 
     pub fn stack(&mut self) -> usize {
-        let sp = self.get(Location::Reg(RegSpec::rsp()));
+        let sp = self.get(Location::Reg(STACK));
         match sp {
             JitVariable::Known(JitValue::Ref(base, offset))
                 if let JitValue::Stack = *base =>
@@ -558,19 +606,23 @@ impl<'a> FunctionTranslator<'a> {
     /// existing ecx variable in our context, or create a new one and use that.
     /// This has to handle *all* operand types, however: if there's an `[ecx]` we need
     /// to emit a deref instruction and return the value result of that as well.
+    /// XXX: add `width` and `extension_mode` parameters?
     pub fn value(&mut self, ip: usize, loc: Operand) -> JitValue {
         match loc {
             Operand::Register(const { RegSpec::rip() }) => {
                 JitValue::Const(Wrapping(ip))
             },
+            Operand::RegDisp(const { RegSpec::rip() }, o) => {
+                JitValue::Const(Wrapping(ip) + Wrapping(o as isize as usize))
+            },
             Operand::Register(r) => {
                 self.get(Location::Reg(r)).val(self.builder)
             },
-            Operand::RegDeref(const { RegSpec::rsp() }) => {
+            Operand::RegDeref(STACK) => {
                 let sp = self.stack();
                 self.get(Location::Stack(sp)).val(self.builder)
             },
-            Operand::RegDisp(const { RegSpec::rsp() }, o) => {
+            Operand::RegDisp(STACK, o) => {
                 // [rsp-8] becomes Stack(self.stack() + 1)
                 assert_eq!(o % 8, 0);
                 let slot = Wrapping(self.stack() as isize) + Wrapping(o as isize);
@@ -604,14 +656,17 @@ impl<'a> FunctionTranslator<'a> {
             Operand::ImmediateI8(c) => {
                 JitValue::Const(Wrapping(c as u8 as usize))
             },
-            _ => unimplemented!("value for {}", loc)
+            Operand::ImmediateI32(c) => {
+                JitValue::Const(Wrapping(c as isize as usize))
+            },
+            _ => unimplemented!("value for {:?}", loc)
         }
     }
 
     pub fn store(&mut self, loc: Operand, val: JitValue) {
         // The key to look up for the operand in our context.
         let key = match loc {
-            Operand::Register(const { RegSpec::rsp() }) => {
+            Operand::Register(STACK) => {
                 // sub rsp, 0x8 gets the stack as the value of rsp,
                 // which means it becomes e.g. STACK_TOP-8 after a push.
                 // we just get the offset from STACK_TOP, and move stack
@@ -619,16 +674,16 @@ impl<'a> FunctionTranslator<'a> {
                     JitValue::Ref(ref base,offset) if let JitValue::Stack = **base => {
                         assert!(offset <= STACK_TOP);
                         assert_eq!(offset % 8, 0);
-                        Location::Reg(RegSpec::rsp())
+                        Location::Reg(STACK)
                     }
                     _ => unimplemented!("non-concrete stack! {:?}", val),
                 }
             },
             Operand::Register(r) => Location::Reg(r),
-            Operand::RegDeref(const { RegSpec::rsp() }) => {
+            Operand::RegDeref(STACK) => {
                 Location::Stack(self.stack())
             },
-            Operand::RegDisp(const { RegSpec::rsp() }, o) => {
+            Operand::RegDisp(STACK, o) => {
                 // We turn [rsp-8] into Stack(stack - 1) - we count
                 // stack slots up from 0.
                 assert_eq!(o % 8, 0);
@@ -654,9 +709,9 @@ impl<'a> FunctionTranslator<'a> {
                     // rax = val becomes a redefine for the register
                     Operand::Register(_)
                     // [rsp] = val becomes a redefine for the current stack
-                    | Operand::RegDeref(const { RegSpec::rsp() })
+                    | Operand::RegDeref(STACK)
                     // [rsp-8] = val becomes a redefine for the stack slot
-                    | Operand::RegDisp(const { RegSpec::rsp() }, _) => {
+                    | Operand::RegDisp(STACK, _) => {
                         let var = Variable::new(*self.idx);
                         *self.idx = *self.idx + 1;
                         self.builder.declare_var(var, self.int);

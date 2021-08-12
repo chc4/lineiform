@@ -1,5 +1,5 @@
 [package]
-name = "simpl_calc"
+name = "lineiform"
 version = "0.1.0"
 authors = ["Charlie Cummings <chc4000@gmail.com>"]
 edition = "2018"
