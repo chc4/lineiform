@@ -278,27 +278,28 @@ impl<'a, A, O> Jit<'a, A, O> {
         };
 
         let mut ip = self.f.base as usize;
+        println!("starting emitting @ 0x{:x}", ip);
         let mut stream = self.f.instructions.clone();
         let mut i = 0;
         'emit: loop {
             let inst = stream.get(i);
             if let None = inst {
                 // we ran out of inputs but didn't hit a ret!
+                println!("hit translate out @ 0x{:x}", ip);
                 return Err(LiftError::TranslateOut(()));
             }
             let inst = inst.unwrap();
             ip += inst.len().to_const() as usize;
-            i += 1;
             let eff = function_translator.emit(ip, inst)?;
             match eff {
-                EmitEffect::Advance => (),
+                EmitEffect::Advance => i += 1,
                 EmitEffect::Jmp(target) => {
                     // XXX: make sure this only works for *internal* jumps?
                     // tailcalls need to become just a jmp to the target and stop
                     let jump_target = Function::<A, O>::new(function_translator.tracer, target as *const ())?;
                     //self.tracer.format(&jump_target.instructions)?;
                     //self.inline(jump_target)?;
-                    println!("emitting inlined jmp target");
+                    println!("jmp to 0x{:x}", target);
                     stream = jump_target.instructions.clone();
                     i = 0;
                     ip = target;

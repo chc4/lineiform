@@ -123,7 +123,7 @@ impl<'a> Tracer<'a> {
     pub fn get_symbol_from_vaddr(&self, f: usize) -> Option<Sym> {
         let addr = (f as usize).try_into().unwrap();
         self.elf.syms.iter().filter(|sym|
-            sym.st_value >= addr && addr < sym.st_value + sym.st_size
+            sym.st_value == addr
         ).next()
     }
 
@@ -201,7 +201,7 @@ mod test {
     #[test]
     fn can_disassemble_fn() -> Result<(), TracerError> {
         let mut tracer = Tracer::new()?;
-        let sym = tracer.t_symbol_from_address(crate::tracer::add_one as *const ())?;
+        let sym = tracer.get_symbol_from_address(crate::tracer::add_one as *const ())?;
         let instructions = tracer.disassemble(crate::tracer::add_one as *const (), sym.st_size as usize)?;
         tracer.format(&instructions)?;
         Ok(())
