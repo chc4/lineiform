@@ -186,11 +186,11 @@ mod test {
     #[test]
     pub fn test_handles_wrapping_and_widths() -> Result<(), crate::MainError> {
         use core::num::Wrapping;
-        let a: Wrapping<usize> = Wrapping(-3 as isize as usize);
+        let a: Wrapping<u32> = Wrapping(-3 as i32 as u32);
         let mut jit = crate::Lineiform::new();
         use core::hint::black_box;
         let clos = jit.speedup(move |()| { black_box(a) + Wrapping(2) });
-        assert_eq!(clos(()), Wrapping(-1 as isize as usize));
+        assert_eq!(clos(()), Wrapping(-1 as i32 as u32));
         Ok(())
     }
 }
