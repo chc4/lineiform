@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 #![deny(unused_must_use, improper_ctypes_definitions)]
-#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, inline_const, inherent_associated_types, associated_type_bounds, let_chains)]
+#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, inline_const, inherent_associated_types, associated_type_bounds, let_chains, asm)]
 //extern crate nom;
 extern crate jemallocator;
 extern crate thiserror;
@@ -14,6 +14,8 @@ extern crate cranelift_jit;
 extern crate cranelift_codegen;
 extern crate target_lexicon;
 extern crate bitvec;
+extern crate bitflags;
+
 use thiserror::Error;
 use std::fmt::Display;
 
@@ -194,4 +196,58 @@ mod test {
         assert_eq!(clos(()), Wrapping(-1 as i32 as u32));
         Ok(())
     }
+
+    #[test]
+    pub fn test_handles_branches_true() -> Result<(), crate::MainError> {
+        let a: u32 = 33;
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        let clos = jit.speedup(move |()| {
+            let val;
+            if black_box(a) > 32 {
+                val = 1;
+            } else {
+                val = 2;
+            }
+            val
+        });
+        assert_eq!(clos(()), 2);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_handles_branches_false() -> Result<(), crate::MainError> {
+        let a: u32 = 32;
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        let clos = jit.speedup(move |()| {
+            let val;
+            if black_box(a) > 32 {
+                val = 1;
+            } else {
+                val = 2;
+            }
+            val
+        });
+        assert_eq!(clos(()), 2);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_handles_loops() -> Result<(), crate::MainError> {
+        use core::num::Wrapping;
+        let a: Wrapping<u32> = Wrapping(10 as i32 as u32);
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        let clos = jit.speedup(move |()| {
+            let mut acc = Wrapping(0);
+            for i in 0..black_box(a).0 {
+                acc += acc + Wrapping(1);
+            }
+            acc
+        });
+        assert_eq!(clos(()), Wrapping(55 as i32 as u32));
+        Ok(())
+    }
+
 }

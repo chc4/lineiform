@@ -6,7 +6,7 @@ use cranelift_module::{DataContext, Linkage, Module};
 use crate::block::{Function};
 use cranelift_codegen::ir::types::Type;
 
-use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
+use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, RegisterBank, Opcode};
 use yaxpeax_arch::LengthedInstruction;
 
 use bitvec::vec::BitVec;
@@ -50,14 +50,26 @@ const STACK: RegSpec = RegSpec::rsp();
 use lazy_static::lazy_static;
 lazy_static! {
     static ref REGMAP: HashMap<RegSpec, RegSpec> = [
+        (RegSpec::al(), RegSpec::rax()),
+        (RegSpec::ah(), RegSpec::rax()),
         (RegSpec::ax(), RegSpec::rax()),
         (RegSpec::eax(), RegSpec::rax()),
-        (RegSpec::w(3), RegSpec::q(3)), // there is no rbx() helper or bx() in real_mode
-        (RegSpec::ebx(), RegSpec::q(3)), // there is no rbx() helper
-        (RegSpec::w(1), RegSpec::rcx()), // no cx() in real_mode
+
+        //(RegSpec::bl(), RegSpec::q(3)), // there is no rbx() helper or bx() in real_mode
+        //(RegSpec::bh(), RegSpec::q(3)),
+        //(RegSpec::bx(), RegSpec::q(3)),
+        (RegSpec::ebx(), RegSpec::q(3)),
+
+        (RegSpec::cl(), RegSpec::rcx()), // no cx() in real_mode
+        (RegSpec::ch(), RegSpec::rcx()), // no cx() in real_mode
+        //(RegSpec::cx(), RegSpec::rcx()), // no cx() in real_mode
         (RegSpec::ecx(), RegSpec::rcx()),
+
+        (RegSpec::dl(), RegSpec::rdx()),
+        //(RegSpec::dh(), RegSpec::rdx()),
         (RegSpec::dx(), RegSpec::rdx()),
         (RegSpec::edx(), RegSpec::rdx()),
+
         (RegSpec::d(6), RegSpec::rsi()), // esi is not public
         (RegSpec::d(7), RegSpec::rdi()), // edi is not public
         (RegSpec::w(5), RegSpec::rbp()), // there's only a bp() helper in real_mode
@@ -94,7 +106,7 @@ impl JitVariable {
                     // we want a memory or stack value as a certain width:
                     // get a use of the variable backing it, and mask to the correct
                     // size.
-                    let width_mask: usize = (2 << ((width*8)+1)) - 1;
+                    let width_mask: usize = (1 << ((width*8)+1)) - 1;
                     let mask = builder.ins()
                         .iconst(types::I64, width_mask as isize as i64);
                     val = builder.ins().band(val, mask);
@@ -105,7 +117,7 @@ impl JitVariable {
                 if width == HOST_WIDTH {
                     val.clone()
                 } else {
-                    let width_mask = Wrapping((2 << ((width*8)+1)) - 1);
+                    let width_mask = Wrapping((1 << ((width*8)+1)) - 1);
                     match val {
                         JitValue::Const(c) => JitValue::Const(*c & width_mask),
                         _ => unimplemented!(),
@@ -161,12 +173,61 @@ impl JitValue {
     }
 }
 
+#[derive(Hash, PartialEq, Clone, Copy)]
+enum Flag {
+    CF = 0,
+    PF = 2,
+    AF = 4,
+    ZF = 6,
+    SF = 7,
+    TF = 8,
+    IF = 9,
+    DF = 10,
+    OF = 11,
+    FINAL = 12,
+}
+use Flag::*;
+
+/// A macro that allows for saving of `eflags` values to a Context after
+/// operations. Care should be taken that the last operation of `e` is the
+/// operation you want to collect flags from - you should probably only
+/// call this with some inline assembly expression to prevent the compiler
+/// from turning your a + b into a lea, for example.
+/// TODO: CPUID checks for if we have lahf
+macro_rules! getflags {
+    ($ctx:expr, $e:expr, $bits:expr) => {
+        $e;
+        let mut scratch_stack: usize = 0;
+        let mut flags: u64 = 0;
+        asm!("
+            pushfq;
+            pop {0};
+        ", out(reg) flags);
+        println!("flags are 0b{:b}", flags);
+        $ctx.set_flags_const($bits, flags);
+    }
+}
+
+
+/// A conditional bool for our JIT. These are used for lazily computing branch
+/// conditions: we can store Known(true|false) for constant computed adds, while
+/// setting Unknown(ssa_values) to the *result* of our add - and only do the icmp
+/// and bz when we need the flag value for a conditional jump instruction, to avoid
+/// generating a billion SSA values and instructions that would be pruned the
+/// majority of the time.
+#[derive(Clone)]
+enum JitFlag {
+    Known(u64),
+    Unknown(Value, Value, Value), // left <op> right = <result>
+}
+
 struct Context {
     /// Our currently known execution environment. This holds values like `rax`
     /// and stored stack values, mapping them to either constant propagated
     /// values, or Cranelift SSA variables if they are unknown at compilation
     /// time.
     bound: HashMap<Location, JitVariable>,
+    flags: Vec<JitFlag>,
 }
 
 impl Context {
@@ -182,6 +243,35 @@ impl Context {
                 *offset
             },
             _ => unimplemented!("non-concrete stack??"),
+        }
+    }
+
+    #[inline]
+    pub fn set_flags(&mut self, flags: Vec<Flag>, val: (Value, Value, Value)) -> JitValue {
+        for flag in flags {
+            self.flags[flag as usize] = JitFlag::Unknown(val.0, val.1, val.2);
+        }
+        JitValue::Value(val.2)
+    }
+
+    #[inline]
+    pub fn set_flags_const(&mut self, flags: Vec<Flag>, c: u64) {
+        for flag in flags {
+            self.flags[flag as usize] = JitFlag::Known(c);
+        }
+    }
+
+    pub fn flag_value(&mut self, flag: Flag, builder: &mut FunctionBuilder) -> JitValue {
+        let val = &self.flags[flag as usize];
+        match val {
+            JitFlag::Known(b) => {
+                let flag_mask = (1 << (flag as usize + 1)) - 1;
+                JitValue::Const(Wrapping((*b as usize & flag_mask)))
+            },
+            JitFlag::Unknown(left, right, result) => JitValue::Value(match flag {
+                Flag::ZF => builder.ins().icmp_imm(IntCC::Equal, *result, 0),
+                _ => unimplemented!(),
+            }),
         }
     }
 
@@ -212,6 +302,7 @@ pub struct Jit<'a, A, O> {
 enum EmitEffect {
     Advance,
     Jmp(usize),
+    Branch(Value, usize),
     Ret,
 }
 
@@ -377,6 +468,23 @@ impl<'a, A, O> Jit<'a, A, O> {
                     i = jump_target.offset.1;
                     ip = target;
                 },
+                EmitEffect::Branch(cond, target) => {
+                    // if cond isn't false, then we branch to target, otherwise we
+                    // fallthrough.
+                    // handling branchs is a bit tricky: we snapshot our context,
+                    // because we need to isolate effects from one control flow path
+                    // from the other. we also give the branches different "version" -
+                    // i think there's a way to use (version, addr) tuples for
+                    // better block compilation or something idk
+                    //
+                    // we probably dont ever want to *merge* control flow path,
+                    // unfortunately - it's pretty unlikely that both sides of a
+                    // branch end up with identical contexts when they merge, and
+                    // doing eta nodes or erasing their values back to SSA is hairy
+                    // because we lose constant value knowledge, which is our bread
+                    // and butter.
+                    unimplemented!();
+                },
                 // The actual end of our function - 
                 EmitEffect::Ret => {
                     break 'emit;
@@ -428,6 +536,8 @@ impl<'a, A, O> Jit<'a, A, O> {
         );
         Context {
             bound: ctx,
+            // XXX: set this to the real default flags
+            flags: vec![JitFlag::Known(0); Flag::FINAL as usize],
         }
     }
 
@@ -500,22 +610,107 @@ impl<'a> FunctionTranslator<'a> {
             Opcode::INC => {
                 // TODO: set flags
                 let val = self.value(ip, inst.operand(0), ms);
-                let inced = self.add(val, JitValue::Const(Wrapping(1)));
+                let inced = self.add::<false>(val, JitValue::Const(Wrapping(1)));
                 self.store(inst.operand(0), inced, ms);
             },
             Opcode::ADD => {
-                // TODO: set flags
                 let left = self.value(ip, inst.operand(0), ms);
                 let right = self.value(ip, inst.operand(1), ms);
-                let added = self.add(left, right);
+                let added = self.add::<true>(left, right);
                 self.store(inst.operand(0), added, ms);
             },
-            Opcode::SUB => {
+            op @ (Opcode::SUB | Opcode::CMP) => {
                 // TODO: set flags
                 let left = self.value(ip, inst.operand(0), ms);
+                let right = self.value(ip, inst.operand(1), inst.operand(0).width());
+                let subbed = self.sub(left.clone(), right.clone());
+                self.store(inst.operand(0), subbed, ms);
+            },
+            op @ (Opcode::AND | Opcode::TEST) => {
+                let left = self.value(ip, inst.operand(0), ms);
                 let right = self.value(ip, inst.operand(1), ms);
-                let added = self.sub(left, right);
-                self.store(inst.operand(0), added, ms);
+                let anded = self.band(left.clone(), right.clone());
+                if let Opcode::AND = op {
+                    self.store(inst.operand(0), anded, ms);
+                }
+            },
+            Opcode::NOP => (),
+            Opcode::XOR => {
+                if inst.operand(0) == inst.operand(1) {
+                    self.store(inst.operand(0), JitValue::Const(Wrapping(0)), ms);
+                }
+                let left = self.value(ip, inst.operand(0), ms);
+                let right = self.value(ip, inst.operand(1), ms);
+                let xored = self.bxor(left.clone(), right.clone());
+                self.store(inst.operand(0), xored, ms);
+            },
+            setcc @ (Opcode::SETA | Opcode::SETAE) => {
+                let (cond, flags) = match setcc {
+                    Opcode::SETA => (IntCC::SignedGreaterThan,
+                        self.flag_values(vec![Flag::CF, Flag::ZF])
+                    ),
+                    Opcode::SETAE => (IntCC::SignedGreaterThanOrEqual,
+                        self.context.flag_value(Flag::CF, self.builder)
+                    ),
+                    _ => unimplemented!(),
+                };
+                if let JitValue::Const(c) = flags {
+                    self.store(inst.operand(0), JitValue::Const(Wrapping(
+                        if c.0 == (true as usize) {
+                            1
+                        } else {
+                            0
+                        })), Some(1));
+                } else if let JitValue::Value(v) = flags {
+                    self.builder.ins().brif(cond, v, unimplemented!(), &[]);
+                } else {
+                    unimplemented!();
+                }
+            },
+            jcc @ Opcode::JZ => {
+                let _target = self.jump_target(inst.operand(0), ip, ms);
+
+                let target;
+                if let JitValue::Const(c) = _target {
+                    println!("known conditional jump location: 0x{:x}", c.0);
+                    // If it's within our own function, it's an internal branch:
+                    // don't handle this for now.
+                    if c.0 >= (self.f.0 as usize + ip) && c.0 <= (self.f.0 as usize) + self.f.1 {
+                        unimplemented!("internal jump");
+                    }
+                    target = c.0;
+                } else {
+                    unimplemented!("dynamic call");
+                }
+
+                let cond = match jcc {
+                    Opcode::JZ => {
+                        self.context.flag_value(Flag::ZF, self.builder)
+                    },
+                    _ => unreachable!(),
+                };
+
+                match cond {
+                    JitValue::Const(Wrapping(const { false as usize })) => {
+                        // we know statically we aren't taking this branch - we
+                        // can just go to the next instruction
+                        ()
+                    },
+                    JitValue::Const(Wrapping(_)) => {
+                        // we know statically we are taking this branch - just
+                        // jump
+                        return Ok(EmitEffect::Jmp(target))
+                    },
+                    JitValue::Value(cond) => {
+                        // we don't know until runtime if we're taking this branch
+                        // or not - we return Brnz(cond, target) as an effect,
+                        // so our emit loop can emit both sides of the branch.
+                        return Ok(EmitEffect::Branch(cond, target));
+                    },
+                    _ => {
+                        unimplemented!();
+                    },
+                }
             },
             Opcode::LEA => {
                 let val = self.effective_address(inst.operand(1))?;
@@ -534,21 +729,7 @@ impl<'a> FunctionTranslator<'a> {
                 self.store(inst.operand(0), sp, Some(HOST_WIDTH)); // rax = [rsp]
             },
             Opcode::JMP => {
-                // Resolve the jump target (either absolute or relative)
-                let target: JitValue = match inst.operand(0) {
-                    absolute @ (
-                        Operand::Register(_) |
-                        Operand::RegDeref(_) |
-                        Operand::RegDisp(_, _)
-                    ) => {
-                        self.value(ip, absolute, ms)
-                    },
-                    relative @ Operand::ImmediateI8(_) => {
-                        let target_val = self.value(ip, relative, None);
-                        self.add(JitValue::Const(Wrapping(ip)), target_val)
-                    },
-                    _ => unimplemented!("jump target operand {}", inst.operand(0)),
-                };
+                let target = self.jump_target(inst.operand(0), ip, ms);
                 // If we know where the jump is going, we can try to inline
                 if let JitValue::Const(c) = target {
                     println!("known jump location: 0x{:x}", c.0);
@@ -564,29 +745,7 @@ impl<'a> FunctionTranslator<'a> {
             },
             Opcode::CALL => {
                 // Resolve the call target (either absolute or relative)
-                let target: JitValue = match inst.operand(0) {
-                    absolute @ (
-                        Operand::Register(_) |
-                        Operand::RegDeref(_) |
-                        Operand::RegDisp(_, _)
-                    ) => {
-                        self.value(ip, absolute, ms)
-                    },
-                    relative @ (
-                        Operand::ImmediateI8(_)  |
-                        Operand::ImmediateI16(_) |
-                        Operand::ImmediateI32(_)
-                    )=> {
-                        let val = match relative {
-                            Operand::ImmediateI8(i) => i as isize as usize,
-                            Operand::ImmediateI16(i) => i as isize as usize,
-                            Operand::ImmediateI32(i) => i as isize as usize,
-                            _ => unreachable!(),
-                        };
-                        JitValue::Const(Wrapping(ip) + Wrapping(val))
-                    },
-                    _ => unimplemented!("call target operand {}", inst.operand(0)),
-                };
+                let target = self.jump_target(inst.operand(0), ip, ms);
                 if let JitValue::Const(c) = target {
                     // we're inlining the call body into this function:
                     let body = Function::<(),()>::new(self.tracer, c.0 as *const ())?;
@@ -638,6 +797,35 @@ impl<'a> FunctionTranslator<'a> {
         Ok(EmitEffect::Advance)
     }
 
+    fn jump_target(&mut self, op: Operand, ip: usize, ms: Option<u8>) -> JitValue {
+        // Resolve the jump target (either absolute or relative)
+        let target: JitValue = match op {
+            absolute @ (
+                Operand::Register(_) |
+                Operand::RegDeref(_) |
+                Operand::RegDisp(_, _)
+            ) => {
+                self.value(ip, absolute, ms)
+            },
+            relative @ (
+                Operand::ImmediateI8(_)  |
+                Operand::ImmediateI16(_) |
+                Operand::ImmediateI32(_)
+            )=> {
+                let val = match relative {
+                    Operand::ImmediateI8(i) => i as isize as usize,
+                    Operand::ImmediateI16(i) => i as isize as usize,
+                    Operand::ImmediateI32(i) => i as isize as usize,
+                    _ => unreachable!(),
+                };
+                JitValue::Const(Wrapping(ip) + Wrapping(val))
+            },
+            _ => unimplemented!("jump target operand {}", op),
+        };
+        target
+    }
+
+
     fn effective_address(&mut self, loc: Operand) -> Result<JitValue, LiftError> {
         match loc {
             Operand::RegDeref(r) => {
@@ -645,7 +833,7 @@ impl<'a> FunctionTranslator<'a> {
             },
             Operand::RegDisp(r, disp) => {
                 let reg = self.get(Location::Reg(r)).val(self.builder, r.width());
-                Ok(self.add(reg, JitValue::Const(Wrapping(disp as u8 as usize))))
+                Ok(self.add::<false>(reg, JitValue::Const(Wrapping(disp as u8 as usize))))
             }
             _ => unimplemented!()
         }
@@ -660,7 +848,7 @@ impl<'a> FunctionTranslator<'a> {
             {
                 assert_eq!(offset % 4, 0);
                 //println!("shifting stack 0x{:x}", offset);
-                let new_stack = self.add(stack_reg,
+                let new_stack = self.add::<false>(stack_reg,
                     JitValue::Const(Wrapping((slots * 8) as usize)));
                 self.store(Operand::Register(STACK), new_stack, Some(HOST_WIDTH));
             }
@@ -743,8 +931,12 @@ impl<'a> FunctionTranslator<'a> {
                                 unsafe {
                                     let val = Wrapping(std::ptr::read::<usize>(
                                         addr.offset(offset.try_into().unwrap()) as *const usize));
-                                    JitValue::Const(val & Wrapping((2<<(width.unwrap()*8+1))-1))
+                                    JitValue::Const(val & Wrapping((1<<(width.unwrap()*8+1))-1))
                                 }
+                            },
+                            JitValue::Stack => {
+                                assert_eq!(offset % 8, 0);
+                                self.get(Location::Stack(offset)).val(self.builder, width.unwrap())
                             },
                             val @ _ => unimplemented!("value for ref to {:?}", val),
                         }
@@ -784,7 +976,21 @@ impl<'a> FunctionTranslator<'a> {
             },
             Operand::Register(r) if r.width() != HOST_WIDTH => {
                 match width {
-                    Some(1) => unimplemented!(),
+                    Some(1) => {
+                        let mask = match r.num() {
+                            // mov al, 1 is actually mov rax, rax[64:8]:0x1
+                            // there's no bl() helper, and b(3) isn't const :(
+                            const { RegSpec::al() } | //const { RegSpec::bl() } |
+                            const { RegSpec::cl() } | const { RegSpec::dl() } => {
+                                let parent = *REGMAP.get(&r).unwrap();
+                                val = self.band(val, self.bor(
+                                    self.value(Location::Reg(parent), self.builder),
+                                    JitValue::Const(Wrapping(!0xFF)),
+                                ));
+                            },
+                            _ => unimplemented!(),
+                        };
+                    },
                     Some(2) => unimplemented!(),
                     Some(4) => {
                         // e.g. `mov eax, rcx` means we mask and load only the low
@@ -881,11 +1087,24 @@ impl<'a> FunctionTranslator<'a> {
         }
     }
 
-    /// Get left+right for JitValues. Treats `left` as a distinct memory region
-    /// if it is frozen: `left+8` gives back a 
-    pub fn add(&mut self, left: JitValue, right: JitValue) -> JitValue {
+    pub fn flag_values(&mut self, flags: Vec<Flag>) -> JitValue {
+        let mut val: Option<JitValue> = None;
+        for flag in flags {
+            let next = self.context.flag_value(flag, self.builder);
+            match val {
+                None => val = Some(next),
+                Some(acc) => val = Some(self.bor(acc, next)),
+            }
+        }
+        val.unwrap()
+    }
+
+    /// Get left+right for JitValues.
+    /// if FLAG is true, then self.context.flags are updated with eflags
+    pub fn add<const FLAG:bool>(&mut self, left: JitValue, right: JitValue) -> JitValue {
         // XXX: set flags
         use JitValue::*;
+        use Flag::*;
         match (left, right) {
             (Value(val_left), Value(val_right)) => {
                 Value(self.builder.ins().iadd(val_left, val_right))
@@ -893,11 +1112,22 @@ impl<'a> FunctionTranslator<'a> {
             (ref_val @ Ref(_,_), Value(ssa))
             | (Value(ssa), ref_val @ Ref(_,_)) => {
                 let v_ptr = ref_val.into_ssa(self.int, self.builder);
-                Value(self.builder.ins().iadd(v_ptr, ssa))
+                Value(self.builder.ins().isub(v_ptr, ssa))
             },
             (Ref(base, offset), Const(c))
             | (Const(c), Ref(base, offset)) => {
-                Ref(base, (Wrapping(offset) + c).0)
+                if FLAG {
+                    let mut val = offset;
+                    unsafe {
+                        getflags!(self.context, asm!("
+                            add {}, {}
+                        ", inout(reg) val, in(reg) c.0),
+                        vec![OF, SF, ZF, AF, PF]);
+                    }
+                    Ref(base, val)
+                } else {
+                    Ref(base, (Wrapping(offset) + c).0)
+                }
             },
             (Const(left_c), Const(right_c)) => {
                 Const(left_c + right_c)
@@ -938,10 +1168,10 @@ impl<'a> FunctionTranslator<'a> {
             (Value(val_left), Value(val_right)) => {
                 Value(self.builder.ins().band(val_left, val_right))
             },
-            (ref_val @ Ref(_,_), Value(ssa))
-            | (Value(ssa), ref_val @ Ref(_,_)) => {
-                let v_ptr = ref_val.into_ssa(self.int, self.builder);
-                Value(self.builder.ins().band(v_ptr, ssa))
+            (val @ _, Value(ssa))
+            | (Value(ssa), val @ _) => {
+                let ssa_val = val.into_ssa(self.int, self.builder);
+                Value(self.builder.ins().band(ssa_val, ssa))
             },
             (Ref(base, offset), Const(c))
             | (Const(c), Ref(base, offset)) => {
@@ -953,6 +1183,55 @@ impl<'a> FunctionTranslator<'a> {
             (left, right) => unimplemented!("unimplemented band {:?} {:?}", left, right)
         }
     }
+
+    pub fn bor(&mut self, left: JitValue, right: JitValue) -> JitValue {
+        // XXX: set flags
+        use JitValue::*;
+        match (left, right) {
+            // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
+            (Value(val_left), Value(val_right)) => {
+                Value(self.builder.ins().bor(val_left, val_right))
+            },
+            (val @ _, Value(ssa))
+            | (Value(ssa), val @ _) => {
+                let ssa_val = val.into_ssa(self.int, self.builder);
+                Value(self.builder.ins().bor(ssa_val, ssa))
+            },
+            (Ref(base, offset), Const(c))
+            | (Const(c), Ref(base, offset)) => {
+                unimplemented!("bor pointer")
+            },
+            (Const(left_c), Const(right_c)) => {
+                Const(left_c & right_c)
+            },
+            (left, right) => unimplemented!("unimplemented bor {:?} {:?}", left, right)
+        }
+    }
+
+    pub fn bxor(&mut self, left: JitValue, right: JitValue) -> JitValue {
+        // XXX: set flags
+        use JitValue::*;
+        match (left, right) {
+            // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
+            (Value(val_left), Value(val_right)) => {
+                Value(self.builder.ins().bxor(val_left, val_right))
+            },
+            (val @ _, Value(ssa))
+            | (Value(ssa), val @ _) => {
+                let ssa_val = val.into_ssa(self.int, self.builder);
+                Value(self.builder.ins().bxor(ssa_val, ssa))
+            },
+            (Ref(base, offset), Const(c))
+            | (Const(c), Ref(base, offset)) => {
+                unimplemented!("bxor pointer")
+            },
+            (Const(left_c), Const(right_c)) => {
+                Const(left_c ^ right_c)
+            },
+            (left, right) => unimplemented!("unimplemented bxor {:?} {:?}", left, right)
+        }
+    }
+
 }
 
 

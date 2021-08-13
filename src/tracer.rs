@@ -129,9 +129,9 @@ impl<'a> Tracer<'a> {
 
     /// Get symbol containing an address.
     pub fn get_symbol_from_address(&mut self, f: *const ()) -> Result<Sym, TracerError> {
-        let mut fi = std::fs::File::open("/proc/self/maps").unwrap();
-        let out = std::io::stdout();
-        std::io::copy(&mut fi, &mut out.lock()).unwrap();
+        //let mut fi = std::fs::File::open("/proc/self/maps").unwrap();
+        //let out = std::io::stdout();
+        //std::io::copy(&mut fi, &mut out.lock()).unwrap();
         println!("looking for {:x}", f as usize);
 
         let base = self.get_base()?;
