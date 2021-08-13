@@ -13,6 +13,7 @@ extern crate cranelift;
 extern crate cranelift_jit;
 extern crate cranelift_codegen;
 extern crate target_lexicon;
+extern crate bitvec;
 use thiserror::Error;
 use std::fmt::Display;
 
@@ -50,8 +51,8 @@ use core::hint::black_box;
 fn main() -> Result<(), MainError> {
     println!("Hello, world!");
     let mut f = std::fs::File::open("/proc/self/maps").unwrap();
-    //let out = std::io::stdout();
-    //std::io::copy(&mut f, &mut out.lock()).unwrap();
+    let out = std::io::stdout();
+    std::io::copy(&mut f, &mut out.lock()).unwrap();
 
 //    let (s, sexpr) = parse_expr("(+ 1 (+ 2 3))")
 //        .map_err(|e| MainError::Compile(CompileError::Parse(format!("{}", e).into())))?;

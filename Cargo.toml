@@ -13,8 +13,9 @@ thiserror = "1.0"
 enum-display-derive = "0.1.1"
 goblin = "0.4"
 lazy_static = "1.4.0"
-yaxpeax-arch = "0.2.5"
+bitvec = "0.22.3"
 
+yaxpeax-arch = "0.2.5"
 
 cranelift = "0.75.0"
 cranelift-codegen = "0.75.0"

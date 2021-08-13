@@ -48,6 +48,8 @@ use std::marker::PhantomData;
 use crate::lift::Location;
 pub struct Function<ARG, OUT> {
     pub base: *const (),
+    /// Our offset from function base to wanted IP. (bytes, instructions)
+    pub offset: (usize, usize),
     pub size: usize,
     pub instructions: Arc<Vec<Instruction>>,
     pub pinned: Vec<(Location, JitValue)>,
@@ -82,10 +84,34 @@ impl<A, O> Function<A, O> {
     }
 
     pub fn new(tracer: &mut Tracer, f: *const ()) -> Result<Self, BlockError> {
+        let base = tracer.get_base()?;
         let f_sym = tracer.get_symbol_from_address(f)?;
-        let instructions = tracer.disassemble(f, f_sym.st_size as usize)?;
+        // Our address could be in the middle of a function - we want to disassemble
+        // from the start so that we can cache disassembly, and so that when we
+        // are emitting from it we have the entire function for backwards jmp analysis
+        let f_base = (base + (f_sym.st_value as usize));
+        let f_off = (f as usize) - f_base;
+        let instructions = tracer.disassemble(f_base as *const (), f_sym.st_size as usize)?;
+        let mut inst_off = 0;
+        let mut inst_addr = f_base;
+        // unfortunately, due to x86 having irregular instruction widths, we can't
+        // easily turn bytes offset -> instruction stream offset.
+        // maybe we can put this in a cache as well? or at least have some skiplist
+        // like structure.
+        use crate::yaxpeax_arch::LengthedInstruction;
+        for inst in instructions.iter() {
+            if inst_addr == (f as usize) {
+                break;
+            } else if inst_addr > (f as usize) {
+                panic!("trying to create a function for {:x} overshot! is it unaligned inside {:x}?", f as usize, f_base);
+            } else {
+                inst_off += 1;
+                inst_addr += inst.len().to_const() as usize;
+            }
+        }
         Ok(Self {
-            base: f,
+            base: f_base as *const (),
+            offset: (f_off, inst_off),
             size: f_sym.st_size as usize,
             instructions: instructions,
             pinned: Vec::new(),

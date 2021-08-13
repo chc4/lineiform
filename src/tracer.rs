@@ -119,16 +119,21 @@ impl<'a> Tracer<'a> {
         Ok(base)
     }
 
-    /// Get symbol for vaddr
+    /// Get symbol for vaddr. The vaddr may be in the middle of a symbol.
     pub fn get_symbol_from_vaddr(&self, f: usize) -> Option<Sym> {
         let addr = (f as usize).try_into().unwrap();
         self.elf.syms.iter().filter(|sym|
-            sym.st_value == addr
+            (sym.st_value <= addr) && (addr < (sym.st_value + sym.st_size))
         ).next()
     }
 
-    /// Get symbol for address
+    /// Get symbol containing an address.
     pub fn get_symbol_from_address(&mut self, f: *const ()) -> Result<Sym, TracerError> {
+        let mut fi = std::fs::File::open("/proc/self/maps").unwrap();
+        let out = std::io::stdout();
+        std::io::copy(&mut fi, &mut out.lock()).unwrap();
+        println!("looking for {:x}", f as usize);
+
         let base = self.get_base()?;
         let sym = self.get_symbol_from_vaddr(f as usize - base)
             .ok_or(TracerError::CantFindFunction(base, f as usize - base))?;

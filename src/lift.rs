@@ -9,6 +9,9 @@ use cranelift_codegen::ir::types::Type;
 use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
 use yaxpeax_arch::LengthedInstruction;
 
+use bitvec::vec::BitVec;
+use bitvec::slice::BitSlice;
+
 use std::collections::HashMap;
 use std::convert::{TryInto, TryFrom};
 use core::num::Wrapping;
@@ -344,6 +347,7 @@ impl<'a, A, O> Jit<'a, A, O> {
             idx: &mut idx,
             return_layout: &mut self.return_layout,
             tracer: &mut self.tracer,
+            seen: HashMap::new(),
         };
 
         let mut ip = self.f.base as usize;
@@ -370,7 +374,7 @@ impl<'a, A, O> Jit<'a, A, O> {
                     //self.inline(jump_target)?;
                     println!("jmp to 0x{:x}", target);
                     stream = jump_target.instructions.clone();
-                    i = 0;
+                    i = jump_target.offset.1;
                     ip = target;
                 },
                 // The actual end of our function - 
@@ -476,6 +480,10 @@ struct FunctionTranslator<'a> {
     idx: &'a mut usize,
     return_layout: &'a mut Vec<Type>,
     tracer: &'a mut Tracer<'static>,
+    /// This is a bitvec for keeping track of instructions that we have seen and
+    /// emitted, so that we can track backwards jumps to know when to emit loops.
+    /// Notably, we keep a bitvec for *each function*, so that we also know when
+    seen: HashMap<*const (), BitVec>
 }
 
 impl<'a> FunctionTranslator<'a> {
@@ -546,7 +554,7 @@ impl<'a> FunctionTranslator<'a> {
                     println!("known jump location: 0x{:x}", c.0);
                     // If it's within our own function, it's an internal branch:
                     // don't handle this for now.
-                    if c.0 >= (self.f.0 as usize) && c.0 <= (self.f.0 as usize) + self.f.1 {
+                    if c.0 >= (self.f.0 as usize + ip) && c.0 <= (self.f.0 as usize) + self.f.1 {
                         unimplemented!("internal jump");
                     }
                     return Ok(EmitEffect::Jmp(c.0));
@@ -569,16 +577,20 @@ impl<'a> FunctionTranslator<'a> {
                         Operand::ImmediateI16(_) |
                         Operand::ImmediateI32(_)
                     )=> {
-                        // XXX: this should be sign extended, not zero extend?
-                        let target_val = self.value(ip, relative, Some(HOST_WIDTH));
-                        self.add(JitValue::Const(Wrapping(ip)), target_val)
+                        let val = match relative {
+                            Operand::ImmediateI8(i) => i as isize as usize,
+                            Operand::ImmediateI16(i) => i as isize as usize,
+                            Operand::ImmediateI32(i) => i as isize as usize,
+                            _ => unreachable!(),
+                        };
+                        JitValue::Const(Wrapping(ip) + Wrapping(val))
                     },
                     _ => unimplemented!("call target operand {}", inst.operand(0)),
                 };
                 if let JitValue::Const(c) = target {
                     // we're inlining the call body into this function:
                     let body = Function::<(),()>::new(self.tracer, c.0 as *const ())?;
-                    self.tracer.format(&body.instructions)?;
+                    self.tracer.format(&body.instructions[body.offset.0..].to_vec())?;
                     // `push rip`
                     println!("putting return address in {:x}", self.context.stack());
                     self.shift_stack(-1); // rsp -= 8
@@ -710,7 +722,7 @@ impl<'a> FunctionTranslator<'a> {
             // XXX: this doesn't allow for unaligned reads - but whatever
             Operand::RegDisp(STACK, o) => {
                 // [rsp-8] becomes Stack(self.stack() + 1)
-                assert_eq!(o % 8, 0);
+                assert_eq!(o % 4, 0);
                 let slot = Wrapping(self.context.stack()) + Wrapping(o as isize as usize);
                 self.get(Location::Stack(slot.0 as usize)).val(self.builder, width.unwrap())
             },
@@ -797,7 +809,8 @@ impl<'a> FunctionTranslator<'a> {
             Operand::RegDisp(STACK, o) => {
                 // We turn [rsp-8] into Stack(stack - 1) - we count
                 // stack slots up from 0.
-                assert_eq!(o % 8, 0);
+                assert_eq!(o % 4, 0); // XXX: there's a few of these - we need to
+                // handle unaligned access to stack values correct
                 let sp = Wrapping(self.context.stack()) + Wrapping(o as isize as usize);
                 println!("stack {} = {:x}", loc, sp.0 as usize);
                 Location::Stack(sp.0 as usize)
