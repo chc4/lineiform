@@ -397,6 +397,8 @@ impl Target {
     }
 }
 
+pub struct JitPath<A, O>(Function<A,O>, Block, Context);
+
 impl<'a, A, O> Jit<'a, A, O> {
     pub fn new(tracer: &'a mut Tracer<'static>) -> Jit<'a, A, O> {
         let builder = JITBuilder::new(cranelift_module::default_libcall_names());
@@ -469,9 +471,32 @@ impl<'a, A, O> Jit<'a, A, O> {
             changed: RangeMap::new(),
         };
         // We step forward all paths through the function until we are done
-        let mut need = vec![(f, entry_block, variables)];
+        // I think we can do something clever here: we can advance the branches
+        // with *the lowest f.offset.0* each time, and coallesce when we have
+        // identical jump targets.
+        // pred
+        // if cond {
+        //  body { block } body2
+        // } else {
+        //  shorter_body
+        // }
+        // merge
+        //
+        // We have two paths after the cond, [pred] and [pred], shorter_body > body,
+        // so we'd step the first branch until it's [pred, body],
+        // and then we'd see that the jump target for both blocks is merge and
+        // can union the states together.
+        // This doesn't properly handle detours through blocks that are towards
+        // the end of the function and then jump back, since we'd advance the
+        // frontier all the way to the end before we reach them even though they
+        // are short. We can probably have some heuristic to inline path length
+        // too, so that it's advanced until it returns and hopefully merges at some
+        // other branch - but we'd have to be careful not to break merging of
+        // our example.
+        // TODO: think about how this interacts with loops?
+        let mut need = vec![JitPath(f, entry_block, variables)];
         while let Some(next) = need.pop() {
-            let mut new = function_translator.translate(next.0, next.1, next.2)?;
+            let mut new = function_translator.translate(next)?;
             need.append(&mut new);
         }
         function_translator.builder.seal_block(entry_block);
@@ -607,8 +632,8 @@ struct FunctionTranslator<'a> {
 }
 
 impl<'a> FunctionTranslator<'a> {
-    fn translate<A, O>(&mut self, f: Function<A, O>, bl: Block, ctx: Context)
-            -> Result<Vec<(Function<A,O>, Block, Context)>, LiftError> {
+    fn translate<A, O>(&mut self, JitPath(f, bl, ctx): JitPath<A,O>)
+            -> Result<Vec<JitPath<A,O>>, LiftError> {
         self.context = ctx;
         let mut base = (f.base as usize) + f.offset.0;
         let mut ip = base;
@@ -624,7 +649,7 @@ impl<'a> FunctionTranslator<'a> {
             let this_f = self.context.seen.entry(f.base);
             if let std::collections::hash_map::Entry::Occupied(emitted) = this_f {
                 if let Some(true) = emitted.get().get(start_i) {
-                    unimplemented!("looping");
+                    unimplemented!("looping @ {}, set {:?}", start_i, emitted.get());
                 }
             }
         }
@@ -645,11 +670,10 @@ impl<'a> FunctionTranslator<'a> {
                 let this_f = function_translator.context.seen.entry(f.base);
                 let entry = this_f.or_insert(Vec::with_capacity(i));
                 // if we don't have enough slots to mark all our data, we
-                // need to grow it so it fits. we will be marking it, so it
-                // can be set by the resize.
-                println!("basic block range is {:x}-{:x}", start_i, i);
+                // need to grow it so it fits.
+                println!("basic block range is {}-{}", start_i, i);
                 if entry.len() <= i {
-                    entry.resize(i, true);
+                    entry.resize(i, false);
                 }
                 for inst in
                     &mut entry[start_i..i] {
@@ -657,6 +681,7 @@ impl<'a> FunctionTranslator<'a> {
                 }
                 // And then we set the context snapshot we made at the start of the
                 // jump to cover the entire range of this block
+                // TODO: should this not snapshot if we already have one?
                 function_translator.changed.insert(start_i..i, (&snap).clone());
                 snap = function_translator.context.bound.clone();
             };
@@ -670,7 +695,7 @@ impl<'a> FunctionTranslator<'a> {
                     //self.tracer.format(&jump_target.instructions)?;
                     //self.inline(jump_target)?;
                     println!("jmp to 0x{:x}", target);
-                    return Ok(vec![(jump_target, bl, self.context.clone())]);
+                    return Ok(vec![JitPath(jump_target, bl, self.context.clone())]);
                 },
                 EmitEffect::Branch(cond, flags, target) => {
                     seal(self);
@@ -702,13 +727,14 @@ impl<'a> FunctionTranslator<'a> {
                     cont.offset = (ip - base, i+1);
                     return Ok(vec![
                         // The branch path
-                        (target, jump_target, self.context.clone()),
+                        JitPath(target, jump_target, self.context.clone()),
                         // The fallthrough
-                        (cont, continue_target, self.context.clone())
+                        JitPath(cont, continue_target, self.context.clone())
                     ]);
                 },
                 // The actual end of our function - 
                 EmitEffect::Ret => {
+                    seal(self);
                     break 'emit;
                 },
             }; break 'handle; }
@@ -791,7 +817,7 @@ impl<'a> FunctionTranslator<'a> {
                     unimplemented!();
                 }
             },
-            jcc @ (Opcode::JZ | Opcode::JB | Opcode::JNA) => {
+            jcc @ (Opcode::JZ | Opcode::JA | Opcode::JB | Opcode::JNA) => {
                 let _target = self.jump_target(inst.operand(0), ip, ms);
 
                 let target;

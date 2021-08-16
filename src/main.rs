@@ -343,6 +343,7 @@ mod test {
             } else {
                 val = 2;
             }
+            black_box(val);
             if black_box(a) > 64 {
                 val += 1;
                 black_box(val);
