@@ -27,6 +27,7 @@ target-lexicon = "0.12.1"
 [dependencies.yaxpeax-x86]
 version = "1.0.4"
 features = ["fmt"]
+path = "../yaxpeax-x86" # FIXME when yax x86 1.1 comes out
 
 [profile.dev]
 opt-level = 2 # we use tailcalls a lot, which will blow the stack on O0

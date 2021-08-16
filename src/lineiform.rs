@@ -29,7 +29,7 @@ pub fn foo<A, O, F: Fn(A)->O>(callback: F, args: (A,)) {
 use core::ffi::c_void;
 #[derive(Copy, Clone)]
 struct FastFn<A, O> {
-    f: Option<extern "C" fn(data: *const c_void, A)->O>,
+    f: extern "C" fn(usize, data: *const c_void, A)->O,
 }
 
 impl<A, O> FnOnce<A> for FastFn<A, O> {
@@ -45,12 +45,20 @@ impl<A, O> FnMut<A> for FastFn<A, O> where FastFn<A, O>: FnOnce<A> {
     }
 }
 
+use core::hint::black_box;
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn break_here(a: usize) -> usize {
+    black_box(a)
+}
+
 impl<A: std::fmt::Debug,O> Fn<A> for FastFn<A, O> where
     FastFn<A, O>: FnOnce<A, Output=O>,
 {
     extern "rust-call" fn call(&self, args: A) -> <Self as FnOnce<A>>::Output {
         println!("got arguments: {:?}", args);
-        (self.f.unwrap())(unsafe { std::mem::transmute(self) }, args)
+        black_box(break_here(black_box(1)));
+        (self.f)(0, self as *const Self as *const c_void, args)
     }
 }
 
@@ -98,8 +106,15 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
         let mut inlined = Jit::lift(&mut self.tracer, func);
         //inlined.assume(vec![call as *const u8, f_body as *const u8]);
         let (inlined, _size) = inlined.lower().unwrap();
+
+        if true {
+            let new_func_dis = self.tracer.disassemble(inlined as *const (), _size as usize).unwrap();
+            println!("recompiled function:");
+            self.tracer.format(&new_func_dis).unwrap();
+        }
+
         // TODO: cache this? idk what our key is
         std::mem::forget(f); // don't run destructor for the closure
-        FastFn { f: Some(unsafe { std::mem::transmute(inlined) }) }
+        FastFn { f: unsafe { std::mem::transmute(inlined) } }
     }
 }

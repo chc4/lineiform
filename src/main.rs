@@ -56,6 +56,26 @@ fn main() -> Result<(), MainError> {
     let out = std::io::stdout();
     std::io::copy(&mut f, &mut out.lock()).unwrap();
 
+    {
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        use core::num::Wrapping;
+        let clos = jit.speedup(move |a: usize| {
+            let val: usize;
+            if a > 32 {
+                val = (1 as usize);
+            } else {
+                val = (0 as usize);
+            }
+            val
+        });
+        assert_eq!(clos(0), 0);
+        assert_eq!(clos(31), 0);
+        assert_eq!(clos(32), 0);
+        assert_eq!(clos(33), 1);
+        return Ok(())
+    }
+
 //    let (s, sexpr) = parse_expr("(+ 1 (+ 2 3))")
 //        .map_err(|e| MainError::Compile(CompileError::Parse(format!("{}", e).into())))?;
 //    println!("{:?}", sexpr);
@@ -187,6 +207,21 @@ mod test {
     }
 
     #[test]
+    pub fn test_passthrough_usize() -> Result<(), crate::MainError> {
+        use core::num::Wrapping;
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        let clos = jit.speedup(move |a: usize| {
+            let b = black_box(0) + black_box(0);
+            a + b
+        });
+        for i in (0..(!0)).step_by(0x4934) {
+            assert_eq!(clos(0), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
     pub fn test_handles_wrapping_and_widths() -> Result<(), crate::MainError> {
         use core::num::Wrapping;
         let a: Wrapping<u32> = Wrapping(-3 as i32 as u32);
@@ -198,7 +233,7 @@ mod test {
     }
 
     #[test]
-    pub fn test_handles_branches_true() -> Result<(), crate::MainError> {
+    pub fn test_handles_branches_const_true() -> Result<(), crate::MainError> {
         let a: u32 = 33;
         let mut jit = crate::Lineiform::new();
         use core::hint::black_box;
@@ -211,12 +246,12 @@ mod test {
             }
             val
         });
-        assert_eq!(clos(()), 2);
+        assert_eq!(clos(()), 1);
         Ok(())
     }
 
     #[test]
-    pub fn test_handles_branches_false() -> Result<(), crate::MainError> {
+    pub fn test_handles_branches_const_false() -> Result<(), crate::MainError> {
         let a: u32 = 32;
         let mut jit = crate::Lineiform::new();
         use core::hint::black_box;
@@ -230,6 +265,47 @@ mod test {
             val
         });
         assert_eq!(clos(()), 2);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_handles_dyn_branches() -> Result<(), crate::MainError> {
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        use core::num::Wrapping;
+        let clos = jit.speedup(move |a: usize| {
+            let val: usize;
+            if a > 32 {
+                val = (1 as usize);
+            } else {
+                val = (0 as usize);
+            }
+            val
+        });
+        assert_eq!(clos(0), 0);
+        assert_eq!(clos(31), 0);
+        assert_eq!(clos(32), 0);
+        assert_eq!(clos(33), 1);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_handles_overflow_dyn_branches() -> Result<(), crate::MainError> {
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        use core::num::Wrapping;
+        let clos = jit.speedup(move |a: usize| {
+            let val: usize;
+            if Wrapping(a) + Wrapping(0x5) < Wrapping(a) {
+                val = 1;
+            } else {
+                val = 2;
+            }
+            val
+        });
+        assert_eq!(clos(0), 2);
+        assert_eq!(clos((-1 as isize) as usize), 1);
+        assert_eq!(clos((-6 as isize) as usize), 2);
         Ok(())
     }
 

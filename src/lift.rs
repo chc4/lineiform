@@ -6,7 +6,7 @@ use cranelift_module::{DataContext, Linkage, Module};
 use crate::block::{Function};
 use cranelift_codegen::ir::types::Type;
 
-use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, RegisterBank, Opcode};
+use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
 use yaxpeax_arch::LengthedInstruction;
 
 use bitvec::vec::BitVec;
@@ -55,25 +55,30 @@ lazy_static! {
         (RegSpec::ax(), RegSpec::rax()),
         (RegSpec::eax(), RegSpec::rax()),
 
-        //(RegSpec::bl(), RegSpec::q(3)), // there is no rbx() helper or bx() in real_mode
-        //(RegSpec::bh(), RegSpec::q(3)),
-        //(RegSpec::bx(), RegSpec::q(3)),
-        (RegSpec::ebx(), RegSpec::q(3)),
+        (RegSpec::bl(), RegSpec::rbx()),
+        (RegSpec::bh(), RegSpec::rbx()),
+        (RegSpec::bx(), RegSpec::rbx()),
+        (RegSpec::ebx(), RegSpec::rbx()),
 
         (RegSpec::cl(), RegSpec::rcx()), // no cx() in real_mode
         (RegSpec::ch(), RegSpec::rcx()), // no cx() in real_mode
-        //(RegSpec::cx(), RegSpec::rcx()), // no cx() in real_mode
+        (RegSpec::cx(), RegSpec::rcx()), // no cx() in real_mode
         (RegSpec::ecx(), RegSpec::rcx()),
 
         (RegSpec::dl(), RegSpec::rdx()),
-        //(RegSpec::dh(), RegSpec::rdx()),
+        (RegSpec::dh(), RegSpec::rdx()),
         (RegSpec::dx(), RegSpec::rdx()),
         (RegSpec::edx(), RegSpec::rdx()),
 
-        (RegSpec::d(6), RegSpec::rsi()), // esi is not public
-        (RegSpec::d(7), RegSpec::rdi()), // edi is not public
-        (RegSpec::w(5), RegSpec::rbp()), // there's only a bp() helper in real_mode
-        (RegSpec::d(5), RegSpec::rbp()), // no ebp() helper
+        (RegSpec::sil(), RegSpec::rsi()), // esi is not public
+        (RegSpec::esi(), RegSpec::rsi()), // esi is not public
+
+        (RegSpec::dil(), RegSpec::rdi()), // edi is not public
+        (RegSpec::edi(), RegSpec::rdi()), // edi is not public
+
+        (RegSpec::bpl(), RegSpec::rbp()), // there's only a bp() helper in real_mode
+        (RegSpec::bp(), RegSpec::rbp()), // there's only a bp() helper in real_mode
+        (RegSpec::ebp(), RegSpec::rbp()), // no ebp() helper
     ].iter().cloned().collect();
 }
 
@@ -173,7 +178,7 @@ impl JitValue {
     }
 }
 
-#[derive(Hash, PartialEq, Clone, Copy)]
+#[derive(Hash, PartialEq, Clone, Copy, Display, Debug)]
 enum Flag {
     CF = 0,
     PF = 2,
@@ -215,7 +220,7 @@ macro_rules! getflags {
 /// and bz when we need the flag value for a conditional jump instruction, to avoid
 /// generating a billion SSA values and instructions that would be pruned the
 /// majority of the time.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum JitFlag {
     Known(u64),
     Unknown(Value, Value, Value), // left <op> right = <result>
@@ -228,6 +233,7 @@ struct Context {
     /// time.
     bound: HashMap<Location, JitVariable>,
     flags: Vec<JitFlag>,
+    int: Type,
 }
 
 impl Context {
@@ -261,16 +267,30 @@ impl Context {
         }
     }
 
-    pub fn flag_value(&mut self, flag: Flag, builder: &mut FunctionBuilder) -> JitValue {
+    pub fn check_flag(&mut self, flag: Flag, set: bool, builder: &mut FunctionBuilder) -> JitValue {
         let val = &self.flags[flag as usize];
+        println!("eflag {} is {:?}", flag, val);
+        let flag_mask = (1 << (flag as usize));
         match val {
             JitFlag::Known(b) => {
-                let flag_mask = (1 << (flag as usize + 1)) - 1;
-                JitValue::Const(Wrapping((*b as usize & flag_mask)))
+                println!("{:b} & {:b}", b, flag_mask);
+                if set {
+                    JitValue::Const(Wrapping((*b as usize & flag_mask == flag_mask) as usize))
+                } else {
+                    JitValue::Const(Wrapping((*b as usize & flag_mask == 0) as usize))
+                }
             },
-            JitFlag::Unknown(left, right, result) => JitValue::Value(match flag {
-                Flag::ZF => builder.ins().icmp_imm(IntCC::Equal, *result, 0),
-                _ => unimplemented!(),
+            JitFlag::Unknown(left, right, result) => JitValue::Value({
+                let flag = match flag {
+                    Flag::ZF => builder.ins().icmp_imm(if set { IntCC::Equal } else { IntCC::NotEqual }, *result, 0),
+                    Flag::CF => {
+                        // our carry flag is set if (left + right) < result
+                        let res = builder.ins().iadd(*left, *right);
+                        builder.ins().icmp(if set { IntCC::UnsignedLessThan } else { IntCC::UnsignedGreaterThanOrEqual }, res, *result)
+                    },
+                    _ => unimplemented!(),
+                };
+                builder.ins().bint(self.int, flag)
             }),
         }
     }
@@ -535,6 +555,7 @@ impl<'a, A, O> Jit<'a, A, O> {
             ))
         );
         Context {
+            int,
             bound: ctx,
             // XXX: set this to the real default flags
             flags: vec![JitFlag::Known(0); Flag::FINAL as usize],
@@ -586,7 +607,7 @@ struct FunctionTranslator<'a> {
     int: Type,
     builder: &'a mut FunctionBuilder<'a>,
     context: Context,
-    module: &'a mut Module,
+    module: &'a mut dyn Module,
     idx: &'a mut usize,
     return_layout: &'a mut Vec<Type>,
     tracer: &'a mut Tracer<'static>,
@@ -620,11 +641,12 @@ impl<'a> FunctionTranslator<'a> {
                 self.store(inst.operand(0), added, ms);
             },
             op @ (Opcode::SUB | Opcode::CMP) => {
-                // TODO: set flags
                 let left = self.value(ip, inst.operand(0), ms);
                 let right = self.value(ip, inst.operand(1), inst.operand(0).width());
-                let subbed = self.sub(left.clone(), right.clone());
-                self.store(inst.operand(0), subbed, ms);
+                let subbed = self.sub::<true>(left.clone(), right.clone());
+                if let Opcode::SUB = op {
+                    self.store(inst.operand(0), subbed, ms);
+                }
             },
             op @ (Opcode::AND | Opcode::TEST) => {
                 let left = self.value(ip, inst.operand(0), ms);
@@ -645,24 +667,31 @@ impl<'a> FunctionTranslator<'a> {
                 self.store(inst.operand(0), xored, ms);
             },
             setcc @ (Opcode::SETA | Opcode::SETAE) => {
-                let (cond, flags) = match setcc {
-                    Opcode::SETA => (IntCC::SignedGreaterThan,
-                        self.flag_values(vec![Flag::CF, Flag::ZF])
-                    ),
-                    Opcode::SETAE => (IntCC::SignedGreaterThanOrEqual,
-                        self.context.flag_value(Flag::CF, self.builder)
-                    ),
+                // get what condition they corrospond to
+                let cond = match setcc {
+                    Opcode::SETA => IntCC::UnsignedGreaterThan,
+                    Opcode::SETAE => IntCC::UnsignedGreaterThanOrEqual,
                     _ => unimplemented!(),
                 };
-                if let JitValue::Const(c) = flags {
+                // and then get the either constant or dynamic flag for whether
+                // to branch or not from the condition
+                let take = self.check_cond(cond);
+                if let JitValue::Const(c) = take {
+                    println!("SETcc conditional is {}", c.0);
                     self.store(inst.operand(0), JitValue::Const(Wrapping(
-                        if c.0 == (true as usize) {
+                        if c.0 == 1 {
                             1
                         } else {
                             0
                         })), Some(1));
-                } else if let JitValue::Value(v) = flags {
-                    self.builder.ins().brif(cond, v, unimplemented!(), &[]);
+                } else if let JitValue::Value(flags) = take {
+                    let one = self.builder.ins().iconst(self.int, 1);
+                    let zero = self.builder.ins().iconst(self.int, 0);
+                    let store = self.builder.ins().selectif(self.int, cond,
+                        flags, one, zero);
+
+                    self.store(inst.operand(0),
+                        JitValue::Value(store), Some(1));
                 } else {
                     unimplemented!();
                 }
@@ -685,7 +714,7 @@ impl<'a> FunctionTranslator<'a> {
 
                 let cond = match jcc {
                     Opcode::JZ => {
-                        self.context.flag_value(Flag::ZF, self.builder)
+                        self.context.check_flag(Flag::ZF, true, self.builder)
                     },
                     _ => unreachable!(),
                 };
@@ -945,10 +974,13 @@ impl<'a> FunctionTranslator<'a> {
                 }
             },
             Operand::ImmediateI8(c) => {
-                JitValue::Const(Wrapping(c as u8 as usize))
+                JitValue::Const(Wrapping(c as isize as usize))
             },
             Operand::ImmediateI32(c) => {
-                JitValue::Const(Wrapping(c as u32 as usize))
+                JitValue::Const(Wrapping(c as isize as usize))
+            },
+            Operand::ImmediateI64(c) => {
+                JitValue::Const(Wrapping(c as usize))
             },
             _ => unimplemented!("value for {:?}", loc)
         }
@@ -977,16 +1009,18 @@ impl<'a> FunctionTranslator<'a> {
             Operand::Register(r) if r.width() != HOST_WIDTH => {
                 match width {
                     Some(1) => {
-                        let mask = match r.num() {
+                        let mask = match r {
                             // mov al, 1 is actually mov rax, rax[64:8]:0x1
                             // there's no bl() helper, and b(3) isn't const :(
-                            const { RegSpec::al() } | //const { RegSpec::bl() } |
+                            const { RegSpec::al() } | const { RegSpec::bl() } |
                             const { RegSpec::cl() } | const { RegSpec::dl() } => {
                                 let parent = *REGMAP.get(&r).unwrap();
-                                val = self.band(val, self.bor(
-                                    self.value(Location::Reg(parent), self.builder),
-                                    JitValue::Const(Wrapping(!0xFF)),
-                                ));
+                                let parent = self.get(Location::Reg(parent))
+                                    .val(self.builder, HOST_WIDTH);
+                                println!("before on reg = {:?}, val = {:?}", parent, val);
+                                let select_mask = JitValue::Const(Wrapping(0xFF));
+                                val = self.bitselect(select_mask, val, parent);
+                                println!("set lower on reg = {:?}", val);
                             },
                             _ => unimplemented!(),
                         };
@@ -1087,16 +1121,50 @@ impl<'a> FunctionTranslator<'a> {
         }
     }
 
-    pub fn flag_values(&mut self, flags: Vec<Flag>) -> JitValue {
-        let mut val: Option<JitValue> = None;
+    pub fn check_cond(&mut self, cond: IntCC) -> JitValue {
+        //match cond {
+        //    IntCC::UnsignedGreaterThan => {
+        //        // CF=0 and ZF=0
+        //        let cf = self.context.check_flag(Flag::CF, false, self.builder);
+        //        let zf = self.context.check_flag(Flag::ZF, false, self.builder);
+        //        self.band(cf, zf)
+        //    },
+        //    IntCC::UnsignedGreaterThanOrEqual => {
+        //        // CF=0
+        //        self.context.check_flag(Flag::CF, false, self.builder)
+        //    },
+        //    _ => unimplemented!(),
+        //}
+        let flags = match cond {
+            IntCC::UnsignedGreaterThan => {
+                vec![Flag::CF, Flag::ZF]
+            },
+            IntCC::UnsignedGreaterThanOrEqual => {
+                vec![CF]
+            },
+            _ => unimplemented!(),
+        };
+        let mut val = None;
+        let mut same = true;
         for flag in flags {
-            let next = self.context.flag_value(flag, self.builder);
-            match val {
-                None => val = Some(next),
-                Some(acc) => val = Some(self.bor(acc, next)),
+            let flag_cond = &self.context.flags[flag as usize];
+            if let Some(set_val) = val {
+                if set_val != flag_cond {
+                    same = false;
+                    break;
+                }
+            } else {
+                val = Some(flag_cond);
             }
         }
-        val.unwrap()
+        if !same {
+            unimplemented!();
+        }
+        if let Some(JitFlag::Unknown(left, right, res)) = val {
+            JitValue::Value(self.builder.ins().ifcmp(*left, *right))
+        } else {
+            unimplemented!()
+        }
     }
 
     /// Get left+right for JitValues.
@@ -1105,14 +1173,17 @@ impl<'a> FunctionTranslator<'a> {
         // XXX: set flags
         use JitValue::*;
         use Flag::*;
+        let flags = vec![OF, SF, ZF, AF, PF, CF];
         match (left, right) {
             (Value(val_left), Value(val_right)) => {
-                Value(self.builder.ins().iadd(val_left, val_right))
+                self.context.set_flags(flags, (val_left, val_right,
+                    self.builder.ins().iadd(val_left, val_right)))
             },
-            (ref_val @ Ref(_,_), Value(ssa))
-            | (Value(ssa), ref_val @ Ref(_,_)) => {
-                let v_ptr = ref_val.into_ssa(self.int, self.builder);
-                Value(self.builder.ins().isub(v_ptr, ssa))
+            (other @ _ , Value(ssa))
+            | (Value(ssa), other @ _) => {
+                let other = other.into_ssa(self.int, self.builder);
+                self.context.set_flags(flags, (other, ssa,
+                    self.builder.ins().iadd(other, ssa)))
             },
             (Ref(base, offset), Const(c))
             | (Const(c), Ref(base, offset)) => {
@@ -1130,31 +1201,70 @@ impl<'a> FunctionTranslator<'a> {
                 }
             },
             (Const(left_c), Const(right_c)) => {
-                Const(left_c + right_c)
+                if FLAG {
+                    let mut val = left_c.0;
+                    unsafe {
+                        getflags!(self.context, asm!("
+                            add {}, {}
+                        ", inout(reg) val, in(reg) right_c.0),
+                        vec![OF, SF, ZF, AF, PF]);
+                    }
+                    Const(Wrapping(val))
+                } else {
+                    Const(left_c + right_c)
+                }
             },
             (left, right) => unimplemented!("unimplemented add {:?} {:?}", left, right)
         }
     }
 
-    pub fn sub(&mut self, left: JitValue, right: JitValue) -> JitValue {
+    pub fn sub<const FLAG:bool>(&mut self, left: JitValue, right: JitValue) -> JitValue {
         // XXX: set flags
         use JitValue::*;
+        let flags = vec![OF, SF, ZF, AF, PF, CF];
         match (left, right) {
             // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
             (Value(val_left), Value(val_right)) => {
-                Value(self.builder.ins().isub(val_left, val_right))
+                let res = self.builder.ins().isub(val_left, val_right);
+                self.context.set_flags(flags, (val_left, val_right, res));
+                Value(res)
             },
-            (ref_val @ Ref(_,_), Value(ssa))
-            | (Value(ssa), ref_val @ Ref(_,_)) => {
-                let v_ptr = ref_val.into_ssa(self.int, self.builder);
-                Value(self.builder.ins().isub(v_ptr, ssa))
+            (left @ _ , right @ Value(_))
+            | (left @ Value(_), right @ _) => {
+                let left = left.into_ssa(self.int, self.builder);
+                let right = right.into_ssa(self.int, self.builder);
+                let res = self.builder.ins().isub(left, right);
+                self.context.set_flags(flags, (left, right, res));
+                Value(res)
             },
-            (Ref(base, offset), Const(c))
-            | (Const(c), Ref(base, offset)) => {
-                Ref(base, (Wrapping(offset) - c).0)
+            (Ref(base, offset), Const(Wrapping(c)))
+            | (Const(Wrapping(offset)), Ref(base, c)) => {
+                if FLAG {
+                    let mut val = offset;
+                    unsafe {
+                        getflags!(self.context, asm!("
+                            sub {}, {}
+                        ", inout(reg) val, in(reg) c),
+                        flags);
+                    }
+                    Ref(base, val)
+                } else {
+                    Ref(base, (Wrapping(offset) - Wrapping(c)).0)
+                }
             },
             (Const(left_c), Const(right_c)) => {
-                Const(left_c - right_c)
+                if FLAG {
+                    let mut val = left_c.0;
+                    unsafe {
+                        getflags!(self.context, asm!("
+                            sub {}, {}
+                        ", inout(reg) val, in(reg) right_c.0),
+                        flags);
+                    }
+                    Const(Wrapping(val))
+                } else {
+                    Const(left_c - right_c)
+                }
             },
             (left, right) => unimplemented!("unimplemented sub {:?} {:?}", left, right)
         }
@@ -1164,6 +1274,8 @@ impl<'a> FunctionTranslator<'a> {
         // XXX: set flags
         use JitValue::*;
         match (left, right) {
+            //0 & val or val & 0 = 0
+            (Const(Wrapping(0)), _) | (_, Const(Wrapping(0))) => Const(Wrapping(0)),
             // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
             (Value(val_left), Value(val_right)) => {
                 Value(self.builder.ins().band(val_left, val_right))
@@ -1188,6 +1300,8 @@ impl<'a> FunctionTranslator<'a> {
         // XXX: set flags
         use JitValue::*;
         match (left, right) {
+            //0 | val or val | 0 = val
+            (Const(Wrapping(0)), val @ _) | (val @ _, Const(Wrapping(0))) => val,
             // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
             (Value(val_left), Value(val_right)) => {
                 Value(self.builder.ins().bor(val_left, val_right))
@@ -1202,7 +1316,7 @@ impl<'a> FunctionTranslator<'a> {
                 unimplemented!("bor pointer")
             },
             (Const(left_c), Const(right_c)) => {
-                Const(left_c & right_c)
+                Const(left_c | right_c)
             },
             (left, right) => unimplemented!("unimplemented bor {:?} {:?}", left, right)
         }
@@ -1231,6 +1345,30 @@ impl<'a> FunctionTranslator<'a> {
             (left, right) => unimplemented!("unimplemented bxor {:?} {:?}", left, right)
         }
     }
+
+    pub fn bitselect(&mut self, control: JitValue, left: JitValue, right: JitValue) -> JitValue {
+        // XXX: set flags
+        use JitValue::*;
+        match (control, left, right) {
+            //bitselect(0, left, right) => right
+            (Const(Wrapping(0)), t @ _, f @ _) => f,
+            //bitselect(!0, left, right) => left
+            (Const(Wrapping(const { !(0 as usize) })), t @ _, f @ _) => t,
+            //bitselect(control, 0, right) => !control & right
+            //bitselect(control, left, 0) => control & left
+            (control @ _, left @ _, Const(Wrapping(0))) => {
+                self.band(control, left)
+            },
+            (control @ _, Value(val_left), Value(val_right)) => {
+                let control = control.into_ssa(self.int, self.builder);
+                Value(self.builder.ins().bitselect(control, val_left, val_right))
+            },
+            (control, left, right) =>
+                unimplemented!("unimplemented bitselect {:?} {:?} {:?}", control, left, right)
+        }
+    }
+
+
 
 }
 
