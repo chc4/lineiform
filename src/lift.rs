@@ -17,7 +17,7 @@ use core::marker::PhantomData;
 use std::collections::HashMap;
 use std::convert::{TryInto, TryFrom};
 use core::num::Wrapping;
-use rangemap::RangeMap;
+use rangemap::RangeInclusiveMap;
 
 use thiserror::Error;
 #[derive(Error, Debug)]
@@ -252,9 +252,8 @@ impl Context {
             Some(JitVariable::Known(JitValue::Ref(base, offset)))
                 if let JitValue::Stack = **base =>
             {
-                //println!("current stack @ 0x{:x}", offset);
+                println!("current stack @ 0x{:x}", offset);
                 assert!(offset <= &STACK_TOP);
-                assert_eq!(offset % 4, 0);
                 *offset
             },
             _ => unimplemented!("non-concrete stack??"),
@@ -468,7 +467,7 @@ impl<'a, A, O> Jit<'a, A, O> {
             idx: &mut idx,
             return_layout: &mut self.return_layout,
             tracer: &mut self.tracer,
-            changed: RangeMap::new(),
+            changed: RangeInclusiveMap::new(),
         };
         // We step forward all paths through the function until we are done
         // I think we can do something clever here: we can advance the branches
@@ -499,7 +498,7 @@ impl<'a, A, O> Jit<'a, A, O> {
             let mut new = function_translator.translate(next)?;
             need.append(&mut new);
         }
-        function_translator.builder.seal_block(entry_block);
+        // function_translator.builder.seal_block(entry_block);
         println!("jit output: \n{}", function_translator.builder.display(None));
         function_translator.builder.finalize();
         Ok(())
@@ -628,21 +627,25 @@ struct FunctionTranslator<'a> {
     /// building the loop body until we have seen all entries, and use the union
     /// of the bound set of all the entries to find the path invariant over all
     /// possibly paths through the loop.
-    changed: RangeMap<usize, HashMap<Location, JitVariable>>,
+    changed: RangeInclusiveMap<usize, HashMap<Location, JitVariable>>,
 }
 
 impl<'a> FunctionTranslator<'a> {
     fn translate<A, O>(&mut self, JitPath(f, bl, ctx): JitPath<A,O>)
             -> Result<Vec<JitPath<A,O>>, LiftError> {
+
         self.context = ctx;
         let mut base = (f.base as usize) + f.offset.0;
         let mut ip = base;
-        println!("starting emitting @ 0x{:x}", ip);
+        println!("starting emitting @ base+0x{:x}", ip - self.tracer.get_base()?);
         let mut stream = f.instructions.clone();
         let mut start_i = f.offset.1;
         let mut i = f.offset.1;
         let mut snap = self.context.bound.clone();
         self.builder.switch_to_block(bl);
+        // We never loop back to block we've already visited - loops emit a new
+        // copy of the body.
+        self.builder.seal_block(bl);
         // First, we check if we've already visited the entrypoint of this block
         // before.
         {
@@ -665,7 +668,7 @@ impl<'a> FunctionTranslator<'a> {
             let inst = inst.unwrap();
             ip += inst.len().to_const() as usize;
             let mut eff = self.emit(ip, inst)?;
-            let mut seal = |function_translator: &mut FunctionTranslator| {
+            let mut seal = |bl: Block, function_translator: &mut FunctionTranslator| {
                 // Mark the entire basic block as visited
                 let this_f = function_translator.context.seen.entry(f.base);
                 let entry = this_f.or_insert(Vec::with_capacity(i));
@@ -682,23 +685,25 @@ impl<'a> FunctionTranslator<'a> {
                 // And then we set the context snapshot we made at the start of the
                 // jump to cover the entire range of this block
                 // TODO: should this not snapshot if we already have one?
-                function_translator.changed.insert(start_i..i, (&snap).clone());
+                function_translator.changed.insert(start_i..=i, (&snap).clone());
                 snap = function_translator.context.bound.clone();
             };
             'handle: loop { match eff {
                 EmitEffect::Advance => i += 1,
                 EmitEffect::Jmp(target) => {
-                    seal(self);
+                    seal(bl, self);
                     // XXX: make sure this only works for *internal* jumps?
                     // tailcalls need to become just a jmp to the target and stop
                     let jump_target = Function::<A, O>::new(self.tracer, target as *const ())?;
                     //self.tracer.format(&jump_target.instructions)?;
                     //self.inline(jump_target)?;
                     println!("jmp to 0x{:x}", target);
-                    return Ok(vec![JitPath(jump_target, bl, self.context.clone())]);
+                    let jump_block = self.builder.create_block();
+                    self.builder.ins().jump(jump_block, &[]);
+                    return Ok(vec![JitPath(jump_target, jump_block, self.context.clone())]);
                 },
                 EmitEffect::Branch(cond, flags, target) => {
-                    seal(self);
+                    seal(bl, self);
                     // if cond isn't false, then we branch to target, otherwise we
                     // fallthrough.
                     // handling branchs is a bit tricky: we snapshot our context,
@@ -718,13 +723,11 @@ impl<'a> FunctionTranslator<'a> {
                     self.builder.ins().brif(cond, flags,
                         jump_target, &[]);
                     self.builder.ins().jump(continue_target, &[]);
-                    self.builder.seal_block(jump_target);
-                    self.builder.seal_block(continue_target);
 
                     let target = Function::<A, O>::new(self.tracer, target as *const ())?;
                     // Our continuation is from here
                     let mut cont = f;
-                    cont.offset = (ip - base, i+1);
+                    cont.offset = (ip - (cont.base as usize), i+1);
                     return Ok(vec![
                         // The branch path
                         JitPath(target, jump_target, self.context.clone()),
@@ -734,7 +737,7 @@ impl<'a> FunctionTranslator<'a> {
                 },
                 // The actual end of our function - 
                 EmitEffect::Ret => {
-                    seal(self);
+                    seal(bl, self);
                     break 'emit;
                 },
             }; break 'handle; }
@@ -772,6 +775,11 @@ impl<'a> FunctionTranslator<'a> {
                 if let Opcode::SUB = op {
                     self.store(inst.operand(0), subbed, ms);
                 }
+            },
+            Opcode::NEG => {
+                let dest = self.value(ip, inst.operand(0), inst.operand(0).width());
+                let negged = self.sub::<true>(JitValue::Const(Wrapping(0)), dest);
+                self.store(inst.operand(0), negged, inst.operand(0).width());
             },
             op @ (Opcode::AND | Opcode::TEST) => {
                 let left = self.value(ip, inst.operand(0), ms);
@@ -817,7 +825,7 @@ impl<'a> FunctionTranslator<'a> {
                     unimplemented!();
                 }
             },
-            jcc @ (Opcode::JZ | Opcode::JA | Opcode::JB | Opcode::JNA) => {
+            jcc @ (Opcode::JZ | Opcode::JA | Opcode::JB | Opcode::JNA | Opcode::JNB) => {
                 let _target = self.jump_target(inst.operand(0), ip, ms);
 
                 let target;
@@ -935,9 +943,11 @@ impl<'a> FunctionTranslator<'a> {
     pub fn cond_from_opcode(&mut self, op: Opcode) -> IntCC {
         match op {
             Opcode::JA | Opcode::SETA => IntCC::UnsignedGreaterThan,
+            Opcode::JNA => IntCC::UnsignedGreaterThan.inverse(),
             Opcode::SETAE => IntCC::UnsignedGreaterThanOrEqual,
             Opcode::JB | Opcode::SETB => IntCC::UnsignedLessThan,
-            Opcode::JNA => IntCC::UnsignedGreaterThan.inverse(),
+            Opcode::JNB => IntCC::UnsignedGreaterThanOrEqual,
+            Opcode::JZ | Opcode::SETZ => IntCC::Equal,
             _ => unimplemented!(),
         }
     }
@@ -991,7 +1001,6 @@ impl<'a> FunctionTranslator<'a> {
             JitValue::Ref(ref base, offset)
                 if let JitValue::Stack = **base =>
             {
-                assert_eq!(offset % 4, 0);
                 //println!("shifting stack 0x{:x}", offset);
                 let new_stack = self.add::<false>(stack_reg,
                     JitValue::Const(Wrapping((slots * 8) as usize)));
@@ -1001,17 +1010,42 @@ impl<'a> FunctionTranslator<'a> {
         }
     }
 
+    pub fn stack_load(&mut self, slot: usize, width: u8) -> JitValue {
+        assert!(slot <= STACK_TOP);
+        let offset = slot % (HOST_WIDTH as usize);
+        if offset == 0 {
+            return self.get(Location::Stack(slot)).val(self.builder, width);
+        }
+        let base = slot - offset;
+        assert_eq!(base % (HOST_WIDTH as usize), 0);
+        if (offset as u8) + width > HOST_WIDTH {
+            unimplemented!("spliced load, {:x}+{}", base, offset);
+        } else {
+            // A load at Stack(4) of 4 is actually Stack(0) & 0xFFFF_FFFF
+            // (little endian)
+            let val = self.get(Location::Stack(base)).val(self.builder, HOST_WIDTH);
+            self.band(val, JitValue::Const(Wrapping((1 << (width*8)+1) - 1)))
+        }
+    }
+
     pub fn get(&mut self, loc: Location) -> JitVariable {
         // If we didn't already have the register bound to a variable,
         // create a fresh one and return it.
+        // This always returns HOST_WIDTH wide values.
         let idx = &mut self.idx;
         let builder = &mut self.builder;
         let int = self.int;
         let key = match loc {
             Location::Reg(r) if r.width() != HOST_WIDTH => Location::Reg(*REGMAP.get(&r).unwrap_or(&r)),
+            Location::Stack(s) if s % (HOST_WIDTH as usize) != 0 =>
+                panic!("self.get shouldn't be called with non-aligned stack slots. did you mean to use stack_load?"),
             _ => loc
         };
-        self.context.bound.entry(key).or_insert_with(|| {
+        self.context.bound.entry(key).or_insert_with_key(|key: &Location| {
+            if let Location::Stack(s) = key {
+                // provide a zeroed stack
+                return JitVariable::Known(JitValue::Const(Wrapping(0)));
+            }
             let fresh = Variable::new(**idx);
             **idx = **idx + 1;
             // FIXME: registers should be the correct width
@@ -1048,16 +1082,21 @@ impl<'a> FunctionTranslator<'a> {
             Operand::Register(const { RegSpec::eip() } | const { RegSpec::esp() }) => {
                 unimplemented!("non-native registers")
             },
+            // aligned reads are handled by val(), which stitches together the
+            // value from multiple stack slots if needed. We only ever store
+            // HOST_WIDTH aligned words in the bound map.
             Operand::RegDeref(STACK) => {
                 let sp = self.context.stack();
-                self.get(Location::Stack(sp)).val(self.builder, width.unwrap())
+                let v = self.stack_load(sp, width.unwrap());
+                println!("[rsp] = {:?}", v);
+                v
+                //self.get(Location::Stack(sp)).val(self.builder, width.unwrap())
             },
-            // XXX: this doesn't allow for unaligned reads - but whatever
             Operand::RegDisp(STACK, o) => {
-                // [rsp-8] becomes Stack(self.stack() + 1)
-                assert_eq!(o % 4, 0);
+                // [rsp-8] becomes Stack(self.stack() - 8)
                 let slot = Wrapping(self.context.stack()) + Wrapping(o as isize as usize);
-                self.get(Location::Stack(slot.0 as usize)).val(self.builder, width.unwrap())
+                self.stack_load(slot.0, width.unwrap())
+                //self.get(Location::Stack(slot.0 as usize)).val(self.builder, width.unwrap())
             },
             Operand::RegDeref(r) => {
                 let reg_val = self.get(Location::Reg(r)).val(self.builder, r.width());
@@ -1076,12 +1115,16 @@ impl<'a> FunctionTranslator<'a> {
                                 unsafe {
                                     let val = Wrapping(std::ptr::read::<usize>(
                                         addr.offset(offset.try_into().unwrap()) as *const usize));
-                                    JitValue::Const(val & Wrapping((1<<(width.unwrap()*8+1))-1))
+                                    if let Some(HOST_WIDTH) = width {
+                                        JitValue::Const(val)
+                                    } else {
+                                        JitValue::Const(val & Wrapping((1<<(width.unwrap()*8+1))-1))
+                                    }
                                 }
                             },
                             JitValue::Stack => {
-                                assert_eq!(offset % 8, 0);
-                                self.get(Location::Stack(offset)).val(self.builder, width.unwrap())
+                                //self.get(Location::Stack(offset)).val(self.builder, width.unwrap())
+                                self.stack_load(offset, width.unwrap())
                             },
                             val @ _ => unimplemented!("value for ref to {:?}", val),
                         }
@@ -1108,7 +1151,7 @@ impl<'a> FunctionTranslator<'a> {
     /// properly.
     pub fn store(&mut self, loc: Operand, mut val: JitValue, width: Option<u8>) {
         // The key to look up for the operand in our context.
-        let key = match loc {
+        let mut key = match loc {
             Operand::Register(STACK) => {
                 // sub rsp, 0x8 gets the stack as the value of rsp,
                 // which means it becomes e.g. STACK_TOP-8 after a push.
@@ -1116,7 +1159,6 @@ impl<'a> FunctionTranslator<'a> {
                 match val {
                     JitValue::Ref(ref base,offset) if let JitValue::Stack = **base => {
                         assert!(offset <= STACK_TOP);
-                        assert_eq!(offset % 4, 0);
                         Location::Reg(STACK)
                     }
                     _ => unimplemented!("non-concrete stack! {:?}", val),
@@ -1163,10 +1205,6 @@ impl<'a> FunctionTranslator<'a> {
                 Location::Stack(self.context.stack())
             },
             Operand::RegDisp(STACK, o) => {
-                // We turn [rsp-8] into Stack(stack - 1) - we count
-                // stack slots up from 0.
-                assert_eq!(o % 4, 0); // XXX: there's a few of these - we need to
-                // handle unaligned access to stack values correct
                 let sp = Wrapping(self.context.stack()) + Wrapping(o as isize as usize);
                 println!("stack {} = {:x}", loc, sp.0 as usize);
                 Location::Stack(sp.0 as usize)
@@ -1175,6 +1213,27 @@ impl<'a> FunctionTranslator<'a> {
             //Operand::RegDisp(r, o) => Location::Reg(r),
             _ => unimplemented!("unimplemented key for {:?}", loc),
         };
+        // We have to switch stores to unaligned stack slots together as well
+        if let Location::Stack(s) = key { if s % (HOST_WIDTH as usize) != 0 {
+                println!("unaligned store to stack {:x}", s);
+                let off: usize = s % (HOST_WIDTH as usize);
+                let slot: usize = s - off;
+                let width = width.unwrap();
+                if (off as u8) + width > HOST_WIDTH {
+                    unimplemented!("splice store, stack(0x{:x}+{}) write {}",
+                        slot, off, width);
+                }
+                // If we're storing 4 bytes to Stack(4), we're actually setting
+                // Stack(0) to bitselect(0xFFFF_FFFF, val, Stack(0))
+                let main = self.get(Location::Stack(slot)).val(self.builder, HOST_WIDTH);
+                val = self.bitselect(
+                    JitValue::Const(Wrapping((1 << ((off+1)*8)) - 1)),
+                    val, main);
+                println!("value to put aligned is {:?}", val);
+                // Our key is now always HOST_WIDTH aligned, so we can just store
+                // into it in our bound map.
+                key = Location::Stack(slot);
+        }};
         match val {
             // If we're just setting a variable to a known value, we copy the
             // value in.
@@ -1251,6 +1310,9 @@ impl<'a> FunctionTranslator<'a> {
             IntCC::UnsignedLessThanOrEqual => {
                 vec![Flag::CF, Flag::ZF]
             },
+            IntCC::Equal => {
+                vec![Flag::ZF]
+            },
             _ => unimplemented!("unimplemented check_cond for {}", cond),
         };
         let mut val = None;
@@ -1293,6 +1355,9 @@ impl<'a> FunctionTranslator<'a> {
                     let cf = self.context.check_flag(Flag::CF, true, self.builder);
                     let zf = self.context.check_flag(Flag::ZF, true, self.builder);
                     self.bor(cf, zf)
+                },
+                IntCC::Equal => {
+                    self.context.check_flag(Flag::ZF, true, self.builder)
                 },
                 _ => unimplemented!(),
             }
@@ -1410,6 +1475,9 @@ impl<'a> FunctionTranslator<'a> {
         match (left, right) {
             //0 & val or val & 0 = 0
             (Const(Wrapping(0)), _) | (_, Const(Wrapping(0))) => Const(Wrapping(0)),
+            // !0 & val or val & !0 = val
+            (Const(Wrapping(const { !0 as usize})), val @ _) |
+                (val @ _, Const(Wrapping(const { !0 as usize }))) => val,
             // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
             (Value(val_left), Value(val_right)) => {
                 Value(self.builder.ins().band(val_left, val_right))
@@ -1489,6 +1557,10 @@ impl<'a> FunctionTranslator<'a> {
             //bitselect(!0, left, right) => left
             (Const(Wrapping(const { !(0 as usize) })), t @ _, f @ _) => t,
             //bitselect(control, 0, right) => !control & right
+            (control @ _, Const(Wrapping(0)), right @ _) => {
+                let ncontrol = self.bnot(control);
+                self.band(ncontrol, right)
+            },
             //bitselect(control, left, 0) => control & left
             (control @ _, left @ _, Const(Wrapping(0))) => {
                 self.band(control, left)
@@ -1499,6 +1571,15 @@ impl<'a> FunctionTranslator<'a> {
             },
             (control, left, right) =>
                 unimplemented!("unimplemented bitselect {:?} {:?} {:?}", control, left, right)
+        }
+    }
+
+    pub fn bnot(&mut self, val: JitValue) -> JitValue {
+        use JitValue::*;
+        match val {
+            Value(val) => Value(self.builder.ins().bnot(val)),
+            Const(c) => Const(!c),
+            _ => unimplemented!("bnot {:?}", val),
         }
     }
 }
