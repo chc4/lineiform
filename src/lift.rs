@@ -204,8 +204,7 @@ use Flag::*;
 macro_rules! getflags {
     ($ctx:expr, $e:expr, $bits:expr) => {
         $e;
-        let mut scratch_stack: usize = 0;
-        let mut flags: u64 = 0;
+        let mut flags: u64;
         asm!("
             pushfq;
             pop {0};
@@ -618,6 +617,18 @@ impl<'a> FunctionTranslator<'a> {
         let mut i = f.offset.1;
         let mut snap = self.context.bound.clone();
         self.builder.switch_to_block(bl);
+        // First, we check if we've already visited the entrypoint of this block
+        // before.
+        {
+            let this_f = self.seen.entry(f.base);
+            if let std::collections::hash_map::Entry::Occupied(emitted) = this_f {
+                if let Some(true) = emitted.get().get(start_i) {
+                    unimplemented!("looping");
+                }
+            }
+        }
+
+        // Otherwise, we emit all the instructions in our block and handle effects
         'emit: loop {
             let inst = stream.get(i);
             if let None = inst {
@@ -1453,9 +1464,4 @@ impl<'a> FunctionTranslator<'a> {
                 unimplemented!("unimplemented bitselect {:?} {:?} {:?}", control, left, right)
         }
     }
-
-
-
 }
-
-

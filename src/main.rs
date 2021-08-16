@@ -175,7 +175,7 @@ mod test {
     #[test]
     pub fn test_can_pin_argument() -> Result<(), crate::MainError> {
         use core::num::Wrapping;
-        extern "C" fn test(a: Wrapping<usize>, b: Wrapping<usize>) -> Wrapping<usize> {
+        extern "C" fn test(a: Wrapping<usize>, _b: Wrapping<usize>) -> Wrapping<usize> {
             a + Wrapping(2)
         }
 
@@ -216,8 +216,8 @@ mod test {
             let b = black_box(0) + black_box(0);
             a + b
         });
-        for i in (0..(!0)).step_by(0x4934) {
-            assert_eq!(clos(0), 0);
+        for i in vec![0, !0, 0xFFFF_0000, 0x284591, &jit as &_ as *const _ as *const () as usize] {
+            assert_eq!(clos(i), i);
         }
         Ok(())
     }

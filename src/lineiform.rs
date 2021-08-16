@@ -7,23 +7,19 @@ use std::rc::Rc;
 use core::num::Wrapping;
 use crate::lift::JitValue;
 
+/// Rust closures are rust-call calling convention only. This is a problem, since
+/// we want to lift them to Cranelift, and we don't know what registers are "live"
+/// at the start and end. We instead make it so that making a Function from an Fn
+/// actually starts the trace from the Trampoline call for the correct type,
+/// with it's call being extern "C". Rustc then emits a stdcall -> rust-call
+/// prologue and epilogue for us, which we can lift.
+
 extern "C" fn c_fn<A, O>(
     cb: extern fn(data: *const c_void, A)->O, // "rust-call", but adding that ICEs
     d: *const c_void,
     a: A
 ) -> O {
     cb(d, a)
-}
-
-pub fn foo<A, O, F: Fn(A)->O>(callback: F, args: (A,)) {
-    let c: for <'a> extern "rust-call" fn(&'a F, (A,))->O = <F as Fn<(A,)>>::call;
-    unsafe {
-        c_fn(
-            std::mem::transmute(c),
-            &callback as *const _ as *const c_void,
-            args
-        )
-    }
 }
 
 use core::ffi::c_void;
@@ -86,7 +82,7 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
         // We want to feed c_fn into our lifter, calling F::call as arg 1, with
         // data as our argument 2.
         let call: for <'a> extern "rust-call" fn(&'a F, (A,))->O = <F as Fn<(A,)>>::call;
-        let f_body = &f as *const _ as *const c_void;
+        let f_body = &f as *const _ as *const u8;
         let call: extern fn(data: *const c_void, A)->O =
             unsafe { std::mem::transmute(call) };
         // We now compile c_fn(call, f_body, a: A) to a function that can throw
@@ -98,7 +94,7 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
                 (Location::Reg(RegSpec::rdi()), JitValue::Const(Wrapping(call as usize))),
                 (Location::Reg(RegSpec::rsi()), JitValue::Ref(
                         Rc::new(JitValue::Frozen {
-                            addr: &f as *const _ as *const u8,
+                            addr: f_body,
                             size: std::mem::size_of_val(&f),
                         }), 0)
                 ),
