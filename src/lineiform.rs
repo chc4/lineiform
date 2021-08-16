@@ -103,9 +103,9 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
                         }), 0)
                 ),
             ]);
-        let mut inlined = Jit::lift(&mut self.tracer, func);
+        let mut inlined = Jit::new(&mut self.tracer);
         //inlined.assume(vec![call as *const u8, f_body as *const u8]);
-        let (inlined, _size) = inlined.lower().unwrap();
+        let (inlined, _size) = inlined.lower(func).unwrap();
 
         if true {
             let new_func_dis = self.tracer.disassemble(inlined as *const (), _size as usize).unwrap();

@@ -12,9 +12,11 @@ use yaxpeax_arch::LengthedInstruction;
 use bitvec::vec::BitVec;
 use bitvec::slice::BitSlice;
 
+use core::marker::PhantomData;
 use std::collections::HashMap;
 use std::convert::{TryInto, TryFrom};
 use core::num::Wrapping;
+use rangemap::RangeMap;
 
 use thiserror::Error;
 #[derive(Error, Debug)]
@@ -97,7 +99,7 @@ pub enum Location {
     Stack(usize),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JitVariable {
     Variable(Variable),
     Known(JitValue),
@@ -134,7 +136,7 @@ impl JitVariable {
 }
 
 use std::rc::Rc;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JitValue {
     /// An SSA value
     Value(Value),
@@ -226,6 +228,7 @@ enum JitFlag {
     Unknown(Value, Value, Value), // left <op> right = <result>
 }
 
+#[derive(Clone)]
 struct Context {
     /// Our currently known execution environment. This holds values like `rax`
     /// and stored stack values, mapping them to either constant propagated
@@ -309,7 +312,6 @@ impl Context {
 }
 
 pub struct Jit<'a, A, O> {
-    f: Function<A, O>,
     builder_context: FunctionBuilderContext,
     ctx: codegen::Context,
     data_ctx: DataContext,
@@ -317,12 +319,13 @@ pub struct Jit<'a, A, O> {
     argument_layout: Vec<Type>,
     return_layout: Vec<Type>,
     tracer: &'a mut Tracer<'static>,
+    _phantom: PhantomData<(A, O)>,
 }
 
 enum EmitEffect {
     Advance,
     Jmp(usize),
-    Branch(Value, usize),
+    Branch(IntCC, Value, usize),
     Ret,
 }
 
@@ -389,7 +392,7 @@ impl Target {
 }
 
 impl<'a, A, O> Jit<'a, A, O> {
-    pub fn lift(tracer: &'a mut Tracer<'static>, f: Function<A, O>) -> Jit<'a, A, O> {
+    pub fn new(tracer: &'a mut Tracer<'static>) -> Jit<'a, A, O> {
         let builder = JITBuilder::new(cranelift_module::default_libcall_names());
         let module = JITModule::new(builder);
 
@@ -410,7 +413,6 @@ impl<'a, A, O> Jit<'a, A, O> {
         }
 
         Self {
-            f: f,
             builder_context: FunctionBuilderContext::new(),
             ctx: ctx,
             data_ctx: DataContext::new(),
@@ -418,13 +420,14 @@ impl<'a, A, O> Jit<'a, A, O> {
             argument_layout,
             return_layout,
             tracer,
+            _phantom: PhantomData,
         }
     }
 
     /// Translate a Function into Cranelift IR.
     /// Calling conventions here are a bit weird: essentially we only ever build
     ///
-    fn translate(&mut self) -> Result<(), LiftError> {
+    fn translate(&mut self, f: Function<A, O>) -> Result<(), LiftError> {
         let int = self.module.target_config().pointer_type();
         // We are translating extern "C" fn(A) -> O;
         // Create the builder to build a function.
@@ -446,76 +449,32 @@ impl<'a, A, O> Jit<'a, A, O> {
 
         let mut idx = 0; // Why do we need to do this instead of asking cranelift for
         // a fresh variable??
-        let mut variables = Self::make_variables(&mut builder, &mut idx, entry_block, int, &self.argument_layout, &self.f.pinned);
+        let mut variables = Self::make_variables(&mut builder, &mut idx, entry_block, int, &self.argument_layout, &f.pinned);
 
         let mut function_translator = FunctionTranslator {
             depth: 0,
-            f: (self.f.base, self.f.size),
             int,
             builder: &mut builder,
-            context: variables,
+            context: variables.clone(),
             module: &mut self.module,
             idx: &mut idx,
             return_layout: &mut self.return_layout,
             tracer: &mut self.tracer,
             seen: HashMap::new(),
+            changed: RangeMap::new(),
         };
-
-        let mut ip = self.f.base as usize;
-        println!("starting emitting @ 0x{:x}", ip);
-        let mut stream = self.f.instructions.clone();
-        let mut i = 0;
-        'emit: loop {
-            let inst = stream.get(i);
-            if let None = inst {
-                // we ran out of inputs but didn't hit a ret!
-                println!("hit translate out @ 0x{:x}", ip);
-                return Err(LiftError::TranslateOut(()));
-            }
-            let inst = inst.unwrap();
-            ip += inst.len().to_const() as usize;
-            let eff = function_translator.emit(ip, inst)?;
-            match eff {
-                EmitEffect::Advance => i += 1,
-                EmitEffect::Jmp(target) => {
-                    // XXX: make sure this only works for *internal* jumps?
-                    // tailcalls need to become just a jmp to the target and stop
-                    let jump_target = Function::<A, O>::new(function_translator.tracer, target as *const ())?;
-                    //self.tracer.format(&jump_target.instructions)?;
-                    //self.inline(jump_target)?;
-                    println!("jmp to 0x{:x}", target);
-                    stream = jump_target.instructions.clone();
-                    i = jump_target.offset.1;
-                    ip = target;
-                },
-                EmitEffect::Branch(cond, target) => {
-                    // if cond isn't false, then we branch to target, otherwise we
-                    // fallthrough.
-                    // handling branchs is a bit tricky: we snapshot our context,
-                    // because we need to isolate effects from one control flow path
-                    // from the other. we also give the branches different "version" -
-                    // i think there's a way to use (version, addr) tuples for
-                    // better block compilation or something idk
-                    //
-                    // we probably dont ever want to *merge* control flow path,
-                    // unfortunately - it's pretty unlikely that both sides of a
-                    // branch end up with identical contexts when they merge, and
-                    // doing eta nodes or erasing their values back to SSA is hairy
-                    // because we lose constant value knowledge, which is our bread
-                    // and butter.
-                    unimplemented!();
-                },
-                // The actual end of our function - 
-                EmitEffect::Ret => {
-                    break 'emit;
-                },
-            };
-        };
+        // We step forward all paths through the function until we are done
+        let mut need = vec![(f, entry_block, variables)];
+        while let Some(next) = need.pop() {
+            let mut new = function_translator.translate(next.0, next.1, next.2)?;
+            need.append(&mut new);
+        }
         function_translator.builder.seal_block(entry_block);
         println!("jit output: \n{}", function_translator.builder.display(None));
         function_translator.builder.finalize();
         Ok(())
     }
+
 
     fn make_variables<'b>(builder: &mut FunctionBuilder<'b>, idx: &mut usize, entry_block: Block,
         int: Type, arg_vars: &Vec<Type>, pinned_values: &Vec<(Location, JitValue)>) -> Context
@@ -562,8 +521,8 @@ impl<'a, A, O> Jit<'a, A, O> {
         }
     }
 
-    pub fn lower(&mut self) -> Result<(*const u8, u32),LiftError> {
-        let translate_result = self.translate()?;
+    pub fn lower(&mut self, f: Function<A, O>) -> Result<(*const u8, u32),LiftError> {
+        let translate_result = self.translate(f)?;
 
         let id = self.module.declare_function(
             "test function",
@@ -603,7 +562,6 @@ impl<'a, A, O> Jit<'a, A, O> {
 // so we need this helper struct for the Jit.
 struct FunctionTranslator<'a> {
     depth: usize,
-    f: (*const (), usize),
     int: Type,
     builder: &'a mut FunctionBuilder<'a>,
     context: Context,
@@ -613,12 +571,141 @@ struct FunctionTranslator<'a> {
     tracer: &'a mut Tracer<'static>,
     /// This is a bitvec for keeping track of instructions that we have seen and
     /// emitted, so that we can track backwards jumps to know when to emit loops.
-    /// Notably, we keep a bitvec for *each function*, so that we also know when
-    seen: HashMap<*const (), BitVec>
+    /// Technically this should be updated at each instruction emission - we can
+    /// optimize it a bit by only updating it when we exit a block, however, and
+    /// mark (start..end) all at once.
+    seen: HashMap<*const (), Vec<bool>>,
+    ///// This is a list of blocks that we visited: each pointer is the address of
+    ///// the start (aka the jump target).
+    //flow: Vec<*const ()>,
+    /// a = 1
+    /// b = 5
+    /// c = 3
+    /// do {
+    ///     a += 1;
+    ///     b -= 1;
+    /// } while (b > 0);
+    /// a + c
+    ///
+    /// We pair a snapshot of the context with every entry to a basic block.
+    /// This means that on a backwards jump we can find the difference between
+    /// the start of block containing the loop and the end we're currently at, so
+    /// we have a set of changed registers + stack values. We can then pass these
+    /// values in as opaque block parameters in the recompiled loop body, and have
+    /// them become parameters for the loop exit block.
+    ///
+    /// We can also diff the bound set at the start and end of the recompiled loop
+    /// to find values that were modified in the loop's *block*, but not the actual
+    /// loop body: in our example it would allow us to recover `c = 3`.
+    ///
+    /// There's a small snag due to multiple loop exits: we can handle this by simply
+    /// emitting branches breadth-first in our high-level emit loop, and delay
+    /// building the loop body until we have seen all entries, and use the union
+    /// of the bound set of all the entries to find the path invariant over all
+    /// possibly paths through the loop.
+    changed: RangeMap<usize, HashMap<Location, JitVariable>>,
 }
 
 impl<'a> FunctionTranslator<'a> {
+    fn translate<A, O>(&mut self, f: Function<A, O>, bl: Block, ctx: Context)
+            -> Result<Vec<(Function<A,O>, Block, Context)>, LiftError> {
+        self.context = ctx;
+        let mut base = (f.base as usize) + f.offset.0;
+        let mut ip = base;
+        println!("starting emitting @ 0x{:x}", ip);
+        let mut stream = f.instructions.clone();
+        let mut start_i = f.offset.1;
+        let mut i = f.offset.1;
+        let mut snap = self.context.bound.clone();
+        self.builder.switch_to_block(bl);
+        'emit: loop {
+            let inst = stream.get(i);
+            if let None = inst {
+                // we ran out of inputs but didn't hit a ret!
+                println!("hit translate out @ 0x{:x}", ip);
+                return Err(LiftError::TranslateOut(()));
+            }
+            let inst = inst.unwrap();
+            ip += inst.len().to_const() as usize;
+            let mut eff = self.emit(ip, inst)?;
+            let mut seal = |function_translator: &mut FunctionTranslator| {
+                // Mark the entire basic block as visited
+                let this_f = function_translator.seen.entry(f.base);
+                let entry = this_f.or_insert(Vec::with_capacity(i));
+                // if we don't have enough slots to mark all our data, we
+                // need to grow it so it fits. we will be marking it, so it
+                // can be set by the resize.
+                println!("basic block range is {:x}-{:x}", start_i, i);
+                if entry.len() <= i {
+                    entry.resize(i, true);
+                }
+                for inst in
+                    &mut entry[start_i..i] {
+                        *inst = true;
+                }
+                // And then we set the context snapshot we made at the start of the
+                // jump to cover the entire range of this block
+                function_translator.changed.insert(start_i..i, (&snap).clone());
+                snap = function_translator.context.bound.clone();
+            };
+            'handle: loop { match eff {
+                EmitEffect::Advance => i += 1,
+                EmitEffect::Jmp(target) => {
+                    seal(self);
+                    // XXX: make sure this only works for *internal* jumps?
+                    // tailcalls need to become just a jmp to the target and stop
+                    let jump_target = Function::<A, O>::new(self.tracer, target as *const ())?;
+                    //self.tracer.format(&jump_target.instructions)?;
+                    //self.inline(jump_target)?;
+                    println!("jmp to 0x{:x}", target);
+                    return Ok(vec![(jump_target, bl, self.context.clone())]);
+                },
+                EmitEffect::Branch(cond, flags, target) => {
+                    seal(self);
+                    // if cond isn't false, then we branch to target, otherwise we
+                    // fallthrough.
+                    // handling branchs is a bit tricky: we snapshot our context,
+                    // because we need to isolate effects from one control flow path
+                    // from the other. we also give the branches different "version" -
+                    // i think there's a way to use (version, addr) tuples for
+                    // better block compilation or something idk
+                    //
+                    // we probably dont ever want to *merge* control flow path,
+                    // unfortunately - it's pretty unlikely that both sides of a
+                    // branch end up with identical contexts when they merge, and
+                    // doing eta nodes or erasing their values back to SSA is hairy
+                    // because we lose constant value knowledge, which is our bread
+                    // and butter. we can probably have some heuristic idk
+                    let jump_target = self.builder.create_block();
+                    let continue_target = self.builder.create_block();
+                    self.builder.ins().brif(cond, flags,
+                        jump_target, &[]);
+                    self.builder.ins().jump(continue_target, &[]);
+                    self.builder.seal_block(jump_target);
+                    self.builder.seal_block(continue_target);
+
+                    let target = Function::<A, O>::new(self.tracer, target as *const ())?;
+                    // Our continuation is from here
+                    let mut cont = f;
+                    cont.offset = (ip, i+1);
+                    return Ok(vec![
+                        // The branch path
+                        (target, jump_target, self.context.clone()),
+                        // The fallthrough
+                        (cont, continue_target, self.context.clone())
+                    ]);
+                },
+                // The actual end of our function - 
+                EmitEffect::Ret => {
+                    break 'emit;
+                },
+            }; break 'handle; }
+        };
+        Ok(vec![])
+    }
+
     fn emit(&mut self, ip: usize, inst: &Instruction) -> Result<EmitEffect, LiftError> {
+
         println!("emitting for {}", inst);
         let ms = inst.mem_size().and_then(|m| m.bytes_size());
         match inst.opcode() {
@@ -668,11 +755,7 @@ impl<'a> FunctionTranslator<'a> {
             },
             setcc @ (Opcode::SETA | Opcode::SETAE) => {
                 // get what condition they corrospond to
-                let cond = match setcc {
-                    Opcode::SETA => IntCC::UnsignedGreaterThan,
-                    Opcode::SETAE => IntCC::UnsignedGreaterThanOrEqual,
-                    _ => unimplemented!(),
-                };
+                let cond = self.cond_from_opcode(setcc);
                 // and then get the either constant or dynamic flag for whether
                 // to branch or not from the condition
                 let take = self.check_cond(cond);
@@ -696,30 +779,20 @@ impl<'a> FunctionTranslator<'a> {
                     unimplemented!();
                 }
             },
-            jcc @ Opcode::JZ => {
+            jcc @ (Opcode::JZ | Opcode::JB) => {
                 let _target = self.jump_target(inst.operand(0), ip, ms);
 
                 let target;
                 if let JitValue::Const(c) = _target {
                     println!("known conditional jump location: 0x{:x}", c.0);
-                    // If it's within our own function, it's an internal branch:
-                    // don't handle this for now.
-                    if c.0 >= (self.f.0 as usize + ip) && c.0 <= (self.f.0 as usize) + self.f.1 {
-                        unimplemented!("internal jump");
-                    }
                     target = c.0;
                 } else {
                     unimplemented!("dynamic call");
                 }
 
-                let cond = match jcc {
-                    Opcode::JZ => {
-                        self.context.check_flag(Flag::ZF, true, self.builder)
-                    },
-                    _ => unreachable!(),
-                };
-
-                match cond {
+                let cond = self.cond_from_opcode(jcc);
+                let take = self.check_cond(cond);
+                match take {
                     JitValue::Const(Wrapping(const { false as usize })) => {
                         // we know statically we aren't taking this branch - we
                         // can just go to the next instruction
@@ -730,11 +803,11 @@ impl<'a> FunctionTranslator<'a> {
                         // jump
                         return Ok(EmitEffect::Jmp(target))
                     },
-                    JitValue::Value(cond) => {
+                    JitValue::Value(flags) => {
                         // we don't know until runtime if we're taking this branch
                         // or not - we return Brnz(cond, target) as an effect,
                         // so our emit loop can emit both sides of the branch.
-                        return Ok(EmitEffect::Branch(cond, target));
+                        return Ok(EmitEffect::Branch(cond, flags, target));
                     },
                     _ => {
                         unimplemented!();
@@ -762,11 +835,6 @@ impl<'a> FunctionTranslator<'a> {
                 // If we know where the jump is going, we can try to inline
                 if let JitValue::Const(c) = target {
                     println!("known jump location: 0x{:x}", c.0);
-                    // If it's within our own function, it's an internal branch:
-                    // don't handle this for now.
-                    if c.0 >= (self.f.0 as usize + ip) && c.0 <= (self.f.0 as usize) + self.f.1 {
-                        unimplemented!("internal jump");
-                    }
                     return Ok(EmitEffect::Jmp(c.0));
                 } else {
                     unimplemented!("dynamic call");
@@ -824,6 +892,15 @@ impl<'a> FunctionTranslator<'a> {
             }
         }
         Ok(EmitEffect::Advance)
+    }
+
+    pub fn cond_from_opcode(&mut self, op: Opcode) -> IntCC {
+        match op {
+            Opcode::JA | Opcode::SETA => IntCC::UnsignedGreaterThan,
+            Opcode::SETAE => IntCC::UnsignedGreaterThanOrEqual,
+            Opcode::JB | Opcode::SETB => IntCC::UnsignedLessThan,
+            _ => unimplemented!(),
+        }
     }
 
     fn jump_target(&mut self, op: Operand, ip: usize, ms: Option<u8>) -> JitValue {
@@ -1129,6 +1206,9 @@ impl<'a> FunctionTranslator<'a> {
             IntCC::UnsignedGreaterThanOrEqual => {
                 vec![CF]
             },
+            IntCC::UnsignedLessThan => {
+                vec![Flag::CF]
+            },
             _ => unimplemented!(),
         };
         let mut val = None;
@@ -1161,6 +1241,10 @@ impl<'a> FunctionTranslator<'a> {
                 IntCC::UnsignedGreaterThanOrEqual => {
                     // CF=0
                     self.context.check_flag(Flag::CF, false, self.builder)
+                },
+                IntCC::UnsignedGreaterThanOrEqual => {
+                    // CF=1
+                    self.context.check_flag(Flag::CF, true, self.builder)
                 },
                 _ => unimplemented!(),
             }

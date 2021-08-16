@@ -15,6 +15,7 @@ extern crate cranelift_codegen;
 extern crate target_lexicon;
 extern crate bitvec;
 extern crate bitflags;
+extern crate rangemap;
 
 use thiserror::Error;
 use std::fmt::Display;
@@ -122,8 +123,8 @@ fn main() -> Result<(), MainError> {
     let mut tracer = Tracer::new()?;
     let assumed_test = Function::<(usize, usize), usize>::new(&mut tracer, test as *const ())?
         .assume_args(vec![(Location::Reg(RegSpec::rdi()), JitValue::Const(Wrapping(3)))]);
-    let mut lifted = Jit::lift(&mut tracer, assumed_test);
-    let (lowered_test, size) = lifted.lower()?;
+    let mut lifted = Jit::new(&mut tracer);
+    let (lowered_test, size) = lifted.lower(assumed_test)?;
     unsafe {
         let jitted_pinned_test = std::mem::transmute::<_, extern "C" fn(usize, usize)->usize>(lowered_test);
         assert_eq!(jitted_pinned_test(1, 2), 5);
@@ -155,10 +156,10 @@ fn test_jit() -> Result<(), MainError> {
     println!("base @ {:x}", func.base as usize);
     tracer.format(&func.instructions)?;
 
-    let mut jitted = Jit::lift(&mut tracer, func);
+    let mut jitted = Jit::new(&mut tracer);
     //
     jitted.format();
-    let (new_func, new_size) = jitted.lower()?;
+    let (new_func, new_size) = jitted.lower(func)?;
     let new_func_dis = tracer.disassemble(new_func as *const (), new_size as usize)?;
     println!("recompiled function:");
     tracer.format(&new_func_dis)?;
@@ -186,8 +187,8 @@ mod test {
         let assumed_test = Function::<(usize, usize), usize>::new(&mut tracer, test as *const ())?
             .assume_args(vec![
                 (Location::Reg(RegSpec::rdi()), JitValue::Const(Wrapping(3)))]);
-        let mut lifted = Jit::lift(&mut tracer, assumed_test);
-        let (lowered_test, size) = lifted.lower()?;
+        let mut lifted = Jit::new(&mut tracer);
+        let (lowered_test, size) = lifted.lower(assumed_test)?;
         unsafe {
             let jitted_pinned_test = std::mem::transmute::<_, extern "C" fn(usize, usize)->usize>(lowered_test);
             assert_eq!(jitted_pinned_test(1, 2), 5);
@@ -231,6 +232,7 @@ mod test {
         assert_eq!(clos(()), Wrapping(-1 as i32 as u32));
         Ok(())
     }
+
 
     #[test]
     pub fn test_handles_branches_const_true() -> Result<(), crate::MainError> {
@@ -306,6 +308,26 @@ mod test {
         assert_eq!(clos(0), 2);
         assert_eq!(clos((-1 as isize) as usize), 1);
         assert_eq!(clos((-6 as isize) as usize), 2);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_handles_branches_dyn_blocks() -> Result<(), crate::MainError> {
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        let clos = jit.speedup(move |a: usize| {
+            let val: usize;
+            if black_box(a) > 32 {
+                val = 1;
+                black_box(val);
+            } else {
+                val = 2;
+            }
+            val
+        });
+        assert_eq!(clos(31), 2);
+        assert_eq!(clos(32), 2);
+        assert_eq!(clos(33), 1);
         Ok(())
     }
 
