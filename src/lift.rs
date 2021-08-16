@@ -1122,19 +1122,6 @@ impl<'a> FunctionTranslator<'a> {
     }
 
     pub fn check_cond(&mut self, cond: IntCC) -> JitValue {
-        //match cond {
-        //    IntCC::UnsignedGreaterThan => {
-        //        // CF=0 and ZF=0
-        //        let cf = self.context.check_flag(Flag::CF, false, self.builder);
-        //        let zf = self.context.check_flag(Flag::ZF, false, self.builder);
-        //        self.band(cf, zf)
-        //    },
-        //    IntCC::UnsignedGreaterThanOrEqual => {
-        //        // CF=0
-        //        self.context.check_flag(Flag::CF, false, self.builder)
-        //    },
-        //    _ => unimplemented!(),
-        //}
         let flags = match cond {
             IntCC::UnsignedGreaterThan => {
                 vec![Flag::CF, Flag::ZF]
@@ -1162,6 +1149,21 @@ impl<'a> FunctionTranslator<'a> {
         }
         if let Some(JitFlag::Unknown(left, right, res)) = val {
             JitValue::Value(self.builder.ins().ifcmp(*left, *right))
+        } else if let Some(JitFlag::Known(c)) = val {
+            println!("constant eflags {:?} with cond {}", c, cond);
+            match cond {
+                IntCC::UnsignedGreaterThan => {
+                    // CF=0 and ZF=0
+                    let cf = self.context.check_flag(Flag::CF, false, self.builder);
+                    let zf = self.context.check_flag(Flag::ZF, false, self.builder);
+                    self.band(cf, zf)
+                },
+                IntCC::UnsignedGreaterThanOrEqual => {
+                    // CF=0
+                    self.context.check_flag(Flag::CF, false, self.builder)
+                },
+                _ => unimplemented!(),
+            }
         } else {
             unimplemented!()
         }
