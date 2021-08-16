@@ -5,6 +5,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataContext, Linkage, Module};
 use crate::block::{Function};
 use cranelift_codegen::ir::types::Type;
+use cranelift_codegen::ir::condcodes::CondCode;
 
 use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
 use yaxpeax_arch::LengthedInstruction;
@@ -236,6 +237,12 @@ struct Context {
     bound: HashMap<Location, JitVariable>,
     flags: Vec<JitFlag>,
     int: Type,
+    /// This is a bitvec for keeping track of instructions that we have seen and
+    /// emitted, so that we can track backwards jumps to know when to emit loops.
+    /// Technically this should be updated at each instruction emission - we can
+    /// optimize it a bit by only updating it when we exit a block, however, and
+    /// mark (start..end) all at once.
+    seen: HashMap<*const (), Vec<bool>>,
 }
 
 impl Context {
@@ -459,7 +466,6 @@ impl<'a, A, O> Jit<'a, A, O> {
             idx: &mut idx,
             return_layout: &mut self.return_layout,
             tracer: &mut self.tracer,
-            seen: HashMap::new(),
             changed: RangeMap::new(),
         };
         // We step forward all paths through the function until we are done
@@ -517,6 +523,7 @@ impl<'a, A, O> Jit<'a, A, O> {
             bound: ctx,
             // XXX: set this to the real default flags
             flags: vec![JitFlag::Known(0); Flag::FINAL as usize],
+            seen: HashMap::new(),
         }
     }
 
@@ -568,12 +575,6 @@ struct FunctionTranslator<'a> {
     idx: &'a mut usize,
     return_layout: &'a mut Vec<Type>,
     tracer: &'a mut Tracer<'static>,
-    /// This is a bitvec for keeping track of instructions that we have seen and
-    /// emitted, so that we can track backwards jumps to know when to emit loops.
-    /// Technically this should be updated at each instruction emission - we can
-    /// optimize it a bit by only updating it when we exit a block, however, and
-    /// mark (start..end) all at once.
-    seen: HashMap<*const (), Vec<bool>>,
     ///// This is a list of blocks that we visited: each pointer is the address of
     ///// the start (aka the jump target).
     //flow: Vec<*const ()>,
@@ -620,7 +621,7 @@ impl<'a> FunctionTranslator<'a> {
         // First, we check if we've already visited the entrypoint of this block
         // before.
         {
-            let this_f = self.seen.entry(f.base);
+            let this_f = self.context.seen.entry(f.base);
             if let std::collections::hash_map::Entry::Occupied(emitted) = this_f {
                 if let Some(true) = emitted.get().get(start_i) {
                     unimplemented!("looping");
@@ -641,7 +642,7 @@ impl<'a> FunctionTranslator<'a> {
             let mut eff = self.emit(ip, inst)?;
             let mut seal = |function_translator: &mut FunctionTranslator| {
                 // Mark the entire basic block as visited
-                let this_f = function_translator.seen.entry(f.base);
+                let this_f = function_translator.context.seen.entry(f.base);
                 let entry = this_f.or_insert(Vec::with_capacity(i));
                 // if we don't have enough slots to mark all our data, we
                 // need to grow it so it fits. we will be marking it, so it
@@ -698,7 +699,7 @@ impl<'a> FunctionTranslator<'a> {
                     let target = Function::<A, O>::new(self.tracer, target as *const ())?;
                     // Our continuation is from here
                     let mut cont = f;
-                    cont.offset = (ip, i+1);
+                    cont.offset = (ip - base, i+1);
                     return Ok(vec![
                         // The branch path
                         (target, jump_target, self.context.clone()),
@@ -790,7 +791,7 @@ impl<'a> FunctionTranslator<'a> {
                     unimplemented!();
                 }
             },
-            jcc @ (Opcode::JZ | Opcode::JB) => {
+            jcc @ (Opcode::JZ | Opcode::JB | Opcode::JNA) => {
                 let _target = self.jump_target(inst.operand(0), ip, ms);
 
                 let target;
@@ -910,6 +911,7 @@ impl<'a> FunctionTranslator<'a> {
             Opcode::JA | Opcode::SETA => IntCC::UnsignedGreaterThan,
             Opcode::SETAE => IntCC::UnsignedGreaterThanOrEqual,
             Opcode::JB | Opcode::SETB => IntCC::UnsignedLessThan,
+            Opcode::JNA => IntCC::UnsignedGreaterThan.inverse(),
             _ => unimplemented!(),
         }
     }
@@ -1215,12 +1217,15 @@ impl<'a> FunctionTranslator<'a> {
                 vec![Flag::CF, Flag::ZF]
             },
             IntCC::UnsignedGreaterThanOrEqual => {
-                vec![CF]
+                vec![Flag::CF]
             },
             IntCC::UnsignedLessThan => {
                 vec![Flag::CF]
             },
-            _ => unimplemented!(),
+            IntCC::UnsignedLessThanOrEqual => {
+                vec![Flag::CF, Flag::ZF]
+            },
+            _ => unimplemented!("unimplemented check_cond for {}", cond),
         };
         let mut val = None;
         let mut same = true;
@@ -1253,9 +1258,15 @@ impl<'a> FunctionTranslator<'a> {
                     // CF=0
                     self.context.check_flag(Flag::CF, false, self.builder)
                 },
-                IntCC::UnsignedGreaterThanOrEqual => {
+                IntCC::UnsignedLessThan => {
                     // CF=1
                     self.context.check_flag(Flag::CF, true, self.builder)
+                },
+                IntCC::UnsignedLessThanOrEqual => {
+                    // CF=1 or ZF=1
+                    let cf = self.context.check_flag(Flag::CF, true, self.builder);
+                    let zf = self.context.check_flag(Flag::ZF, true, self.builder);
+                    self.bor(cf, zf)
                 },
                 _ => unimplemented!(),
             }

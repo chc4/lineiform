@@ -332,6 +332,37 @@ mod test {
     }
 
     #[test]
+    pub fn test_handles_multiple_branches() -> Result<(), crate::MainError> {
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        let clos = jit.speedup(move |a: usize| {
+            let mut val: usize;
+            if black_box(a) > 32 {
+                val = 1;
+                black_box(val);
+            } else {
+                val = 2;
+            }
+            if black_box(a) > 64 {
+                val += 1;
+                black_box(val);
+            } else {
+                val += 2;
+            }
+            val
+        });
+        assert_eq!(clos(31), 4);
+        assert_eq!(clos(32), 4);
+        assert_eq!(clos(33), 3);
+        assert_eq!(clos(63), 3);
+        assert_eq!(clos(64), 3);
+        assert_eq!(clos(65), 2);
+        Ok(())
+    }
+
+
+
+    #[test]
     pub fn test_handles_loops() -> Result<(), crate::MainError> {
         use core::num::Wrapping;
         let a: Wrapping<u32> = Wrapping(10 as i32 as u32);
