@@ -243,6 +243,12 @@ struct Context {
     /// optimize it a bit by only updating it when we exit a block, however, and
     /// mark (start..end) all at once.
     seen: HashMap<*const (), Vec<bool>>,
+
+    /// The callstack for this execution context. Notably, this includes calls
+    /// and returns from inlined functions. This is so we can clear the `seen`
+    /// bitmap for inlined functions when we return, so that inlining the same
+    /// method twice is not detected as a loop.
+    callstack: Vec<usize>,
 }
 
 impl Context {
@@ -331,7 +337,8 @@ enum EmitEffect {
     Advance,
     Jmp(usize),
     Branch(IntCC, Value, usize),
-    Ret,
+    Call(usize),
+    Ret(Option<usize>),
 }
 
 use cranelift_codegen::ir::ArgumentLoc;
@@ -548,6 +555,7 @@ impl<'a, A, O> Jit<'a, A, O> {
             // XXX: set this to the real default flags
             flags: vec![JitFlag::Known(0); Flag::FINAL as usize],
             seen: HashMap::new(),
+            callstack: vec![],
         }
     }
 
@@ -641,6 +649,7 @@ impl<'a> FunctionTranslator<'a> {
         let mut stream = f.instructions.clone();
         let mut start_i = f.offset.1;
         let mut i = f.offset.1;
+        // snapshot of our context when we started this basic block
         let mut snap = self.context.bound.clone();
         self.builder.switch_to_block(bl);
         // We never loop back to block we've already visited - loops emit a new
@@ -649,10 +658,14 @@ impl<'a> FunctionTranslator<'a> {
         // First, we check if we've already visited the entrypoint of this block
         // before.
         {
+            // XXX: hmm i think this actually has to be done on every instruction...
+            // if we have a basic block that continues into another one we already
+            // emitted with a jump we won't detect it as "looping". maybe that's ok?
             let this_f = self.context.seen.entry(f.base);
             if let std::collections::hash_map::Entry::Occupied(emitted) = this_f {
                 if let Some(true) = emitted.get().get(start_i) {
-                    unimplemented!("looping @ {}, set {:?}", start_i, emitted.get());
+                    unimplemented!("looping @ base+{} ({}), set {:?}",
+                        f.base as usize - self.tracer.get_base()?, start_i, emitted.get());
                 }
             }
         }
@@ -686,14 +699,26 @@ impl<'a> FunctionTranslator<'a> {
                 // jump to cover the entire range of this block
                 // TODO: should this not snapshot if we already have one?
                 function_translator.changed.insert(start_i..=i, (&snap).clone());
-                snap = function_translator.context.bound.clone();
+                // XXX: technically we shouldn't do this, but we can't require
+                // that it breaks 'handle after a seal?
+                // snap = function_translator.context.bound.clone();
             };
             'handle: loop { match eff {
                 EmitEffect::Advance => i += 1,
                 EmitEffect::Jmp(target) => {
-                    seal(bl, self);
-                    // XXX: make sure this only works for *internal* jumps?
-                    // tailcalls need to become just a jmp to the target and stop
+                    if !(target >= (f.base as usize) && target < (f.base as usize) + f.size) {
+                        // this is an unconditional jump out - we clear our coverage
+                        // bitmap for the function that's jumping, because it means
+                        // we have a tailcall. if we don't do this than two inlined
+                        // calls would be detected as a loop, since they go through
+                        // the same basic block twice.
+                        // we don't unwrap() this because e.g. Fn:call tailcalls from the
+                        // first block - which means we never created coverage in the
+                        // first place.
+                        self.context.seen.remove(&f.base);
+                    } else {
+                        seal(bl, self);
+                    }
                     let jump_target = Function::<A, O>::new(self.tracer, target as *const ())?;
                     //self.tracer.format(&jump_target.instructions)?;
                     //self.inline(jump_target)?;
@@ -735,9 +760,52 @@ impl<'a> FunctionTranslator<'a> {
                         JitPath(cont, continue_target, self.context.clone())
                     ]);
                 },
-                // The actual end of our function - 
-                EmitEffect::Ret => {
+                // The emitted code calls an address
+                EmitEffect::Call(targ) => {
                     seal(bl, self);
+                    // TODO: some inlining heuristic
+                    println!("calling {:x}", targ);
+                    self.context.callstack.push(targ);
+                    let call_targ = Function::<A, O>::new(self.tracer, targ as *const ())?;
+                    //self.tracer.format(&call_targ.instructions)?;
+                    //self.inline(call_targ)?;
+                    let inlined_block = self.builder.create_block();
+                    self.builder.ins().jump(inlined_block, &[]);
+                    return Ok(vec![JitPath(call_targ, inlined_block, self.context.clone())]);
+                },
+                // The emitted code tried to return
+                EmitEffect::Ret(targ) => {
+                    if let Some(targ) = targ {
+                        // We keep track of the callstack from call/ret,
+                        // so let's also use it as a shadow stack for some
+                        // sanity checking.
+                        let shadow = self.context.callstack.pop();
+                        assert_eq!(shadow, Some(targ));
+                        println!("returning to {:x}", targ);
+                        // We clear the seen bitmap for our current function:
+                        // this is so a new call to it has a clean visitation
+                        self.context.seen.remove(&f.base).unwrap();
+                        // then we jump back to callsite to continue the function
+                        // that inlined us.
+                        let callsite = self.builder.create_block();
+                        self.builder.ins().jump(callsite, &[]);
+
+                        let target = Function::<A, O>::new(self.tracer, targ as *const ())?;
+                        return Ok(vec![JitPath(target, callsite, self.context.clone())]);
+
+
+                    } else {
+                        seal(bl, self);
+                            // We are returning out of the JIT function
+                        let r_layout = self.return_layout.clone();
+                        let return_values: Vec<Value> = r_layout.iter().enumerate()
+                            .map(|(i, r_ty)| {
+                                let r_val = &HOST.outputs[i];
+                                let mut var = self.get(r_val.clone());
+                                var.val(self.builder, HOST_WIDTH).into_ssa(self.int, self.builder)
+                            }).collect();
+                        self.builder.ins().return_(&return_values[..]);
+                    }
                     break 'emit;
                 },
             }; break 'handle; }
@@ -890,16 +958,13 @@ impl<'a> FunctionTranslator<'a> {
                 // Resolve the call target (either absolute or relative)
                 let target = self.jump_target(inst.operand(0), ip, ms);
                 if let JitValue::Const(c) = target {
-                    // we're inlining the call body into this function:
-                    let body = Function::<(),()>::new(self.tracer, c.0 as *const ())?;
-                    self.tracer.format(&body.instructions[body.offset.0..].to_vec())?;
-                    // `push rip`
                     println!("putting return address in {:x}", self.context.stack());
                     self.shift_stack(-1); // rsp -= 8
                     self.store(Operand::RegDeref(STACK),
                         JitValue::Const(Wrapping(ip)), Some(HOST_WIDTH));
+                    self.context.callstack.push(c.0);
                     // and then we just jump to the call target
-                    return Ok(EmitEffect::Jmp(c.0));
+                    return Ok(EmitEffect::Call(c.0));
                 } else {
                     unimplemented!("call to {} ({:?})", inst.operand(0), target)
                 }
@@ -912,22 +977,12 @@ impl<'a> FunctionTranslator<'a> {
                 // stack, then we were returning out of our emitted function:
                 // we're all done jitting, and can tell cranelift to stop.
                 if self.context.stack() == STACK_TOP {
-                    let r_layout = self.return_layout.clone();
-                    let return_values: Vec<Value> = r_layout.iter().enumerate()
-                        .map(|(i, r_ty)| {
-                            let r_val = &HOST.outputs[i];
-                            let mut var = self.get(r_val.clone());
-                            var.val(self.builder, HOST_WIDTH).into_ssa(self.int, self.builder)
-                        }).collect();
-                    self.builder.ins().return_(&return_values[..]);
-                    return Ok(EmitEffect::Ret);
+                    return Ok(EmitEffect::Ret(None));
                 }
-                // inlined calls are just jumps - if we see a ret, we just
-                // jump back to the IP they pushed on the stack.
                 let new_rip = self.value(ip, Operand::RegDeref(STACK), Some(HOST_WIDTH));
                 if let JitValue::Const(c) = new_rip {
                     self.shift_stack(1);
-                    return Ok(EmitEffect::Jmp(c.0));
+                    return Ok(EmitEffect::Ret(Some(c.0)));
                 } else {
                     self.context.dump();
                     unimplemented!("return to unknown location {:?}", new_rip);
