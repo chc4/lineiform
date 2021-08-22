@@ -258,7 +258,7 @@ impl Context {
             Some(JitVariable::Known(JitValue::Ref(base, offset)))
                 if let JitValue::Stack = **base =>
             {
-                println!("current stack @ 0x{:x}", offset);
+                //println!("current stack @ 0x{:x}", offset);
                 assert!(offset <= &STACK_TOP);
                 *offset
             },
@@ -765,7 +765,7 @@ impl<'a> FunctionTranslator<'a> {
                     seal(bl, self);
                     // TODO: some inlining heuristic
                     println!("calling {:x}", targ);
-                    self.context.callstack.push(targ);
+                    self.context.callstack.push(ip);
                     let call_targ = Function::<A, O>::new(self.tracer, targ as *const ())?;
                     //self.tracer.format(&call_targ.instructions)?;
                     //self.inline(call_targ)?;
@@ -780,11 +780,12 @@ impl<'a> FunctionTranslator<'a> {
                         // so let's also use it as a shadow stack for some
                         // sanity checking.
                         let shadow = self.context.callstack.pop();
+                        println!("returning, shadow = {:x}, stack = {:x}", shadow.unwrap(), targ);
                         assert_eq!(shadow, Some(targ));
                         println!("returning to {:x}", targ);
                         // We clear the seen bitmap for our current function:
                         // this is so a new call to it has a clean visitation
-                        self.context.seen.remove(&f.base).unwrap();
+                        self.context.seen.remove(&f.base);
                         // then we jump back to callsite to continue the function
                         // that inlined us.
                         let callsite = self.builder.create_block();
@@ -815,7 +816,7 @@ impl<'a> FunctionTranslator<'a> {
 
     fn emit(&mut self, ip: usize, inst: &Instruction) -> Result<EmitEffect, LiftError> {
 
-        println!("emitting for {}", inst);
+        println!("---- {}", inst);
         let ms = inst.mem_size().and_then(|m| m.bytes_size());
         match inst.opcode() {
             Opcode::MOV => {
@@ -962,7 +963,6 @@ impl<'a> FunctionTranslator<'a> {
                     self.shift_stack(-1); // rsp -= 8
                     self.store(Operand::RegDeref(STACK),
                         JitValue::Const(Wrapping(ip)), Some(HOST_WIDTH));
-                    self.context.callstack.push(c.0);
                     // and then we just jump to the call target
                     return Ok(EmitEffect::Call(c.0));
                 } else {
