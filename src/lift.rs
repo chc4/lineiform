@@ -57,7 +57,7 @@ impl OperandFun for Operand {
             Operand::ImmediateI8( _) | Operand::ImmediateI16(_) |
             Operand::ImmediateI32(_) | Operand::ImmediateI64(_) =>
                 true,
-            _ => unimplemented!("is_imm for {}", self),
+            _ => false,
         }
     }
 }
@@ -161,7 +161,7 @@ impl JitVariable {
                 }
             },
             JitVariable::Known(val) => {
-                let width_mask = Wrapping((1 << ((width*8)+1)) - 1);
+                //let width_mask = Wrapping((1 << ((width*8)+1)) - 1);
                 match val {
                     JitValue::Const(c) => match width {
                         1 => JitTemp::Const8(c.0 as u8),
@@ -170,7 +170,13 @@ impl JitVariable {
                         8 => JitTemp::Const64(c.0 as u64),
                         _ => unimplemented!(),
                     },
-                    id if width == HOST_WIDTH => unimplemented!(),
+                    id if width == HOST_WIDTH => match id {
+                        JitValue::Ref(base, offset) =>
+                            JitTemp::Ref(base.clone(), *offset),
+                        JitValue::Frozen { addr, size } =>
+                            JitTemp::Frozen { addr: *addr, size: *size },
+                        x @ _ => unimplemented!("temp {:?}", x),
+                    },
                     _ => unimplemented!(),
                 }
             },
