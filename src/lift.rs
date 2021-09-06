@@ -221,6 +221,7 @@ pub enum JitTemp {
     Const32(u32),
     Const64(u64),
 }
+const HOST_TMP: fn(u64) -> JitTemp = JitTemp::Const64;
 
 impl JitTemp {
     /// Get a Cranelift SSA Value for this JitValue. Don't use this if you can
@@ -238,6 +239,17 @@ impl JitTemp {
             Const32(c) => make_const(*c),
             Const64(c) => make_const(*c),
             x => unimplemented!("into_ssa for {:?", x),
+        }
+    }
+
+    fn val_of_width(c: usize, width: u8) -> JitTemp {
+        use JitTemp::*;
+        match width {
+            1 => Const8(c as u8),
+            2 => Const16(c as u16),
+            4 => Const32(c as u32),
+            8 => Const64(c as u64),
+            _ => unimplemented!(),
         }
     }
 
@@ -1211,7 +1223,7 @@ impl<'a> FunctionTranslator<'a> {
                 //println!("shifting stack 0x{:x}", offset);
                 assert_eq!(HOST_WIDTH, 8);
                 let new_stack = self.add::<false>(stack_reg,
-                    JitTemp::Const64((slots * 8) as usize as u64));
+                    HOST_TMP((slots * 8) as usize as u64));
                 self.store(Operand::Register(STACK), new_stack, Some(HOST_WIDTH));
             }
             _ => unimplemented!("non-concrete stack!!"),
@@ -1395,7 +1407,7 @@ impl<'a> FunctionTranslator<'a> {
                                 let parent = self.get(Location::Reg(parent))
                                     .tmp(self.builder, HOST_WIDTH);
                                 println!("before on reg = {:?}, val = {:?}", parent, val);
-                                let select_mask = JitTemp::Const64(0xFF);
+                                let select_mask = HOST_TMP(0xFF);
                                 val = self.bitselect(select_mask, val, parent);
                                 println!("set lower on reg = {:?}", val);
                             },
@@ -1406,7 +1418,7 @@ impl<'a> FunctionTranslator<'a> {
                     Some(4) => {
                         // e.g. `mov eax, rcx` means we mask and load only the low
                         // 4 bytes.
-                        val = self.band(val, JitTemp::Const64(Wrapping(0xFFFF_FFFF)));
+                        val = self.band(val, HOST_TMP(0xFFFF_FFFF));
                         ()
                     },
                     Some(8) => (),
@@ -1444,7 +1456,7 @@ impl<'a> FunctionTranslator<'a> {
                 // Stack(0) to bitselect(0xFFFF_FFFF, val, Stack(0))
                 let main = self.get(Location::Stack(slot)).val(self.builder, HOST_WIDTH);
                 val = self.bitselect(
-                    JitValue::Const(Wrapping((1 << ((off+1)*8)) - 1)),
+                    HOST_TMP((1 << ((off+1)*8)) - 1),
                     val, main);
                 println!("value to put aligned is {:?}", val);
                 // Our key is now always HOST_WIDTH aligned, so we can just store
@@ -1665,36 +1677,46 @@ impl<'a> FunctionTranslator<'a> {
         }
     }
 
-    //pub fn band(&mut self, left: JitTemp, right: JitTemp) -> JitTemp {
-    //    use JitTemp::*;
-    //    let biggest = max(left.width(), right.width());
-    //    left = left.zero_extend(biggest);
-    //    right = right.zero_extend(biggest);
-    //    match (left, right) {
-    //        //0 & val or val & 0 = 0
-    //        (Const(0), _) | (_, Const(0)) => Const(0),
-    //        // !0 & val or val & !0 = val
-    //        (Const(Wrapping(const { !0 as usize})), val @ _) |
-    //            (val @ _, Const(Wrapping(const { !0 as usize }))) => val,
-    //        // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
-    //        (Value(val_left, typ_left), Value(val_right, typ_right)) => {
-    //            Value(self.builder.ins().band(val_left, val_right), typ_left)
-    //        },
-    //        (val @ _, Value(ssa, ssa_typ))
-    //        | (Value(ssa, ssa_typ), val @ _) => {
-    //            let ssa_val = val.into_ssa(self.int, self.builder);
-    //            Value(self.builder.ins().band(ssa_val, ssa), ssa_typ)
-    //        },
-    //        (Ref(base, offset), Const(c))
-    //        | (Const(c), Ref(base, offset)) => {
-    //            unimplemented!("band pointer")
-    //        },
-    //        (Const(left_c), Const(right_c)) => {
-    //            Const(left_c & right_c)
-    //        },
-    //        (left, right) => unimplemented!("unimplemented band {:?} {:?}", left, right)
-    //    }
-    //}
+    pub fn band(&mut self, left: JitTemp, right: JitTemp) -> JitTemp {
+        use JitTemp::*;
+        let biggest = max(left.width(), right.width());
+        left = left.zero_extend(biggest);
+        right = right.zero_extend(biggest);
+        match (left, right) {
+            (c, other) | (other, c) if c.is_const() => {
+                let fixed_c = c.into_usize(self.builder).unwrap();
+                match (fixed_c, other) {
+                    //0 & val or val & 0 = 0
+                    (0, _) => return JitTemp.val_of_width(0, biggest),
+                    // !0 & val or val & !0 = val
+                    (const { !0 as usize }, _) => return other,
+                    // left_c & right_c is just left & right
+                    (fixed_c, other) if other.is_const() => {
+                        let fixed_other = other.into_usize(self.builder).unwrap();
+                        return JitTemp.val_of_width(fixed_c & fixed_other, biggest)
+                    },
+                    (_, _) => (),
+                }
+            },
+        };
+
+        match (left, right) {
+            // add rsp, 0x8 becomes a redefine of rsp with offset -= 1
+            (Value(val_left, typ_left), Value(val_right, typ_right)) => {
+                Value(self.builder.ins().band(val_left, val_right), typ_left)
+            },
+            (val @ _, Value(ssa, ssa_typ))
+            | (Value(ssa, ssa_typ), val @ _) => {
+                let ssa_val = val.into_ssa(self.int, self.builder);
+                Value(self.builder.ins().band(ssa_val, ssa), ssa_typ)
+            },
+            (Ref(base, offset), _)
+            | (_, Ref(base, offset)) => {
+                unimplemented!("band pointer")
+            },
+            (left, right) => unimplemented!("unimplemented band {:?} {:?}", left, right)
+        }
+    }
 
     //pub fn bor(&mut self, left: JitValue, right: JitValue) -> JitValue {
     //    // XXX: set flags
