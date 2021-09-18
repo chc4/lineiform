@@ -1082,9 +1082,9 @@ impl<'a> FunctionTranslator<'a> {
                         0
                     }), Some(1));
                 } else if let JitValue::Value(flags) = take {
-                    let one = self.builder.ins().iconst(self.int, 1);
-                    let zero = self.builder.ins().iconst(self.int, 0);
-                    let store = self.builder.ins().selectif(self.int, cond,
+                    let one = self.builder.ins().iconst(types::I8, 1);
+                    let zero = self.builder.ins().iconst(types::I8, 0);
+                    let store = self.builder.ins().selectif(types::I8, cond,
                         flags, one, zero);
 
                     self.store(inst.operand(0),
