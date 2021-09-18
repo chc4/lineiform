@@ -997,11 +997,8 @@ impl<'a> FunctionTranslator<'a> {
                             .map(|(i, r_ty)| {
                                 let r_val = &HOST.outputs[i];
                                 let mut var = self.get(r_val.clone());
-                                if let JitValue::Value(val) = var.value(self.builder) {
-                                    val
-                                } else {
-                                    panic!()
-                                }
+                                var.tmp(self.builder, HOST_WIDTH)
+                                    .into_ssa(self.int, self.builder)
                             }).collect();
                         self.builder.ins().return_(&return_values[..]);
                     }
