@@ -189,6 +189,8 @@ use std::rc::Rc;
 pub enum JitValue {
     /// An SSA value
     Value(Value),
+    /// An SSA comparison flag value
+    Flag(Value),
     /// A reference to a value, plus an offset into it
     Ref(Rc<JitValue>, usize),
     /// A memory region we use to represent the stack: `sub rsp, 0x8` becomes
@@ -212,6 +214,7 @@ impl JitValue {
 pub enum JitTemp {
     /// An SSA value
     Value(Value, Type),
+    Flag(Value),
     // XX: how do we handle these "opaque" values? we want to be able to reassemble
     // them from a memcpy, for example. worry about it when we have a better
     // use-case?
@@ -242,6 +245,7 @@ impl JitTemp {
         }
         match self {
             Value(val, typ) => *val,
+            Flag(val) => *val,
             Const8(c) => make_const(builder, I8, *c),
             Const16(c) => make_const(builder, I16, *c),
             Const32(c) => make_const(builder, I32, *c),
@@ -305,7 +309,38 @@ impl JitTemp {
         }
     }
     fn sign_extend(self, builder: &mut FunctionBuilder, width: u8) -> JitTemp {
-        unimplemented!();
+        if self.width() == width { return self }
+        match self.clone() {
+            JitTemp::Value(val, typ) => {
+                if typ.bytes() != width.into() {
+                    let new_typ = Type::int((width*8) as u16).unwrap();
+                    JitTemp::Value(builder.ins().sextend(new_typ, val), new_typ)
+                } else {
+                    self
+                }
+            },
+            c if c.is_const() => {
+                match width {
+                    2 => match self {
+                        JitTemp::Const8(c) => JitTemp::Const16(c as i8 as i16 as u16),
+                        _ => panic!(),
+                    },
+                    4 => match self {
+                        JitTemp::Const8(c) => JitTemp::Const32(c as i8 as i32 as u32),
+                        JitTemp::Const16(c) => JitTemp::Const32(c as i16 as i32 as u32),
+                        _ => panic!(),
+                    },
+                    8 => match self {
+                        JitTemp::Const8(c) => JitTemp::Const64(c as i8 as i64 as u64),
+                        JitTemp::Const16(c) => JitTemp::Const64(c as i16 as i64 as u64),
+                        JitTemp::Const32(c) => JitTemp::Const64(c as i32 as i64 as u64),
+                        _ => panic!(),
+                    },
+                    x => panic!("tried to sign-extend a {} value to {}", self.width(), x),
+                }
+            }
+            _ => unimplemented!(),
+        }
     }
 
     fn zero_extend(self, builder: &mut FunctionBuilder, width: u8) -> JitTemp {
@@ -323,18 +358,21 @@ impl JitTemp {
                 match width {
                     2 => match self {
                         JitTemp::Const8(c) => JitTemp::Const16(c as u16),
-                        _ => panic!(),
+                        x @ JitTemp::Const16(_) => x,
+                        _ => panic!("{:?} to {}", c, width),
                     },
                     4 => match self {
                         JitTemp::Const8(c) => JitTemp::Const32(c as u32),
                         JitTemp::Const16(c) => JitTemp::Const32(c as u32),
-                        _ => panic!(),
+                        x @ JitTemp::Const32(_) => x,
+                        _ => panic!("{:?} to {}", c, width),
                     },
                     8 => match self {
                         JitTemp::Const8(c) => JitTemp::Const64(c as u64),
                         JitTemp::Const16(c) => JitTemp::Const64(c as u64),
                         JitTemp::Const32(c) => JitTemp::Const64(c as u64),
-                        _ => panic!(),
+                        x @ JitTemp::Const64(_) => x,
+                        _ => panic!("{:?} to {}", c, width),
                     },
                     x => panic!("tried to zero-extend a {} value to {}", self.width(), x),
                 }
@@ -346,7 +384,7 @@ impl JitTemp {
 
 
 #[derive(Hash, PartialEq, Clone, Copy, Display, Debug)]
-enum Flag {
+enum Flags {
     CF = 0,
     PF = 2,
     AF = 4,
@@ -358,7 +396,7 @@ enum Flag {
     OF = 11,
     FINAL = 12,
 }
-use Flag::*;
+use Flags::*;
 
 /// A macro that allows for saving of `eflags` values to a Context after
 /// operations. Care should be taken that the last operation of `e` is the
@@ -402,11 +440,17 @@ macro_rules! const_ops {
     ($ctx:expr, $flag:expr, $left:expr, $right:expr, $asm:expr, $flags:expr, $op:tt) => { {
         use JitTemp::*;
         match ($left, $right) {
-            (Const8(l), Const8(r)) => Const8(do_op!($ctx, $flag, reg_byte, l, r, $asm, $flags, $op)),
-            (Const16(l), Const16(r)) => Const16(do_op!($ctx, $flag, reg, l, r, $asm, $flags, $op)),
-            (Const32(l), Const32(r)) => Const32(do_op!($ctx, $flag, reg, l, r, $asm, $flags, $op)),
-            (Const64(l), Const64(r)) => Const64(do_op!($ctx, $flag, reg, l, r, $asm, $flags, $op)),
-            _ => unimplemented!("op {} for {:?} {:?}", stringify!($op), $left, $right),
+            (Const8(l), Const8(r)) =>
+                Const8(do_op!($ctx, $flag, reg_byte, l, r, $asm, $flags, $op)),
+            (Const16(l), Const16(r)) =>
+                Const16(do_op!($ctx, $flag, reg, l, r, $asm, $flags, $op)),
+            (Const32(l), Const32(r)) =>
+                Const32(do_op!($ctx, $flag, reg, l, r, $asm, $flags, $op)),
+            (Const64(l), Const64(r)) =>
+                Const64(do_op!($ctx, $flag, reg, l, r, $asm, $flags, $op)),
+            _ => unimplemented!(
+                "op {} for {:?} {:?}",
+                stringify!($op), $left, $right),
         }
     } }
 }
@@ -462,21 +506,21 @@ impl Context {
     }
 
     #[inline]
-    pub fn set_flags(&mut self, flags: Vec<Flag>, val: (Value, Value, Value)) -> JitValue {
+    pub fn set_flags(&mut self, flags: Vec<Flags>, val: (Value, Value, Value)) -> JitValue {
         for flag in flags {
             self.flags[flag as usize] = JitFlag::Unknown(val.0, val.1, val.2);
         }
-        JitValue::Value(val.2)
+        JitValue::Flag(val.2)
     }
 
     #[inline]
-    pub fn set_flags_const(&mut self, flags: Vec<Flag>, c: u64) {
+    pub fn set_flags_const(&mut self, flags: Vec<Flags>, c: u64) {
         for flag in flags {
             self.flags[flag as usize] = JitFlag::Known(c);
         }
     }
 
-    pub fn check_flag(&mut self, flag: Flag, set: bool, builder: &mut FunctionBuilder) -> JitTemp {
+    pub fn check_flag(&mut self, flag: Flags, set: bool, builder: &mut FunctionBuilder) -> JitTemp {
         let val = &self.flags[flag as usize];
         println!("eflag {} is {:?}", flag, val);
         let flag_mask = (1 << (flag as usize));
@@ -489,17 +533,17 @@ impl Context {
                     HOST_TMP((*b as usize & flag_mask == 0) as usize as _)
                 }
             },
-            JitFlag::Unknown(left, right, result) => JitTemp::Value({
-                let flag = match flag {
-                    Flag::ZF => builder.ins().icmp_imm(if set { IntCC::Equal } else { IntCC::NotEqual }, *result, 0),
-                    Flag::CF => {
-                        let res = builder.ins().iadd(*left, *right);
-                        builder.ins().icmp(if set { IntCC::UnsignedLessThan } else { IntCC::UnsignedGreaterThanOrEqual }, res, *result)
-                    },
-                    _ => unimplemented!(),
-                };
-                builder.ins().bint(self.int, flag)
-            }, self.int),
+            JitFlag::Unknown(left, right, result) => JitTemp::Flag({
+                //let flag = match flag {
+                //    Flags::ZF => builder.ins().icmp_imm(if set { IntCC::Equal } else { IntCC::NotEqual }, *result, 0),
+                //    Flags::CF => {
+                //        let (res, flag) = builder.ins().iadd(*left, *right);
+                //        builder.ins().icmp(if set { IntCC::UnsignedLessThan } else { IntCC::UnsignedGreaterThanOrEqual }, res, *result)
+                //    },
+                //    _ => unimplemented!(),
+                //};
+                *result
+            }),
         }
     }
 
@@ -747,7 +791,7 @@ impl<'a, A, O> Jit<'a, A, O> {
             int,
             bound: ctx,
             // XXX: set this to the real default flags
-            flags: vec![JitFlag::Known(0); Flag::FINAL as usize],
+            flags: vec![JitFlag::Known(0); Flags::FINAL as usize],
             seen: HashMap::new(),
             callstack: vec![],
         }
@@ -1028,8 +1072,22 @@ impl<'a> FunctionTranslator<'a> {
             //},
             Opcode::ADD => {
                 let left = self.operand_value(ip, inst.operand(0), ms);
-                let right = self.operand_value(ip, inst.operand(1), ms);
+                let mut right = self.operand_value(ip, inst.operand(1), ms);
+                if inst.operand(1).is_imm() {
+                    right = right.sign_extend(self.builder, inst.operand(0).width().or(ms).unwrap());
+                }
                 let added = self.add::<true>(left, right);
+                self.store(inst.operand(0), added, ms);
+            },
+            Opcode::ADC => {
+                let left = self.operand_value(ip, inst.operand(0), ms);
+                let mut right = self.operand_value(ip, inst.operand(1), ms);
+                if inst.operand(1).is_imm() {
+                    right = right.sign_extend(self.builder, inst.operand(0).width().or(ms).unwrap());
+                }
+                let carry = self.context.check_flag(Flags::CF, true, self.builder);
+                println!("adc {:?} {:?} {:?}", left, right, carry);
+                let added = self.adc::<true>(left, right, carry);
                 self.store(inst.operand(0), added, ms);
             },
             op @ (Opcode::SUB | Opcode::CMP) => {
@@ -1037,8 +1095,8 @@ impl<'a> FunctionTranslator<'a> {
                 // ff gets sign extended to 0xffff_ffff
                 let left = self.operand_value(ip, inst.operand(0), ms);
                 let mut right = self.operand_value(ip, inst.operand(1), ms);
-                if inst.operand(0).is_imm() {
-                    right = right.sign_extend(self.builder, inst.operand(0).width().unwrap());
+                if inst.operand(1).is_imm() {
+                    right = right.sign_extend(self.builder, inst.operand(0).width().or(ms).unwrap());
                 }
                 let subbed = self.sub::<true>(left, right);
                 if let Opcode::SUB = op {
@@ -1117,7 +1175,7 @@ impl<'a> FunctionTranslator<'a> {
                         // jump
                         return Ok(EmitEffect::Jmp(target))
                     },
-                    JitValue::Value(flags) => {
+                    JitValue::Flag(flags) => {
                         // we don't know until runtime if we're taking this branch
                         // or not - we return Brnz(cond, target) as an effect,
                         // so our emit loop can emit both sides of the branch.
@@ -1573,22 +1631,22 @@ impl<'a> FunctionTranslator<'a> {
     pub fn check_cond(&mut self, cond: IntCC) -> JitValue {
         let flags = match cond {
             IntCC::UnsignedGreaterThan => {
-                vec![Flag::CF, Flag::ZF]
+                vec![Flags::CF, Flags::ZF]
             },
             IntCC::UnsignedGreaterThanOrEqual => {
-                vec![Flag::CF]
+                vec![Flags::CF]
             },
             IntCC::UnsignedLessThan => {
-                vec![Flag::CF]
+                vec![Flags::CF]
             },
             IntCC::UnsignedLessThanOrEqual => {
-                vec![Flag::CF, Flag::ZF]
+                vec![Flags::CF, Flags::ZF]
             },
             IntCC::Equal => {
-                vec![Flag::ZF]
+                vec![Flags::ZF]
             },
             IntCC::NotEqual => {
-                vec![Flag::ZF]
+                vec![Flags::ZF]
             },
             _ => unimplemented!("unimplemented check_cond for {}", cond),
         };
@@ -1609,35 +1667,35 @@ impl<'a> FunctionTranslator<'a> {
             unimplemented!();
         }
         if let Some(JitFlag::Unknown(left, right, res)) = val {
-            JitValue::Value(self.builder.ins().ifcmp(*left, *right))
+            JitValue::Flag(self.builder.ins().ifcmp(*left, *right))
         } else if let Some(JitFlag::Known(c)) = val {
             println!("constant eflags {:?} with cond {}", c, cond);
             let tmp = match cond {
                 IntCC::UnsignedGreaterThan => {
                     // CF=0 and ZF=0
-                    let cf = self.context.check_flag(Flag::CF, false, self.builder);
-                    let zf = self.context.check_flag(Flag::ZF, false, self.builder);
+                    let cf = self.context.check_flag(Flags::CF, false, self.builder);
+                    let zf = self.context.check_flag(Flags::ZF, false, self.builder);
                     self.band(cf, zf)
                 },
                 IntCC::UnsignedGreaterThanOrEqual => {
                     // CF=0
-                    self.context.check_flag(Flag::CF, false, self.builder)
+                    self.context.check_flag(Flags::CF, false, self.builder)
                 },
                 IntCC::UnsignedLessThan => {
                     // CF=1
-                    self.context.check_flag(Flag::CF, true, self.builder)
+                    self.context.check_flag(Flags::CF, true, self.builder)
                 },
                 IntCC::UnsignedLessThanOrEqual => {
                     // CF=1 or ZF=1
-                    let cf = self.context.check_flag(Flag::CF, true, self.builder);
-                    let zf = self.context.check_flag(Flag::ZF, true, self.builder);
+                    let cf = self.context.check_flag(Flags::CF, true, self.builder);
+                    let zf = self.context.check_flag(Flags::ZF, true, self.builder);
                     self.bor(cf, zf)
                 },
                 IntCC::Equal => {
-                    self.context.check_flag(Flag::ZF, true, self.builder)
+                    self.context.check_flag(Flags::ZF, true, self.builder)
                 },
                 IntCC::NotEqual => {
-                    self.context.check_flag(Flag::ZF, false, self.builder)
+                    self.context.check_flag(Flags::ZF, false, self.builder)
                 }
                 _ => unimplemented!(),
             };
@@ -1653,12 +1711,12 @@ impl<'a> FunctionTranslator<'a> {
     /// if FLAG is true, then self.context.flags are updated with eflags
     pub fn add<const FLAG:bool>(&mut self, left: JitTemp, right: JitTemp) -> JitTemp {
         use JitTemp::*;
-        use Flag::*;
+        use Flags::*;
         let flags = vec![OF, SF, ZF, AF, PF, CF];
         match (left, right) {
             (Value(val_left, typ_left), Value(val_right, _)) => {
-                let res = self.builder.ins().iadd(val_left, val_right);
-                self.context.set_flags(flags, (val_left, val_right, res));
+                let (res, flag) = self.builder.ins().iadd_cout(val_left, val_right);
+                self.context.set_flags(flags, (val_left, val_right, flag));
                 Value(res, typ_left)
             },
             (left @ _ , right @ Value(_, _))
@@ -1666,35 +1724,136 @@ impl<'a> FunctionTranslator<'a> {
                 let typ = Type::int((left.width() * 8) as u16).unwrap();
                 let _left = left.into_ssa(typ, self.builder);
                 let _right = right.zero_extend(self.builder, left.width()).into_ssa(typ, self.builder);
-                let res = self.builder.ins().iadd(_left, _right);
+                let (res, flag) = self.builder.ins().iadd_cout(_left, _right);
                 self.context.set_flags(flags, (_left, _right, res));
                 Value(res, typ)
             },
             (Ref(base, offset), c) if c.is_const() => {
                 let c = c.into_usize(self.builder).unwrap();
-                Ref(base, do_op!(self.context, FLAG, offset, c, "add {}, {}", flags, +))
+                Ref(base, do_op!(self.context, FLAG, offset, (c), "add {}, {}", flags, +))
             },
             (offset, Ref(base, c)) if offset.is_const() => {
                 let offset = offset.into_usize(self.builder).unwrap();
-                Ref(base, do_op!(self.context, FLAG, offset, c, "add {}, {}", flags, +))
+                Ref(base, do_op!(self.context, FLAG, offset, (c), "add {}, {}", flags, +))
             },
             (left_c, mut right_c) if left_c.clone().is_const() && right_c.clone().is_const() => {
                 right_c = right_c.zero_extend(self.builder, left_c.clone().width());
-                const_ops!(self.context, FLAG, left_c.clone(), right_c.clone(), "add {}, {}", flags, +)
+                const_ops!(self.context, FLAG, left_c.clone(), (right_c.clone()), "add {}, {}", flags, +)
             },
             (left, right) => unimplemented!("unimplemented add {:?} {:?}", left, right)
         }
     }
 
+    /// Add with carry
+    pub fn adc<const FLAG:bool>(&mut self, left: JitTemp, right: JitTemp, carry: JitTemp) -> JitTemp {
+        use JitTemp::*;
+        use Flags::*;
+        let flags = vec![OF, SF, ZF, AF, PF, CF];
+        match (left.clone(), right.clone(), carry.clone()) {
+            (Value(val_left, typ_left), Value(val_right, _), Flag(val_carry)) => {
+                let (res, flag) = self.builder.ins().iadd_carry(val_left, val_right, val_carry);
+                self.context.set_flags(flags, (val_left, val_right, flag));
+                Value(res, typ_left)
+            },
+            (_, _, carry) if carry.is_const() => {
+                // basically, this sucks a lot:
+                // iadd_carry is broken on cranelift (#2860), so we work around
+                // it by lowering to a normal iadd_cout in the CF=false case,
+                // and to two iadd_cout's in the CF=true case (and then have to
+                // fixup our carry flag so the spliced +1 doesn't break).
+                let carry = carry.into_usize(self.builder).unwrap();
+                if carry == 0 {
+                    return self.add::<FLAG>(left, right);
+                } else {
+                    let left_plus_one = self.add::<FLAG>(left, Const8(1));
+                    // track if the +1 overflowed
+                    let carried = self.context.check_flag(Flags::CF, true, self.builder);
+
+                    let res = self.add::<FLAG>(left_plus_one, right);
+                    if(FLAG) {
+                        // if the +1 definitely carried, we know that carry has to
+                        // be set.
+                        println!("carried = {:?}", carried);
+                        if let JitTemp::Const64(1) = carried {
+                            self.context.flags[Flags::CF as usize] = JitFlag::Known(1 << Flags::CF as usize);
+                        } else if let JitTemp::Const64(0) = carried {
+                            ();
+                        } else if let JitTemp::Value(val, typ) = carried {
+                            unimplemented!("double check this");
+                            // but if we don't know, then we have to OR it with
+                            // the other carry flag (which sucks!)
+                            let other_carried = self.context.check_flag(Flags::CF, true, self.builder);
+                            let maybe_carried = self.bor(other_carried, carried);
+                            self.context.set_flags(vec![Flags::CF],
+                                (left_plus_one.into_ssa(typ, self.builder),
+                                 right.into_ssa(typ, self.builder),
+                                 maybe_carried.into_ssa(typ, self.builder)));
+                        } else {
+                            unimplemented!();
+                        }
+                    }
+                    return res;
+                }
+            },
+            (left @ Value(_, _), right @ _, carry @ _) |
+            (left @ _, right @ Value(_, _), carry @ _) |
+            (left @ _, right @ _, carry @ Flag(_)) => {
+                let typ = Type::int((left.width() * 8) as u16).unwrap();
+                let _left = left.into_ssa(typ, self.builder);
+                let _right = right.zero_extend(self.builder, left.width()).into_ssa(typ, self.builder);
+                let mut _carry = carry.into_ssa(types::IFLAGS, self.builder);
+                let (res, flag) = self.builder.ins().iadd_ifcarry(_left, _right, _carry);
+                self.context.set_flags(flags, (_left, _right, flag));
+                Value(res, typ)
+            },
+            (Ref(base, offset), off, carry) if off.is_const() && carry.is_const() => {
+                let off = off.into_usize(self.builder).unwrap();
+                let carry = carry.into_usize(self.builder).unwrap();
+                assert_eq!(HOST_WIDTH, 8);
+                if carry == 0 {
+                    Ref(base, do_op!(self.context, FLAG, offset, off, "add {}, {}", flags, +))
+                } else {
+                    Ref(base, do_op!(self.context, FLAG, offset, off, "stc; adc {}, {}", flags, +))
+                }
+            },
+            (offset, Ref(base, off), carry) if offset.is_const() && carry.is_const() => {
+                let offset = offset.into_usize(self.builder).unwrap();
+                let carry = carry.into_usize(self.builder).unwrap();
+                assert_eq!(HOST_WIDTH, 8);
+                if carry == 0 {
+                    Ref(base, do_op!(self.context, FLAG, offset, off, "add {}, {}", flags, +))
+                } else {
+                    Ref(base, do_op!(self.context, FLAG, offset, off, "stc; adc {}, {}", flags, +))
+                }
+            },
+            (left_c, mut right_c, mut carry_c)
+            if left_c.clone().is_const()
+            && right_c.clone().is_const()
+            && carry_c.clone().is_const() => {
+                right_c = right_c.zero_extend(self.builder, left_c.clone().width());
+                let carry_c = carry_c.into_usize(self.builder).unwrap();
+                assert_eq!(HOST_WIDTH, 8);
+                if carry_c == 0 {
+                    const_ops!(self.context, FLAG, left_c.clone(), right_c.clone(), "add {}, {}", flags, +)
+                } else {
+                    const_ops!(self.context, FLAG, left_c.clone(), right_c.clone(), "stc; adc {}, {}", flags, +)
+                }
+            },
+            (left, right, carry) => unimplemented!("unimplemented adc {:?} {:?} {:?}", left, right, carry)
+        }
+    }
+
+
+
     pub fn sub<const FLAG:bool>(&mut self, left: JitTemp, right: JitTemp) -> JitTemp {
         use JitTemp::*;
-        use Flag::*;
+        use Flags::*;
         let flags = vec![OF, SF, ZF, AF, PF, CF];
         match (left, right) {
             // sub dest, val is always a dest sized output
             (Value(val_left, typ_left), Value(val_right, _)) => {
-                let res = self.builder.ins().isub(val_left, val_right);
-                self.context.set_flags(flags, (val_left, val_right, res));
+                let (res, flag) = self.builder.ins().isub_ifbout(val_left, val_right);
+                self.context.set_flags(flags, (val_left, val_right, flag));
                 Value(res, typ_left)
             },
             (left @ _ , right @ Value(_, _))
@@ -1702,8 +1861,8 @@ impl<'a> FunctionTranslator<'a> {
                 let typ = Type::int((left.width() * 8) as u16).unwrap();
                 let _left = left.into_ssa(typ, self.builder);
                 let _right = right.zero_extend(self.builder, left.width()).into_ssa(typ, self.builder);
-                let res = self.builder.ins().isub(_left, _right);
-                self.context.set_flags(flags, (_left, _right, res));
+                let (res, flag) = self.builder.ins().isub_ifbout(_left, _right);
+                self.context.set_flags(flags, (_left, _right, flag));
                 Value(res, typ)
             },
             // XXX: this is technically incorrect: flags will be wrong, because
@@ -1727,6 +1886,76 @@ impl<'a> FunctionTranslator<'a> {
             (left, right) => unimplemented!("unimplemented sub {:?} {:?}", left, right)
         }
     }
+
+    /// Sub with borrow
+    pub fn sbb<const FLAG:bool>(&mut self, left: JitTemp, right: JitTemp, borrow: JitTemp) -> JitTemp {
+        use JitTemp::*;
+        use Flags::*;
+        let flags = vec![OF, SF, ZF, AF, PF, CF];
+        match (left.clone(), right.clone(), borrow.clone()) {
+            (Value(val_left, typ_left), Value(val_right, _), Flag(val_borrow)) => {
+                let (res, flag) = self.builder.ins().isub_borrow(val_left, val_right, val_borrow);
+                self.context.set_flags(flags, (val_left, val_right, flag));
+                Value(res, typ_left)
+            },
+            (_, _, borrow) if borrow.is_const() => {
+                // see note in self.adc
+                let borrow = borrow.into_usize(self.builder).unwrap();
+                if borrow == 0 {
+                    return self.sub::<FLAG>(left, right);
+                } else {
+                    unimplemented!()
+                }
+            },
+            (left @ Value(_, _), right @ _, borrow @ _) |
+            (left @ _, right @ Value(_, _), borrow @ _) |
+            (left @ _, right @ _, borrow @ Flag(_)) => {
+                let typ = Type::int((left.width() * 8) as u16).unwrap();
+                let _left = left.into_ssa(typ, self.builder);
+                let _right = right.zero_extend(self.builder, left.width()).into_ssa(typ, self.builder);
+                let mut _borrow = borrow.into_ssa(types::IFLAGS, self.builder);
+                let (res, flag) = self.builder.ins().isub_borrow(_left, _right, _borrow);
+                self.context.set_flags(flags, (_left, _right, flag));
+                Value(res, typ)
+            },
+            (Ref(base, offset), off, borrow) if off.is_const() && borrow.is_const() => {
+                let off = off.into_usize(self.builder).unwrap();
+                let borrow = borrow.into_usize(self.builder).unwrap();
+                assert_eq!(HOST_WIDTH, 8);
+                if borrow == 0 {
+                    Ref(base, do_op!(self.context, FLAG, offset, off, "sub {}, {}", flags, +))
+                } else {
+                    Ref(base, do_op!(self.context, FLAG, offset, off, "stc; sbb {}, {}", flags, +))
+                }
+            },
+            (offset, Ref(base, off), borrow) if offset.is_const() && borrow.is_const() => {
+                let offset = offset.into_usize(self.builder).unwrap();
+                let borrow = borrow.into_usize(self.builder).unwrap();
+                assert_eq!(HOST_WIDTH, 8);
+                if borrow == 0 {
+                    Ref(base, do_op!(self.context, FLAG, offset, off, "sub {}, {}", flags, +))
+                } else {
+                    Ref(base, do_op!(self.context, FLAG, offset, off, "stc; sbb {}, {}", flags, +))
+                }
+            },
+            (left_c, mut right_c, mut borrow)
+            if left_c.clone().is_const()
+            && right_c.clone().is_const()
+            && borrow.clone().is_const() => {
+                right_c = right_c.zero_extend(self.builder, left_c.clone().width());
+                let borrow = borrow.into_usize(self.builder).unwrap();
+                assert_eq!(HOST_WIDTH, 8);
+                if borrow == 0 {
+                    const_ops!(self.context, FLAG, left_c.clone(), right_c.clone(), "sub {}, {}", flags, +)
+                } else {
+                    const_ops!(self.context, FLAG, left_c.clone(), right_c.clone(), "stc; sbb {}, {}", flags, +)
+                }
+            },
+            (left, right, borrow) => unimplemented!("unimplemented sbb {:?} {:?} {:?}", left, right, borrow)
+        }
+    }
+
+
 
     pub fn band(&mut self, mut left: JitTemp, mut right: JitTemp) -> JitTemp {
         use JitTemp::*;
