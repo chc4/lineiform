@@ -48,11 +48,13 @@ pub struct Region {
     sources: Vec<PortIdx>,
     /// The output ports for this region
     sinks: Vec<PortIdx>,
+    live: bool,
 }
 
 impl Region {
     pub fn new() -> Self {
         Self {
+            live: false,
             ..Default::default()
         }
     }
@@ -138,7 +140,7 @@ pub trait NodeBehavior {
         unimplemented!();
     }
 
-    fn add_output(&mut self, ir: &mut IR) -> PortIdx {
+    fn add_output(&mut self, r: &mut Region, ir: &mut IR) -> PortIdx {
         unimplemented!();
     }
 
@@ -168,12 +170,10 @@ impl<T: NodeBehavior> NodeBehavior for Node<T> {
         self.inputs.push(p)
     }
 
-    fn add_output(&mut self, ir: &mut IR) -> PortIdx {
-        ir.in_region(self.containing_region.unwrap(), |mut r, ir| {
-            let p_x = r.add_port();
-            self.outputs.push(p_x);
-            p_x
-        })
+    fn add_output(&mut self, r: &mut Region, ir: &mut IR) -> PortIdx {
+        let p_x = r.add_port();
+        self.outputs.push(p_x);
+        p_x
     }
 
     fn create_ports(&mut self, ir: &mut IR) {
@@ -183,7 +183,7 @@ impl<T: NodeBehavior> NodeBehavior for Node<T> {
                 self.add_input(p, ir);
             }
             for i in 0..self.output_count() {
-                self.add_output(ir);
+                self.add_output(r, ir);
             }
         })
     }
@@ -300,7 +300,8 @@ pub struct IR {
 
 impl IR {
     pub fn new() -> Self {
-        let r = Region::new();
+        let mut r = Region::new();
+        r.live = true;
         let mut r_map = StableGraph::new();
         let r_x = r_map.add_node(r);
         Self {
@@ -313,18 +314,24 @@ impl IR {
 
     /// Create a region in this IR instance at the top-most level.
     pub fn new_region(&mut self) -> RegionIdx {
-        let r = Region::new();
+        let mut r = Region::new();
+        r.live = true;
         let r_x = self.regions.add_node(r);
         self.regions.add_edge(self.master_region, r_x, ());
         r_x
     }
 
+    pub fn add_function<const A: usize, const O: usize>(&mut self, f: Node<NodeVariant::Function<A, O>>) {
+        self.in_region(self.master_region, |r, ir| {
+            r.add_node(f);
+        });
+    }
+
     pub fn set_body<const A: usize, const O: usize>(&mut self, f: Node<NodeVariant::Function<A, O>>) {
         let body = self.in_region(self.master_region, |r, ir| {
-            let n = r.nodes.len();
-            r.add_node(f);
-            n
+            r.nodes.len()
         });
+        self.add_function(f);
         self.body = Some(body); // once told me
     }
 
@@ -332,6 +339,7 @@ impl IR {
         where F: FnOnce(&mut Region, &mut Self) -> O {
         let mut dummy = Region::new();
         std::mem::swap(&mut dummy, &mut self.regions[r]);
+        assert_eq!(dummy.live, true, "dead region? {:?}", r);
         let o = f(&mut dummy, self);
         std::mem::swap(&mut dummy, &mut self.regions[r]);
         o
