@@ -113,7 +113,7 @@ mod NodeVariant {
             f: F) where F: FnOnce(&mut Node<T>, &mut IR) -> ()
         {
             n.containing_region = Some(self.0);
-            ir.in_region(self.0, |mut r, ir| { n.create_ports(ir); });
+            n.create_ports(ir);
             f(&mut n, ir);
             ir.in_region(self.0, |mut r, ir| { r.add_node(n) });
         }
@@ -214,14 +214,14 @@ impl<T: NodeBehavior> NodeBehavior for Node<T> {
 impl NodeBehavior for NodeVariant::Simple {
     fn input_count(&self) -> usize {
         match &self.0 {
-            Inc => 1,
+            Operation::Inc => 1,
             _ => unimplemented!(),
         }
     }
 
     fn output_count(&self) -> usize {
         match &self.0 {
-            Inc => 1,
+            Operation::Inc => 1,
             _ => unimplemented!(),
         }
     }
