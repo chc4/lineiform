@@ -1,0 +1,33 @@
+[package]
+name = "lineiform"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nom = "7.0.0-alpha1"
+jemallocator = "0.3.2"
+thiserror = "1.0"
+enum-display-derive = "0.1.1"
+goblin = "0.4"
+lazy_static = "1.4.0"
+bitvec = "0.22.3"
+bitflags = "1.3.1"
+rangemap = "0.1.11"
+
+yaxpeax-arch = "0.2.5"
+
+cranelift = "0.75.0"
+cranelift-codegen = "0.75.0"
+cranelift-jit = "0.75.0"
+cranelift-module = "0.75.0"
+target-lexicon = "0.12.1"
+
+[dependencies.yaxpeax-x86]
+version = "1.0.4"
+features = ["fmt"]
+path = "../../yaxpeax-x86" # FIXME when yax x86 1.1 comes out
+
+[lib]
+path = "src/lib.rs"

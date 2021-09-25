@@ -32,6 +32,8 @@ mod lift;
 use lift::{Jit, LiftError};
 mod lineiform;
 use lineiform::{Lineiform};
+mod ir;
+use ir::IR;
 
 use std::collections::HashMap;
 

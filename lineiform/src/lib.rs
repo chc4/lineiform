@@ -1,10 +1,33 @@
+#![allow(unused_imports, unused_parens)]
+#![deny(unused_must_use, improper_ctypes_definitions)]
+#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, inline_const, inherent_associated_types, associated_type_bounds, let_chains, asm, destructuring_assignment)]
+
 #[deny(bare_trait_objects)]
+extern crate jemallocator;
+extern crate thiserror;
+#[macro_use]
+extern crate enum_display_derive;
+extern crate yaxpeax_arch;
+extern crate yaxpeax_x86;
+extern crate goblin;
+extern crate cranelift;
+extern crate cranelift_jit;
+extern crate cranelift_codegen;
+extern crate target_lexicon;
+extern crate bitvec;
+extern crate bitflags;
+extern crate rangemap;
 use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
 use std::collections::HashMap;
 use core::marker::PhantomData;
 use std::sync::Arc;
 use std::rc::Rc;
 use core::num::Wrapping;
+
+
+pub mod lift;
+pub mod tracer;
+pub mod block;
 use crate::lift::JitValue;
 
 /// Rust closures are rust-call calling convention only. This is a problem, since
@@ -58,9 +81,9 @@ impl<A: std::fmt::Debug,O> Fn<A> for FastFn<A, O> where
     }
 }
 
-use crate::Jit;
-use crate::Tracer;
-use crate::Function;
+use lift::Jit;
+use tracer::Tracer;
+use block::Function;
 pub struct Lineiform<A, O> {
     decompiled: HashMap<*const (), Arc<Vec<Instruction>>>,
     _phantom: PhantomData<fn(A)->O>,
