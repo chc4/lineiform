@@ -37,8 +37,6 @@ fn new_port() -> Port {
 }
 pub struct Edge {
     variant: EdgeVariant,
-    origin: NodeId,
-    user: NodeId,
 }
 
 #[derive(Default)]
@@ -66,6 +64,14 @@ impl Region {
     pub fn add_port(&mut self) -> PortIdx {
         let p = new_port();
         self.ports.add_node(p)
+    }
+
+    pub fn connect_ports(&mut self, input: PortIdx, output: PortIdx) {
+        // TODO: support other edge metadata?
+        let e = Edge {
+            variant: EdgeVariant::Data,
+        };
+        self.ports.add_edge(input, output, e);
     }
 
     pub fn add_source(&mut self) -> PortIdx {
@@ -107,16 +113,17 @@ mod NodeVariant {
             f: F) where F: FnOnce(&mut Node<T>, &mut IR) -> ()
         {
             n.containing_region = Some(self.0);
+            ir.in_region(self.0, |mut r, ir| { n.create_ports(ir); });
             f(&mut n, ir);
-            ir.get_region(self.0).add_node(n)
+            ir.in_region(self.0, |mut r, ir| { r.add_node(n) });
         }
 
         pub fn add_argument(&mut self, ir: &mut IR) -> PortIdx {
-            ir.get_region(self.0).add_source()
+            ir.in_region(self.0, |mut r, ir| { r.add_source() })
         }
 
-        pub fn add_return(&mut self, p: PortIdx, ir: &mut IR) {
-            ir.get_region(self.0).add_sink();
+        pub fn add_return(&mut self, ir: &mut IR) -> PortIdx {
+            ir.in_region(self.0, |mut r, ir| { r.add_sink() })
         }
     }
     pub struct Global(pub Region); // "Delta-Nodes"; global variables
@@ -134,6 +141,26 @@ pub trait NodeBehavior {
     fn add_output(&mut self, ir: &mut IR) -> PortIdx {
         unimplemented!();
     }
+
+    fn create_ports(&mut self, ir: &mut IR) {
+        unimplemented!();
+    }
+
+    fn input_count(&self) -> usize {
+        unimplemented!();
+    }
+
+    fn output_count(&self) -> usize {
+        unimplemented!();
+    }
+
+    fn connect_input(&mut self, idx: usize, input: PortIdx, ir: &mut IR) {
+        unimplemented!();
+    }
+
+    fn connect_output(&mut self, idx: usize, output: PortIdx, ir: &mut IR) {
+        unimplemented!();
+    }
 }
 
 impl<T: NodeBehavior> NodeBehavior for Node<T> {
@@ -142,14 +169,62 @@ impl<T: NodeBehavior> NodeBehavior for Node<T> {
     }
 
     fn add_output(&mut self, ir: &mut IR) -> PortIdx {
-        let r = ir.get_region(self.containing_region.unwrap());
-        let p_x = r.add_port();
-        self.outputs.push(p_x);
-        p_x
+        ir.in_region(self.containing_region.unwrap(), |mut r, ir| {
+            let p_x = r.add_port();
+            self.outputs.push(p_x);
+            p_x
+        })
+    }
+
+    fn create_ports(&mut self, ir: &mut IR) {
+        ir.in_region(self.containing_region.unwrap(), |mut r, ir| {
+            for i in 0..self.input_count() {
+                let p = r.add_port();
+                self.add_input(p, ir);
+            }
+            for i in 0..self.output_count() {
+                self.add_output(ir);
+            }
+        })
+    }
+
+    fn input_count(&self) -> usize {
+        self.variant.input_count()
+    }
+
+    fn output_count(&self) -> usize {
+        self.variant.output_count()
+    }
+
+    fn connect_input(&mut self, idx: usize, input: PortIdx, ir: &mut IR) {
+        let p = self.inputs[idx];
+        ir.in_region(self.containing_region.unwrap(), |r, ir| {
+            r.connect_ports(input, p);
+        });
+    }
+
+    fn connect_output(&mut self, idx: usize, output: PortIdx, ir: &mut IR) {
+        let p = self.inputs[idx];
+        ir.in_region(self.containing_region.unwrap(), |r, ir| {
+            r.connect_ports(p, output);
+        });
     }
 }
 
 impl NodeBehavior for NodeVariant::Simple {
+    fn input_count(&self) -> usize {
+        match &self.0 {
+            Inc => 1,
+            _ => unimplemented!(),
+        }
+    }
+
+    fn output_count(&self) -> usize {
+        match &self.0 {
+            Inc => 1,
+            _ => unimplemented!(),
+        }
+    }
 }
 
 impl<A, O> NodeBehavior for NodeVariant::Function<A, O> {
@@ -235,8 +310,13 @@ impl IR {
         r_x
     }
 
-    pub fn get_region(&mut self, r: RegionIdx) -> &mut Region {
-        &mut self.regions[r]
+    pub fn in_region<F, O>(&mut self, r: RegionIdx, f: F) -> O
+        where F: FnOnce(&mut Region, &mut Self) -> O {
+        let mut dummy = Region::new();
+        std::mem::swap(&mut dummy, &mut self.regions[r]);
+        let o = f(&mut dummy, self);
+        std::mem::swap(&mut dummy, &mut self.regions[r]);
+        o
     }
 
     pub fn optimize(&mut self) -> &mut Self {
@@ -265,13 +345,12 @@ mod test {
         let mut ir = IR::new();
         let mut f = Node::<S>::function::<(), ()>(&mut ir);
         let port = f.add_argument(&mut ir);
+        let ret_port = f.add_return(&mut ir);
         let mut inc = Node::<S>::simple(Operation::Inc);
-        let mut out_port = None;
         f.add_body(inc, &mut ir, |inc, ir| {
-            inc.add_input(port, ir);
-            out_port = Some(inc.add_output(ir));
+            inc.connect_input(0, port, ir);
+            inc.connect_output(0, ret_port, ir);
         });
-        f.add_return(out_port.unwrap(), &mut ir);
     }
 
 }
