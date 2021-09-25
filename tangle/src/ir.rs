@@ -99,11 +99,11 @@ mod NodeVariant {
     use std::marker::PhantomData;
     use super::*;
     pub struct Simple(pub Operation); // Instructions or constant operands
-    pub struct Function<A, O>(pub RegionIdx, PhantomData<(A,O)>); // "Lambda-Nodes"; procedures and functions
-    impl<A, O> Function<A, O> {
+    pub struct Function<const A: usize, const O: usize>(pub RegionIdx); // "Lambda-Nodes"; procedures and functions
+    impl<const A: usize, const O: usize> Function<A, O> {
         pub fn new(ir: &mut IR) -> Self {
             let r = ir.new_region();
-            Self(r, PhantomData)
+            Self(r)
         }
 
         pub fn add_body<T: 'static + NodeBehavior, F>(
@@ -227,7 +227,16 @@ impl NodeBehavior for NodeVariant::Simple {
     }
 }
 
-impl<A, O> NodeBehavior for NodeVariant::Function<A, O> {
+impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O> {
+    fn input_count(&self) -> usize {
+        A
+    }
+
+    fn output_count(&self) -> usize {
+        // The output of a function node is always the function itself
+        1
+    }
+
 }
 
 
@@ -270,7 +279,7 @@ impl<T> Node<T> {
         Node::new(NodeVariant::Simple(op))
     }
 
-    pub fn function<A, O>(ir: &mut IR) -> Node<NodeVariant::Function<A, O>> {
+    pub fn function<const A: usize, const O: usize>(ir: &mut IR) -> Node<NodeVariant::Function<A, O>> {
         Node::new(NodeVariant::Function::new(ir))
     }
 }
@@ -281,7 +290,7 @@ type RegionIdx = NodeIndex;
 #[derive(Default)]
 pub struct IR {
     nodes: Vec<Box<dyn NodeBehavior>>,
-    body: Option<NodeId>,
+    body: Option<usize>,
     /// A directed acyclic graph of regions; if there is an edge r_1 -> r_2, then
     /// r_2 is within r_1.
     regions: StableGraph<Region, RegionEdge, petgraph::Directed>,
@@ -308,6 +317,15 @@ impl IR {
         let r_x = self.regions.add_node(r);
         self.regions.add_edge(self.master_region, r_x, ());
         r_x
+    }
+
+    pub fn set_body<const A: usize, const O: usize>(&mut self, f: Node<NodeVariant::Function<A, O>>) {
+        let body = self.in_region(self.master_region, |r, ir| {
+            let n = r.nodes.len();
+            r.add_node(f);
+            n
+        });
+        self.body = Some(body); // once told me
     }
 
     pub fn in_region<F, O>(&mut self, r: RegionIdx, f: F) -> O
@@ -337,13 +355,13 @@ mod test {
     #[test]
     pub fn simple_function() {
         let mut ir = IR::new();
-        let mut f = Node::<S>::function::<(), ()>(&mut ir);
+        let mut f = Node::<S>::function::<0, 0>(&mut ir);
     }
 
     #[test]
     pub fn function_inc() {
         let mut ir = IR::new();
-        let mut f = Node::<S>::function::<(), ()>(&mut ir);
+        let mut f = Node::<S>::function::<1, 1>(&mut ir);
         let port = f.add_argument(&mut ir);
         let ret_port = f.add_return(&mut ir);
         let mut inc = Node::<S>::simple(Operation::Inc);
@@ -351,6 +369,7 @@ mod test {
             inc.connect_input(0, port, ir);
             inc.connect_output(0, ret_port, ir);
         });
+        ir.set_body(f);
     }
 
 }
