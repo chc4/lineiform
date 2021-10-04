@@ -17,7 +17,46 @@ use petgraph::stable_graph::StableGraph;
 use petgraph::graph::{NodeIndex};
 use petgraph::Direction;
 use petgraph::visit::{EdgeRef, Dfs, Reversed, depth_first_search, DfsEvent, ControlFlow};
-use yaxpeax_x86::long_mode::{Operand, RegSpec};
+use yaxpeax_x86::long_mode::{Operand, RegSpec, register_class};
+use yaxpeax_x86::x86_64;
+use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, AssemblyOffset};
+use dynasmrt::x64::Assembler;
+
+// yaxpeax decoder example
+mod decoder {
+    use yaxpeax_arch::{Arch, AddressDisplay, Decoder, Reader, ReaderBuilder};
+
+    pub fn decode_stream<
+        'data,
+        A: yaxpeax_arch::Arch,
+        U: ReaderBuilder<A::Address, A::Word>,
+    >(data: U) -> Vec<A::Instruction>
+        where A::Instruction: std::fmt::Display
+    {
+        let mut reader = ReaderBuilder::read_from(data);
+        let mut address: A::Address = reader.total_offset();
+
+        let decoder = A::Decoder::default();
+        let mut decode_res = decoder.decode(&mut reader);
+        let mut res = Vec::new();
+        loop {
+            match decode_res {
+                Ok(inst) => {
+                    //println!("{}: {}", address.show(), inst);
+                    decode_res = decoder.decode(&mut reader);
+                    address = reader.total_offset();
+                    res.push(inst);
+                }
+                Err(e) => {
+                    //println!("{}: decode error: {}", address.show(), e);
+                    break;
+                }
+            }
+        }
+        res
+    }
+}
+
 
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub enum EdgeVariant {
@@ -75,6 +114,7 @@ pub struct Region {
     sinks: Vec<PortIdx>,
     live: bool,
     idx: RegionIdx,
+    order: Vec<usize>,
 }
 
 impl Region {
@@ -92,7 +132,7 @@ impl Region {
     }
 
     pub fn add_node<T: 'static + NodeBehavior, F>(&mut self, mut n: Node<T>,
-        f: F) where F: FnOnce(&mut Node<T>, &mut Region) -> () {
+        f: F) where F: FnOnce(&mut Node<T>, &mut Region) -> (), T: core::fmt::Debug {
         n.containing_region = Some(self.idx);
         n.create_ports(self);
         f(&mut n, self);
@@ -139,11 +179,18 @@ impl Region {
         struct RegMeta {
             // todo: what information should we keep around? minimum width (maybe with a bitmap?)
             width: u8,
-            // it was a virtual register, but one of the uses is constrained to
             hint: Storage,
         }
         //let mut regmap = HashMap::<Storage, RegMeta>::new();
         let mut virt_num = 0;
+
+        // idea: we can instead have a virtual register have a set of constraints,
+        // which are a hashmap of storage -> list of uses.
+        // then we do splitting of virtual registers with moves, with the split
+        // happening at the best spot (larger gap or whatever). basically ssa live
+        // range splitting but not.
+        // we don't do that currently (we just emit a move the first time there
+        // is a constrain conflict)
 
         while let Some(n) = nodes.pop() {
             println!("got root {:?}", n);
@@ -199,8 +246,59 @@ impl Region {
             });
         }
     }
+
+    pub fn order(&self) -> Vec<usize> {
+        let mut ports = self.sources.clone();
+        // there's probably a smarter way to do this? we intentionally don't
+        // attach ports to nodes so that we can move and destroy nodes as we want
+        // without having to invalidate a port<->node map, so we can't just get
+        // an order of nodes from an order of ports easily.
+        // this can be a better datastructure at least (union-find map?)
+        let mut node_ports = vec![];
+        use std::collections::HashSet;
+        for (idx, n) in self.nodes.iter().enumerate() {
+            let mut connected = HashSet::new();
+            for p in n.sources() { connected.insert(p); }
+            for p in n.sinks() { connected.insert(p); }
+            node_ports.push((idx, connected));
+        }
+        let mut ord = vec![];
+        while let Some(port) = ports.pop() {
+            println!("top-down got port {:?}", port);
+            for (idx, set) in &node_ports {
+                if set.contains(&port) {
+                    println!("\tconnected to node {:?}", idx);
+                    ord.push(*idx);
+                }
+            }
+
+            for edge in self.ports.edges_directed(port, Direction::Incoming) {
+                println!("\thas port to {:?}", edge.source());
+                for (idx, set) in &node_ports {
+                    if set.contains(&edge.source()) {
+                        ports.append(&mut self.nodes[*idx].sinks());
+                    }
+                }
+            }
+        }
+        ord
+    }
+
+    pub fn codegen(&mut self, ir: &mut IR, ops: &mut Assembler) {
+        // TODO: emit all the constant values first?
+        let mut nodes = vec![];
+        let ord = self.order();
+        std::mem::swap(&mut self.nodes, &mut nodes);
+        // lol this is wrong. we actually want to thread a State edge through
+        // nodes, and just visit the State edge uses in order.
+        for mut n in ord {
+            nodes[n].codegen(vec![], vec![], self, ir, ops);
+        }
+        std::mem::swap(&mut self.nodes, &mut nodes);
+    }
 }
 
+#[derive(Debug)]
 pub enum Operation {
     Nop,
     Constant(JitTemp),
@@ -212,8 +310,11 @@ mod NodeVariant {
     use super::{Operation, Region};
     use std::marker::PhantomData;
     use super::*;
+    #[derive(Debug)]
     pub struct Move(pub Storage, pub Storage); // A move operation, sink <- source.
+    #[derive(Debug)]
     pub struct Simple(pub Operation); // Instructions or constant operands
+    #[derive(Debug)]
     pub struct Function<const A: usize, const O: usize> {
         args: u8,
         outs: u8,
@@ -233,7 +334,7 @@ mod NodeVariant {
             &mut self,
             mut n: Node<T>,
             ir: &mut IR,
-            f: F) where F: FnOnce(&mut Node<T>, &mut Region) -> ()
+            f: F) where F: FnOnce(&mut Node<T>, &mut Region) -> (), T: core::fmt::Debug
         {
             ir.in_region(self.region, |mut r, ir| {
                 r.add_node(n, f)
@@ -313,9 +414,33 @@ pub trait NodeBehavior {
     fn connect_operands(&mut self, input: usize, output: usize, r: &mut Region) {
         unimplemented!();
     }
+
+    fn codegen(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        unimplemented!();
+    }
+
+    fn sinks(&self) -> Vec<PortIdx> {
+        unimplemented!();
+    }
+
+    fn sources(&self) -> Vec<PortIdx> {
+        unimplemented!();
+    }
+
+    fn tag(&self) -> String {
+        "<unknown>".to_string()
+    }
 }
 
-impl<T: NodeBehavior> NodeBehavior for Node<T> {
+impl<T: NodeBehavior + core::fmt::Debug> NodeBehavior for Node<T> {
+    fn sinks(&self) -> Vec<PortIdx> {
+        self.outputs.clone()
+    }
+
+    fn sources(&self) -> Vec<PortIdx> {
+        self.inputs.clone()
+    }
+
     fn add_input(&mut self, p: PortIdx, r: &mut Region) {
         self.inputs.push(p)
     }
@@ -365,6 +490,15 @@ impl<T: NodeBehavior> NodeBehavior for Node<T> {
         let output = self.outputs[output];
         r.connect_ports(input, output);
     }
+
+    fn codegen(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        println!("node codegen for {:?}", self.variant);
+        self.variant.codegen(self.inputs.clone(), self.outputs.clone(), r, ir, ops)
+    }
+
+    fn tag(&self) -> String {
+        self.variant.tag()
+    }
 }
 
 impl NodeBehavior for NodeVariant::Simple {
@@ -378,6 +512,35 @@ impl NodeBehavior for NodeVariant::Simple {
     fn output_count(&self) -> usize {
         match &self.0 {
             Operation::Inc => 1,
+            _ => unimplemented!(),
+        }
+    }
+
+
+    fn codegen(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        match &self.0 {
+            Operation::Inc => {
+                let operand = &r.ports[inputs[0]];
+                match operand.storage.as_ref().unwrap() {
+                    Storage::Physical(r) => match r.class() {
+                        register_class::Q => dynasm!(ops
+                            ; inc Rq(r.num())
+                        ),
+                        register_class::D => dynasm!(ops
+                            ; inc Rd(r.num())
+                        ),
+                        x => unimplemented!("unknown class {:?} for inc", x),
+                    },
+                    _ => unimplemented!(),
+                }
+            }
+            x => unimplemented!("unimplemented codegen for {:?}", x),
+        }
+    }
+
+    fn tag(&self) -> String {
+        match &self.0 {
+            Operation::Inc => "inc".to_string(),
             _ => unimplemented!(),
         }
     }
@@ -397,6 +560,24 @@ impl NodeBehavior for NodeVariant::Move {
         r.constrain(outputs[0], self.0.clone());
         r.constrain(inputs[0], self.1.clone());
     }
+
+    fn codegen(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        let source = &r.ports[inputs[0]];
+        let sink = &r.ports[outputs[0]];
+        match (sink.storage.as_ref().unwrap(), source.storage.as_ref().unwrap()) {
+            (Storage::Physical(r0), Storage::Physical(r1)) => {
+                match (r0.class(), r1.class()) {
+                    (register_class::Q, register_class::Q) =>
+                        dynasm!(ops
+                            ; mov Rq(r0.num()), Rq(r1.num())
+                        ),
+                    (x, y) => unimplemented!("{:?} <- {:?} unimplemented", x, y),
+                }
+            },
+            _ => unimplemented!(),
+        }
+    }
+
 }
 
 
@@ -408,9 +589,16 @@ impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O
     fn output_count(&self) -> usize {
         // The output of a function node is always the function itself
         // todo lol
-        0
+        1
     }
 
+    fn codegen(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        // if we're calling codegen on a function, it should be the only one.
+        ir.in_region(self.region, |r, ir| { r.codegen(ir, ops); });
+        dynasm!(ops
+            ; ret
+        );
+    }
 }
 
 
@@ -502,7 +690,8 @@ impl IR {
 
     pub fn add_function<const A: usize, const O: usize>(&mut self, f: Node<NodeVariant::Function<A, O>>) {
         self.in_region(self.master_region, |r, ir| {
-            r.add_node(f, |_, _| {});
+            r.add_node(f, |n, r| {
+            });
         });
     }
 
@@ -532,6 +721,9 @@ impl IR {
 
     pub fn regalloc(&mut self) {
         for r in self.regions.node_weights_mut() {
+            if r.idx == self.master_region {
+                continue;
+            }
             r.regalloc();
         }
     }
@@ -543,6 +735,20 @@ impl IR {
             }
             r.validate();
         }
+    }
+
+    pub fn codegen(&mut self) -> (Assembler, AssemblyOffset, usize) {
+        let mut ops = Assembler::new().unwrap();
+        let start = ops.offset();
+        let mut ret = None;
+        self.in_region(self.master_region, |r, ir| {
+            let mut n = vec![];
+            std::mem::swap(&mut r.nodes, &mut n);
+            ret = Some(n[ir.body.unwrap()].codegen(vec![], vec![], r, ir, &mut ops));
+            std::mem::swap(&mut r.nodes, &mut n);
+        });
+        let end = ops.offset();
+        (ops, start, end.0 - start.0)
     }
 
     pub fn print(&self) {
@@ -580,6 +786,23 @@ mod test {
     pub fn function_inc_regalloc() {
         let mut ir = IR::new();
         let mut f = Node::<S>::function::<1, 1>(&mut ir);
+        let port = f.add_argument(&mut ir);
+        let ret_port = f.add_return(&mut ir);
+        let mut inc = Node::<S>::simple(Operation::Inc);
+        f.add_body(inc, &mut ir, |inc, r| {
+            inc.connect_input(0, port, r);
+            inc.connect_output(0, ret_port, r);
+            inc.connect_operands(0, 0, r);
+        });
+        ir.set_body(f);
+        ir.regalloc();
+        ir.validate();
+    }
+
+    #[test]
+    pub fn function_inc_codegen() {
+        let mut ir = IR::new();
+        let mut f = Node::<S>::function::<1, 1>(&mut ir);
         println!("create f");
         let port = f.add_argument(&mut ir);
         println!("create arg");
@@ -595,5 +818,23 @@ mod test {
         ir.set_body(f);
         ir.regalloc();
         ir.validate();
+
+        let (mut ops, off, size) = ir.codegen();
+        let buf = ops.finalize().unwrap();
+        let hello_fn: extern "C" fn(usize) -> usize = unsafe { std::mem::transmute(buf.ptr(off)) };
+        let all = crate::ir::decoder::decode_stream::<yaxpeax_x86::x86_64, _>(unsafe {
+            core::slice::from_raw_parts(
+                buf.ptr(off) as *const u8,
+                size as usize) as &[u8]
+        });
+        println!("disassembly: \n");
+        let mut fmt = String::new();
+        for inst in all {
+            inst.write_to(&mut fmt);
+            fmt.push('\n');
+        }
+        println!("{}", fmt);
+
+        assert_eq!(hello_fn(1), 2);
     }
 }

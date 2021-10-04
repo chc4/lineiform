@@ -4,4 +4,5 @@ extern crate lineiform;
 extern crate lazy_static;
 extern crate petgraph;
 extern crate yaxpeax_x86;
+extern crate dynasmrt;
 mod ir;
