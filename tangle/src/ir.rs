@@ -15,26 +15,51 @@ use lineiform::lift::{JitValue, JitTemp};
 use lineiform::block::{Function};
 use petgraph::stable_graph::StableGraph;
 use petgraph::graph::{NodeIndex};
+use petgraph::Direction;
+use petgraph::visit::{EdgeRef, Dfs, Reversed, depth_first_search, DfsEvent, ControlFlow};
+use yaxpeax_x86::long_mode::{Operand, RegSpec};
 
+#[derive(PartialEq, Debug, Copy, Clone)]
 pub enum EdgeVariant {
     State,
     Data,
 }
 
 pub type NodeId = u64;
+#[derive(Clone, PartialEq, Debug)]
+pub enum Storage {
+    Virtual(u16), // todo: width?
+    Physical(RegSpec),
+}
 
-pub type Port = u32;
+#[derive(Clone, Debug)]
+pub struct Port {
+    id: u32,
+    variant: EdgeVariant,
+    storage: Option<Storage>,
+}
+impl Port {
+    pub fn new() -> Self {
+        let mut guard = PORT_COUNT.lock().unwrap();
+        let curr = *guard;
+        *guard += 1;
+        println!("created port v{:?}", curr);
+        Port { id: curr, variant: EdgeVariant::Data, storage: None }
+    }
+
+    pub fn set_storage(&mut self, store: Storage) {
+        assert!(self.variant != EdgeVariant::State, "tried to set storage on a state port");
+        self.storage = Some(store);
+    }
+}
+
 pub type PortIdx = NodeIndex;
 use std::sync::Mutex;
 lazy_static::lazy_static! {
-    static ref PORT_COUNT: Mutex<Port> = Mutex::new(0);
+    static ref PORT_COUNT: Mutex<u32> = Mutex::new(0);
 }
-fn new_port() -> Port {
-    let mut guard = PORT_COUNT.lock().unwrap();
-    let curr = *guard;
-    *guard += 1;
-    curr
-}
+
+#[derive(Clone, Debug)]
 pub struct Edge {
     variant: EdgeVariant,
 }
@@ -49,6 +74,7 @@ pub struct Region {
     /// The output ports for this region
     sinks: Vec<PortIdx>,
     live: bool,
+    idx: RegionIdx,
 }
 
 impl Region {
@@ -59,21 +85,33 @@ impl Region {
         }
     }
 
-    pub fn add_node<T: 'static + NodeBehavior>(&mut self, n: Node<T>) {
+    pub fn validate(&self) {
+        for port in self.ports.node_weights() {
+            assert!(port.storage.is_some(), "port v{:?} with unconstrained storage", port.id);
+        }
+    }
+
+    pub fn add_node<T: 'static + NodeBehavior, F>(&mut self, mut n: Node<T>,
+        f: F) where F: FnOnce(&mut Node<T>, &mut Region) -> () {
+        n.containing_region = Some(self.idx);
+        n.create_ports(self);
+        f(&mut n, self);
         self.nodes.push(box n)
     }
 
     pub fn add_port(&mut self) -> PortIdx {
-        let p = new_port();
+        let p = Port::new();
         self.ports.add_node(p)
     }
 
     pub fn connect_ports(&mut self, input: PortIdx, output: PortIdx) {
-        // TODO: support other edge metadata?
+        let input_kind = self.ports[input].variant;
+        let output_kind = self.ports[output].variant;
+        assert_eq!(input_kind, output_kind);
         let e = Edge {
-            variant: EdgeVariant::Data,
+            variant: input_kind,
         };
-        self.ports.add_edge(input, output, e);
+        self.ports.add_edge(output, input, e);
     }
 
     pub fn add_source(&mut self) -> PortIdx {
@@ -86,6 +124,80 @@ impl Region {
         let p = self.add_port();
         self.sinks.push(p);
         p
+    }
+
+    pub fn constrain(&mut self, port: PortIdx, store: Storage) {
+        println!("constraining port v{:?} to storage {:?}", self.ports[port].id, store);
+        self.ports[port].set_storage(store)
+    }
+
+    pub fn regalloc(&mut self) {
+        // Starting at the sinks to the region, we do a DFS visit for all of the
+        // ports connected to each sink.
+        let mut nodes = self.sinks.clone();
+
+        struct RegMeta {
+            // todo: what information should we keep around? minimum width (maybe with a bitmap?)
+            width: u8,
+            // it was a virtual register, but one of the uses is constrained to
+            hint: Storage,
+        }
+        //let mut regmap = HashMap::<Storage, RegMeta>::new();
+        let mut virt_num = 0;
+
+        while let Some(n) = nodes.pop() {
+            println!("got root {:?}", n);
+            depth_first_search(&self.ports.clone(), Some(n), |event| {
+                match event {
+                    DfsEvent::TreeEdge(u, v) => {
+                        let mut sink = self.ports[u].clone();
+                        let mut source = self.ports[v].clone();
+                        println!("v{:?} <- v{:?}", sink.id, source.id);
+                        println!("storages {:?} <- {:?}", sink.storage, source.storage);
+                        let sink_store = sink.storage.clone().unwrap();
+                        if let Some(source_store) = &source.storage {
+                            match (sink_store.clone(), source_store.clone()) {
+                                (sink_store, source_store) if sink_store == source_store => {
+                                },
+                                (Storage::Physical(p0), Storage::Physical(p1)) => {
+                                    // we have two regions each with their own
+                                    // physical register constraint. we by
+                                    // definition need to emit a move.
+                                    // TODO: this can probably do some sort
+                                    // of deduplication, if e.g. there are
+                                    // two sources of the value with the same
+                                    // register constraint to avoid emitting
+                                    // a move for each.
+                                    let con = self.ports.find_edge(u, v).unwrap();
+                                    self.ports.remove_edge(con);
+                                    let mut n = Node::<S>::r#move(sink_store.clone(), source_store.clone());
+                                    self.add_node(n, |n, r| {
+                                        n.connect_input(0, v, r);
+                                        n.connect_output(0, u, r);
+                                        // and then add the source to the visitation set
+                                        nodes.push(v);
+                                    });
+                                },
+                                (x, y) => unimplemented!("couldn't fill {:?} <- {:?}", x, y),
+                            }
+                        } else {
+                            println!("just propogating");
+                            // we can't just use source.set_storage because it's
+                            // a clone.
+                            self.ports[v].set_storage(sink_store);
+                        }
+                        ControlFlow::continuing()
+                    },
+                    DfsEvent::Discover(n, t) => {
+                        ControlFlow::continuing()
+                    },
+                    DfsEvent::Finish(n, t) => {
+                        ControlFlow::continuing()
+                    },
+                    x => unimplemented!("{:?}", x),
+                }
+            });
+        }
     }
 }
 
@@ -100,32 +212,61 @@ mod NodeVariant {
     use super::{Operation, Region};
     use std::marker::PhantomData;
     use super::*;
+    pub struct Move(pub Storage, pub Storage); // A move operation, sink <- source.
     pub struct Simple(pub Operation); // Instructions or constant operands
-    pub struct Function<const A: usize, const O: usize>(pub RegionIdx); // "Lambda-Nodes"; procedures and functions
+    pub struct Function<const A: usize, const O: usize> {
+        args: u8,
+        outs: u8,
+        pub region: RegionIdx,
+    } // "Lambda-Nodes"; procedures and functions
     impl<const A: usize, const O: usize> Function<A, O> {
-        pub fn new(ir: &mut IR) -> Self {
+        pub fn new(ir: &mut IR) -> Function<A, O> {
             let r = ir.new_region();
-            Self(r)
+            Self {
+                region: r,
+                args: 0,
+                outs: 0
+            }
         }
 
         pub fn add_body<T: 'static + NodeBehavior, F>(
             &mut self,
             mut n: Node<T>,
             ir: &mut IR,
-            f: F) where F: FnOnce(&mut Node<T>, &mut IR) -> ()
+            f: F) where F: FnOnce(&mut Node<T>, &mut Region) -> ()
         {
-            n.containing_region = Some(self.0);
-            n.create_ports(ir);
-            f(&mut n, ir);
-            ir.in_region(self.0, |mut r, ir| { r.add_node(n) });
+            ir.in_region(self.region, |mut r, ir| {
+                r.add_node(n, f)
+            });
         }
 
         pub fn add_argument(&mut self, ir: &mut IR) -> PortIdx {
-            ir.in_region(self.0, |mut r, ir| { r.add_source() })
+            let arg_map = vec![
+                RegSpec::rdi(),
+                RegSpec::rsi(),
+                RegSpec::rdx(),
+            ];
+            let port = ir.in_region(self.region, |mut r, ir| {
+                let port = r.add_source();
+                r.constrain(port, Storage::Physical(arg_map[self.args as usize].clone()));
+                port
+            });
+            self.args += 1;
+            port
         }
 
         pub fn add_return(&mut self, ir: &mut IR) -> PortIdx {
-            ir.in_region(self.0, |mut r, ir| { r.add_sink() })
+            let out_map = vec![
+                RegSpec::rax(),
+                RegSpec::rdx(),
+            ];
+            let port = ir.in_region(self.region, |mut r, ir| {
+                let port = r.add_sink();
+                r.constrain(port, Storage::Physical(out_map[self.outs as usize].clone()));
+                port
+            });
+            self.outs += 1;
+            port
         }
     }
     pub struct Global(pub Region); // "Delta-Nodes"; global variables
@@ -134,18 +275,23 @@ mod NodeVariant {
     // The paper also has "Phi-Nodes" (mutually recursive functions) and
     // "Omega-Nodes" (translation units). We only ever JIT one function at a time.
 }
+// this is dumb, but rust's type inference chokes on the builder functions without
+// an explicit NodeVariant type, so just give it this.
+type S = NodeVariant::Simple;
 
 pub trait NodeBehavior {
-    fn add_input(&mut self, p: PortIdx, ir: &mut IR) {
+    fn add_input(&mut self, p: PortIdx, r: &mut Region) {
         unimplemented!();
     }
 
-    fn add_output(&mut self, r: &mut Region, ir: &mut IR) -> PortIdx {
+    fn add_output(&mut self, r: &mut Region) -> PortIdx {
         unimplemented!();
     }
 
-    fn create_ports(&mut self, ir: &mut IR) {
-        unimplemented!();
+    fn create_ports(&mut self, r: &mut Region) {
+    }
+
+    fn ports_callback(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region) {
     }
 
     fn input_count(&self) -> usize {
@@ -156,36 +302,44 @@ pub trait NodeBehavior {
         unimplemented!();
     }
 
-    fn connect_input(&mut self, idx: usize, input: PortIdx, ir: &mut IR) {
+    fn connect_input(&mut self, idx: usize, input: PortIdx, r: &mut Region) {
         unimplemented!();
     }
 
-    fn connect_output(&mut self, idx: usize, output: PortIdx, ir: &mut IR) {
+    fn connect_output(&mut self, idx: usize, output: PortIdx, r: &mut Region) {
+        unimplemented!();
+    }
+
+    fn connect_operands(&mut self, input: usize, output: usize, r: &mut Region) {
         unimplemented!();
     }
 }
 
 impl<T: NodeBehavior> NodeBehavior for Node<T> {
-    fn add_input(&mut self, p: PortIdx, ir: &mut IR) {
+    fn add_input(&mut self, p: PortIdx, r: &mut Region) {
         self.inputs.push(p)
     }
 
-    fn add_output(&mut self, r: &mut Region, ir: &mut IR) -> PortIdx {
+    fn add_output(&mut self, r: &mut Region) -> PortIdx {
         let p_x = r.add_port();
         self.outputs.push(p_x);
         p_x
     }
 
-    fn create_ports(&mut self, ir: &mut IR) {
-        ir.in_region(self.containing_region.unwrap(), |mut r, ir| {
-            for i in 0..self.input_count() {
-                let p = r.add_port();
-                self.add_input(p, ir);
-            }
-            for i in 0..self.output_count() {
-                self.add_output(r, ir);
-            }
-        })
+    fn create_ports(&mut self, r: &mut Region) {
+        println!("create_ports called");
+        self.variant.create_ports(r);
+        let mut inputs = vec![];
+        let mut outputs = vec![];
+        for i in 0..self.input_count() {
+            let p = r.add_port();
+            self.add_input(p, r);
+            inputs.push(p);
+        }
+        for i in 0..self.output_count() {
+            outputs.push(self.add_output(r));
+        }
+        self.variant.ports_callback(inputs, outputs, r);
     }
 
     fn input_count(&self) -> usize {
@@ -196,18 +350,20 @@ impl<T: NodeBehavior> NodeBehavior for Node<T> {
         self.variant.output_count()
     }
 
-    fn connect_input(&mut self, idx: usize, input: PortIdx, ir: &mut IR) {
+    fn connect_input(&mut self, idx: usize, input: PortIdx, r: &mut Region) {
         let p = self.inputs[idx];
-        ir.in_region(self.containing_region.unwrap(), |r, ir| {
-            r.connect_ports(input, p);
-        });
+        r.connect_ports(input, p);
     }
 
-    fn connect_output(&mut self, idx: usize, output: PortIdx, ir: &mut IR) {
-        let p = self.inputs[idx];
-        ir.in_region(self.containing_region.unwrap(), |r, ir| {
-            r.connect_ports(p, output);
-        });
+    fn connect_output(&mut self, idx: usize, output: PortIdx, r: &mut Region) {
+        let p = self.outputs[idx];
+        r.connect_ports(p, output);
+    }
+
+    fn connect_operands(&mut self, input: usize, output: usize, r: &mut Region) {
+        let input = self.inputs[input];
+        let output = self.outputs[output];
+        r.connect_ports(input, output);
     }
 }
 
@@ -227,14 +383,32 @@ impl NodeBehavior for NodeVariant::Simple {
     }
 }
 
+impl NodeBehavior for NodeVariant::Move {
+    fn input_count(&self) -> usize {
+        1
+    }
+
+    fn output_count(&self) -> usize {
+        1
+    }
+
+    fn ports_callback(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region) {
+        println!("{:?} <- {:?} ", outputs, inputs);
+        r.constrain(outputs[0], self.0.clone());
+        r.constrain(inputs[0], self.1.clone());
+    }
+}
+
+
 impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O> {
     fn input_count(&self) -> usize {
-        A
+        0
     }
 
     fn output_count(&self) -> usize {
         // The output of a function node is always the function itself
-        1
+        // todo lol
+        0
     }
 
 }
@@ -279,6 +453,10 @@ impl<T> Node<T> {
         Node::new(NodeVariant::Simple(op))
     }
 
+    pub fn r#move(sink: Storage, source: Storage) -> Node<NodeVariant::Move> {
+        Node::new(NodeVariant::Move(sink, source))
+    }
+
     pub fn function<const A: usize, const O: usize>(ir: &mut IR) -> Node<NodeVariant::Function<A, O>> {
         Node::new(NodeVariant::Function::new(ir))
     }
@@ -317,17 +495,19 @@ impl IR {
         let mut r = Region::new();
         r.live = true;
         let r_x = self.regions.add_node(r);
+        { self.regions.node_weight_mut(r_x).unwrap().idx = r_x; }
         self.regions.add_edge(self.master_region, r_x, ());
         r_x
     }
 
     pub fn add_function<const A: usize, const O: usize>(&mut self, f: Node<NodeVariant::Function<A, O>>) {
         self.in_region(self.master_region, |r, ir| {
-            r.add_node(f);
+            r.add_node(f, |_, _| {});
         });
     }
 
     pub fn set_body<const A: usize, const O: usize>(&mut self, f: Node<NodeVariant::Function<A, O>>) {
+        println!("setting IR body");
         let body = self.in_region(self.master_region, |r, ir| {
             r.nodes.len()
         });
@@ -340,6 +520,7 @@ impl IR {
         let mut dummy = Region::new();
         std::mem::swap(&mut dummy, &mut self.regions[r]);
         assert_eq!(dummy.live, true, "dead region? {:?}", r);
+        //assert!(dummy.idx.is_some(), "region {:?} not connected to graph", r);
         let o = f(&mut dummy, self);
         std::mem::swap(&mut dummy, &mut self.regions[r]);
         o
@@ -347,6 +528,21 @@ impl IR {
 
     pub fn optimize(&mut self) -> &mut Self {
         self
+    }
+
+    pub fn regalloc(&mut self) {
+        for r in self.regions.node_weights_mut() {
+            r.regalloc();
+        }
+    }
+
+    pub fn validate(&mut self) {
+        for r in self.regions.node_weights_mut() {
+            if r.idx == self.master_region {
+                continue;
+            }
+            r.validate();
+        }
     }
 
     pub fn print(&self) {
@@ -380,4 +576,24 @@ mod test {
         ir.set_body(f);
     }
 
+    #[test]
+    pub fn function_inc_regalloc() {
+        let mut ir = IR::new();
+        let mut f = Node::<S>::function::<1, 1>(&mut ir);
+        println!("create f");
+        let port = f.add_argument(&mut ir);
+        println!("create arg");
+        let ret_port = f.add_return(&mut ir);
+        println!("create ret");
+        let mut inc = Node::<S>::simple(Operation::Inc);
+        f.add_body(inc, &mut ir, |inc, r| {
+            inc.connect_input(0, port, r);
+            inc.connect_output(0, ret_port, r);
+            inc.connect_operands(0, 0, r);
+        });
+        println!("create inc");
+        ir.set_body(f);
+        ir.regalloc();
+        ir.validate();
+    }
 }
