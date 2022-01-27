@@ -11,6 +11,8 @@ lazy_static = "1.4.0"
 yaxpeax-arch = "0.2.5"
 dynasm = "1.1.0"
 dynasmrt = "1.1.0"
+ena = "0.14.0"
+rangemap = "0.1.11"
 
 [dependencies.lineiform]
 version = "*"
