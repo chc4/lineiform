@@ -24,6 +24,7 @@ use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, AssemblyOffset};
 use dynasmrt::x64::Assembler;
 use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
+use core::cmp::max;
 
 // yaxpeax decoder example
 mod decoder {
@@ -326,23 +327,32 @@ impl Region {
                 let mut sink = self.ports[e.source()];
                 println!("v{} <- v{}", sink.id, source.id);
                 println!("storages {} <- {}", sink.storage, source.storage);
-                if let None = *sink.storage {
+                if let (None, _) = (*sink.storage, *source.storage) {
                     // We don't have a target storage to progate upwards, so
                     // have to try against next time
                     return true
                 }
-                match (*sink.storage.clone(), *source.storage.clone()) {
-                    (Some(Storage::Virtual(sink_store)), Some(Storage::Virtual(source_store)))
-                    if sink_store == source_store => {
+                let (sink_backing, source_backing) = (
+                    sink.storage.and_then(|s| if let Storage::Virtual(v) = s { virts[&v.into()].backing } else { None } ),
+                    source.storage.and_then(|s| if let Storage::Virtual(v) = s { virts[&v.into()].backing } else { None } ),
+                );
+                println!("storages {} <- {}", sink.storage, source.storage);
+
+                match (
+                    sink.storage.clone().map(|s| if let Storage::Virtual(s) = s { s } else { panic!("l") }),
+                    source.storage.clone().map(|s| if let Storage::Virtual(s) = s { s } else { panic!("r") }),
+                ) {
+                    (Some(sink_store), Some(source_store))
+                    if sink_store == source_store && sink_backing == source_backing => {
                         // Do nothing, there are no conflicts
                     },
-                    (Some(p0), Some(source_store)) if p0 != source_store => {
+                    (Some(p0), Some(source_store)) if p0 != source_store || sink_backing != source_backing => {
                         // we emit a move before any instruction that has conflicting
                         // registers: this could be either because there's a physical
                         // storage already allocated, or two virtual registers
                         // use the same previous register
                         self.ports.remove_edge(e.id());
-                        let mut n = Node::r#move(p0, source_store);
+                        let mut n = Node::r#move(Storage::Virtual(p0), Storage::Virtual(source_store));
                         println!("INSERT MOVE");
                         self.add_node(n, |n, r| {
                             n.connect_input(0, e.target(), r);
@@ -350,27 +360,42 @@ impl Region {
                             // TODO: we need a way to say that these values *depend* on eachother
                             // but don't share storage
                             r.connect_ports(n.sources()[0], n.sinks()[0]);
-                            r.ports[n.sources()[0]].set_storage(source_store);
-                            r.ports[n.sinks()[0]].set_storage(p0);
+                            r.ports[n.sources()[0]].set_storage(Storage::Virtual(source_store));
+                            r.ports[n.sinks()[0]].set_storage(Storage::Virtual(p0));
+                        });
+                        use std::ops::BitOr;
+                        let require = &virts[&p0.into()].hints.clone();
+                        virts.entry(source_store.into()).and_modify(|e| {
+                            e.hints = e.hints.bitor(&require);
                         });
                     },
-                    (Some(Storage::Virtual(sink_store)), None) if virts[&sink_store.into()].backing.is_some() => {
-                        // create a virtual register before the physical one, and give it a hint
-                        virts.insert(reg.into(),
-                            VirtualRegister { ports: vec![], hints: HashSet::from([virts[&sink_store.into()].backing.unwrap()]), backing: None, allocated: false}
-                        );
-                        self.ports[e.target()].set_storage(Storage::Virtual(reg));
+                    (Some(p0), None) if sink_backing.is_some() => {
+                        // create a new virtual register + move before any physical sinks
+                        virts.insert(reg.into(), VirtualRegister { ports: vec![], hints: HashSet::from([sink_backing.unwrap()]), backing: None, allocated: false });
+                        let new_virt = Storage::Virtual(reg);
+                        self.ports[e.target()].set_storage(new_virt);
                         reg += 1;
-                        return false;
+                        self.ports.remove_edge(e.id());
+                        let mut n = Node::r#move(Storage::Virtual(p0), new_virt);
+                        println!("INSERT MOVE");
+                        self.add_node(n, |n, r| {
+                            n.connect_input(0, e.target(), r);
+                            n.connect_output(0, e.source(), r);
+                            // TODO: we need a way to say that these values *depend* on eachother
+                            // but don't share storage
+                            r.connect_ports(n.sources()[0], n.sinks()[0]);
+                            r.ports[n.sources()[0]].set_storage(new_virt);
+                            r.ports[n.sinks()[0]].set_storage(Storage::Virtual(p0));
+                        });
                     },
-                    (Some(Storage::Virtual(sink_store)), _) => {
+                    (Some(sink_store), _) if sink_backing.is_none() => {
                         println!("just propogating");
                         // we can't just use source.set_storage because it's
                         // a clone.
                         self.ports[e.target()].set_storage(Storage::Virtual(sink_store));
                     },
                     (x, y) => {
-                        unimplemented!("create_virtual_registers unhandled {:?} {:?}", x, y);
+                        unimplemented!("create_virtual_registers unhandled {:?} {:?} {:?} {:?}", x, sink_backing, y, source_backing);
                     },
                 };
                 false
@@ -389,10 +414,10 @@ impl Region {
 
     pub fn annotate_port_times_and_hints(&mut self, virts: &mut VirtualRegisterMap) {
         use std::collections::BTreeSet;
-        let mut nodes = { self.nodes.externals(Direction::Incoming).collect::<BTreeSet<_>>() };
+        let mut nodes = { self.nodes.externals(Direction::Outgoing).collect::<BTreeSet<_>>() };
 
         {
-            // The initial set of nodes with no dependencies can already be marked done
+            // The initial set of nodes with no dependants can be marked done
             for n in &nodes {
                 println!("root {:?}", self.nodes[*n]);
                 self.nodes[*n].done = true;
@@ -400,10 +425,13 @@ impl Region {
         }
         println!("all nodes {:#?}", self.nodes.node_weights().collect::<Vec<_>>());
 
-        // Then give process the nodes, adding their dependents to the working set
-        // and having their time be the max of their dependencies' time
+        // Then give process the nodes, adding their dependencies to the working set
+        // and having their time be the max of their dependants' time
+        // We work from the "bottom up" so that all instructions are scheduled the
+        // latest they possibly can.
+        let mut final_time = 0;
         'process: while let Some(sink) = &nodes.pop_first() {
-            let mut dependencies = self.nodes.neighbors_directed(*sink, Direction::Incoming).detach();
+            let mut dependencies = self.nodes.neighbors_directed(*sink, Direction::Outgoing).detach();
             let mut time = self.nodes[*sink].time;
             while let Some((e, dependency)) = dependencies.next(&self.nodes) {
                 // We could have processed a node before we processed all of its dependencies
@@ -415,28 +443,32 @@ impl Region {
                     println!("node {:?} too soon", self.nodes[*sink]);
                     continue 'process;
                 };
-                time = core::cmp::max(time, dependency.time + 1); // TODO: latency
+                time = max(time, dependency.time + 1); // TODO: latency
             }
             println!("node {:?} has time {:?}", self.nodes[*sink], time);
             self.nodes[*sink].time = time;
+            final_time = max(final_time, time);
             self.nodes[*sink].done = true;
 
-            let mut dependents = self.nodes.neighbors_directed(*sink, Direction::Outgoing).detach();
+            let mut dependents = self.nodes.neighbors_directed(*sink, Direction::Incoming).detach();
             while let Some((e, source)) = dependents.next(&self.nodes) {
                 // Add all the dependants of the node to the working set
                 nodes.insert(source);
             }
         }
+        // and add one for the function return ports
+        final_time += 1;
+        println!("final time is {}", final_time);
 
-        let mut last = 0;
         // validate all nodes were given times
-        for n in self.nodes.node_weights().into_iter() {
+        for n in self.nodes.node_weights_mut().into_iter() {
             assert_eq!(n.done, true, "no time for {:?}", n);
+            // renumber nodes so they are increasing in program time
+            n.time = final_time - n.time;
             // and give its ports the correct timings
-            use core::cmp::max;
-            for p in n.sources() { self.ports[p].time = Some(n.time); last = max(last, n.time); }
+            for p in n.sources() { self.ports[p].time = Some(n.time); }
             // TODO: latency
-            for p in n.sinks() { self.ports[p].time = Some(n.time + 1); last = max(last, n.time); }
+            for p in n.sinks() { self.ports[p].time = Some(n.time + 1); }
         }
 
         // and our functions entry/exit ports also need a time
@@ -444,7 +476,7 @@ impl Region {
             self.ports[*p].time = Some(0);
         }
         for p in &self.sinks {
-            self.ports[*p].time = Some(last+1);
+            self.ports[*p].time = Some(final_time);
         }
 
         // sort the uses for virtual registers by timings for later
@@ -456,150 +488,57 @@ impl Region {
 
     pub fn allocate_physical_for_virtual(&mut self, virts: &mut VirtualRegisterMap) {
         // TODO: all of this should just be over virtual register and not ports
-
-        // the nodes that we have to allocate
-        let mut ports = self.ports.node_weights().collect::<Vec<_>>();
-        println!("allocating ports {:?}", ports);
-        let mut working = self.ports.externals(Direction::Outgoing).collect::<Vec<_>>();
-        // We also want the first port for each virtual register that has to be
-        // a specific physical register
-        working.append(
-            &mut virts.values()
-            .filter(|v| v.backing.is_some()).
-            map(|v| *v.ports.first().unwrap()).collect());
-        let mut defered: Vec<(usize, PortIdx)> = vec![];
         use rangemap::RangeInclusiveMap;
-        // The rangemap is (end..start, portidx). portidx is the first port that
-        let mut live: HashMap<RegSpec, RangeInclusiveMap<usize, PortIdx>> = HashMap::new();
-        let mut cache = petgraph::algo::DfsSpace::new(&self.nodes);
-        'work: while
-            let Some(p) = {
-                println!("working {:?}", working);
-                println!("live {:?}", live.clone());
-                working = working.drain(..).filter(|p| {
-                    let port = self.ports[*p];
-                    if let Some(Storage::Virtual(v)) = *port.storage {
-                        // !virts[&v.into()].allocated
-                        !port.done
-                    } else { true }
-                }).collect();
-                working.sort_by(|a, b| {
-                    let a = self.ports[*a];
-                    let b = self.ports[*b];
-                    let (v_a, v_b) = if let (Some(Storage::Virtual(v_a)), Some(Storage::Virtual(v_b))) = (*a.storage, *b.storage) { (v_a, v_b) } else { panic!() };
-                    // We want to allocate all the physical register ranges first
-                    match (virts[&v_a.into()].backing, virts[&v_b.into()].backing) {
-                        (None, None) => Ordering::Equal,
-                        (Some(_), Some(_)) => Ordering::Equal,
-                        (Some(_), None) => Ordering::Greater,
-                        (None, Some(_)) => Ordering::Less,
-                    }.then(a.time.partial_cmp(&b.time).unwrap()).reverse()
+        // The rangemap is (end..start, vreg). vreg is the virtual register that is
+        // live for that timeslice on the physical register.
+        let mut live: HashMap<RegSpec, RangeInclusiveMap<usize, usize>> = HashMap::new();
+
+        // Add all the constrained registers first
+        for (key, reg) in &mut *virts {
+            if reg.backing.is_some() {
+                let range = self.ports[*reg.ports.first().unwrap()].time.unwrap()..=self.ports[*reg.ports.last().unwrap()].time.unwrap();
+                let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
+                    println!("first allocation for constrained {} at {:?}", reg.backing.unwrap(), range); RangeInclusiveMap::new()
                 });
-                defered.sort_by_key(|n| n.0 );
-                let mut r = None;
-                if let Some(deferral) = defered.first() {
-                    if working.first().is_none() || deferral.0 > self.ports[working[0]].time.unwrap() {
-                        println!("using deferral");
-                        let mut deferral = defered.pop().unwrap();
-                        // TODO: make sure ports downstream of this also get scheduled after this?
-                        self.ports[deferral.1].time = Some(deferral.0);
-                        r = Some(deferral.1)
-                    }
+                let already = reg_live.get_key_value(range.start());
+                if let Some(overlap) = already {
+                    panic!("uh oh");
                 }
-                r.or_else(|| working.pop())
-                } {
-            let port = self.ports[p];
-            if port.done {
+                reg_live.insert(range.clone(), *key);
+                println!("allocated constrained {} register {} {:?}", *key, reg.backing.unwrap(), range);
+                // we were able to allocate the physical register requirement
                 continue;
             }
-
-            let storage = port.storage.unwrap();
-            println!("port {} @ time {:?} has storage {}", port.id, port.time, storage);
-            if let Storage::Virtual(vreg) = storage {
-                if let Some(backed) = virts[&vreg.into()].backing {
-                    let vreg_entry = &virts[&vreg.into()];
-                    let range = self.ports[*vreg_entry.ports.first().unwrap()].time.unwrap()..=self.ports[*vreg_entry.ports.last().unwrap()].time.unwrap();
-                    println!("trying to allocate physical register for range {:?}", range);
-                    let reg_live = live.entry(*REGMAP.get(&backed).unwrap()).or_insert_with(|| {
-                        println!("first allocation for {}", backed); RangeInclusiveMap::new()
-                    });
-                    let already = reg_live.get_key_value(&port.time.unwrap());
-                    match already {
-                        Some((r, start)) => {
-                            // We somehow already have this physical register allocated
-                            // at the given time - we have to defer it until after the
-                            // use is done.
-                            println!("test this");
-                            defered.push((*r.end()+1, p));
-                            continue 'work;
-                        },
-                        None | Some(_) => {
-                            // block off the timeslice
-                            // TODO: latency
-                            reg_live.insert(range, p);
-                            virts.get_mut(&vreg.into()).unwrap().allocated = true;
-                            self.ports[p].done = true;
-                        }
-                    }
-                } else {
-                    let uses = &virts[&vreg.into()].ports;
-                    let range = self.ports[*uses.first().unwrap()].time.unwrap()..=self.ports[*uses.last().unwrap()].time.unwrap();
-                    println!("trying to allocate virtual register for range {:?}", range);
-                    let mut ord = REGS.clone();
-                    let hints = &virts[&vreg.into()].hints;
-                    for hint in hints {
-                        println!("hint {}", hint);
-                    }
-                    // Try to allocate it in one of the hints first
-                    ord.sort_by(|a, b| {
-                        hints.contains(a)
-                            .partial_cmp(&hints.contains(b))
-                        .unwrap().reverse()
-                    });
-                    for reg in ord {
-                        println!("trying to allocate virtual reg in {}", reg);
-                        let reg_live = live.entry(*REGMAP.get(&reg).unwrap())
-                            .or_insert_with(|| {
-                                println!("first allocation for {} from virtual", reg); RangeInclusiveMap::new()
-                            });
-                        self.ports[p].done = true;
-                        if let Some(x) = reg_live.gaps(&range).next() {
-                            // We can't use the range if the range isn't empty, or
-                            // if the next step in the range isn't connected to our
-                            // port
-                            if x != range
-                            {
-                                println!("bogos binted {:?}", x);
-                                continue;
-                            }
-                        } else {
-                            println!("no gaps?");
-                            continue;
-                        }
-                        println!("allocating virtual reg in {}", reg);
-                        reg_live.insert(range.clone(), p);
-                        virts.get_mut(&vreg.into()).unwrap().backing = Some(reg);
-                        virts.get_mut(&vreg.into()).unwrap().allocated = true;
-                        continue 'work;
-                    }
-                    panic!("allocate virtual here");
-                }
-            } else {
-                panic!();
-            }
-
-            let mut neighbors = self.ports.neighbors_directed(p, Direction::Incoming).detach();
-            while let Some((e, source)) = neighbors.next(&self.ports) {
-                // if sink <- source where sink is virtual and we're physical, add a hint
-                if let (Storage::Virtual(vreg), Storage::Physical(reg))
-                    = (storage, self.ports[source].storage.unwrap()) {
-                    print!("adding hint to {}", vreg);
-                    virts.get_mut(&vreg.into()).unwrap().hints.insert(reg);
-                }
-                println!("adding {:?} to working set", source);
-                working.push(source);
-            }
         }
+
+        // and then do linear scan for any unconstrained virtual registers
+        'allocate: for (key, reg) in virts {
+            if reg.backing.is_some() { continue; }
+            let (start, end) = (
+                self.ports[*reg.ports.first().unwrap()].time.unwrap(),
+                self.ports[*reg.ports.last().unwrap()].time.unwrap()
+            );
+            println!("allocating virtual register alive {}-{}", start, end);
+            let range = start..=end;
+            // try to use a free register
+            for candidate in reg.hints.iter().chain(REGS.iter()) {
+                let reg_live = live.entry(*candidate).or_insert_with(|| {
+                    println!("first allocation for {} unconstrained at {:?}", candidate, range); RangeInclusiveMap::new()
+                });
+                let already = reg_live.get_key_value(range.start());
+                if let Some(overlap) = already {
+                    continue;
+                }
+                // we have a free register for this time slice
+                reg_live.insert(range.clone(), *key);
+                reg.backing = Some(*candidate);
+                println!("allocated unconstrained {} register {} {:?}", *key, candidate, range);
+                continue 'allocate;
+            }
+            panic!("couldn't allocate");
+
+        }
+
     }
 
     pub fn replace_virtual_with_backing(&mut self, virts: &mut VirtualRegisterMap) {
@@ -932,6 +871,9 @@ impl NodeBehavior for NodeVariant::Move {
         let sink = &r.ports[outputs[0]];
         match (sink.storage.as_ref().unwrap(), source.storage.as_ref().unwrap()) {
             (Storage::Physical(r0), Storage::Physical(r1)) => {
+                // we can simply not emit any move at all if it was trying to move
+                // a register into itself
+                if r0 == r1 { return;; }
                 match (r0.class(), r1.class()) {
                     (register_class::Q, register_class::Q) =>
                         dynasm!(ops
