@@ -159,6 +159,7 @@ pub struct Region {
     order: Vec<usize>,
 }
 
+#[derive(Clone)]
 struct VirtualRegister {
     ports: Vec<PortIdx>, // these are reversed: the 0th element is the last port that uses it
     hints: HashSet<RegSpec>,
@@ -313,6 +314,8 @@ impl Region {
 
         // We have a set of all the ports and edges between them
         let mut ports_edges: Vec<_> = ports.edge_references().collect();
+        ports_edges.sort_by_key(|e| self.ports[e.target()].time);
+        ports_edges.reverse();
         // And we repeatedly propogate any edges we can. If we do propogate, we
         // can remove it from the working set for next iteration.
         // This is pretty slow, but who cares for now tbh.
@@ -330,6 +333,7 @@ impl Region {
                 if let (None, _) = (*sink.storage, *source.storage) {
                     // We don't have a target storage to progate upwards, so
                     // have to try against next time
+                    println!("skip");
                     return true
                 }
                 let (sink_backing, source_backing) = (
@@ -511,8 +515,22 @@ impl Region {
             }
         }
 
-        // and then do linear scan for any unconstrained virtual registers
-        'allocate: for (key, reg) in virts {
+        // and then do reverse linear scan for any unconstrained virtual registers
+        let vregs = virts.clone();
+        let mut vregs = vregs.iter()
+            .collect::<Vec<_>>();
+        vregs.sort_by(|(_, v0), (_, v1)| {
+            // We want registers with hints scheduled first, and registers with
+            // a *smaller* hint set to be scheduled sooner also
+            let v0_time = self.ports[*v0.ports.first().unwrap()].time;
+            let v0_hints = v0.hints.len();
+            let v1_time = self.ports[*v1.ports.first().unwrap()].time;
+            let v1_hints = v1.hints.len();
+            (v0_hints == 0).cmp(&(v1_hints == 0))
+            .then(v0_hints.cmp(&v1_hints))
+            .then(v0_time.cmp(&v1_time))
+        });
+        'allocate: for (key, reg) in vregs.drain(..) {
             if reg.backing.is_some() { continue; }
             let (start, end) = (
                 self.ports[*reg.ports.first().unwrap()].time.unwrap(),
@@ -521,6 +539,7 @@ impl Region {
             println!("allocating virtual register alive {}-{}", start, end);
             let range = start..=end;
             // try to use a free register
+            println!("hints {:?}", reg.hints);
             for candidate in reg.hints.iter().chain(REGS.iter()) {
                 let reg_live = live.entry(*candidate).or_insert_with(|| {
                     println!("first allocation for {} unconstrained at {:?}", candidate, range); RangeInclusiveMap::new()
@@ -531,12 +550,24 @@ impl Region {
                 }
                 // we have a free register for this time slice
                 reg_live.insert(range.clone(), *key);
-                reg.backing = Some(*candidate);
+                virts.get_mut(key).unwrap().backing = Some(*candidate);
                 println!("allocated unconstrained {} register {} {:?}", *key, candidate, range);
                 continue 'allocate;
             }
             panic!("couldn't allocate");
 
+        }
+
+        // print out a pretty graph of the register live ranges
+        let len = 10;
+        for reg in live {
+            let mut graph: String = "[".to_owned() + &" ".repeat(len) + &"]".to_owned();
+            for range in reg.1 {
+                let size = range.0.end() - range.0.start();
+                let new = (range.0.start() + 1)..(range.0.end() + 1);
+                graph.replace_range(new, &"=".repeat(size));
+            }
+            println!("{}: {}", reg.0, graph);
         }
 
     }
@@ -873,7 +904,7 @@ impl NodeBehavior for NodeVariant::Move {
             (Storage::Physical(r0), Storage::Physical(r1)) => {
                 // we can simply not emit any move at all if it was trying to move
                 // a register into itself
-                if r0 == r1 { return;; }
+                if r0 == r1 { return; }
                 match (r0.class(), r1.class()) {
                     (register_class::Q, register_class::Q) =>
                         dynasm!(ops
