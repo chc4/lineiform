@@ -530,24 +530,33 @@ impl Region {
             .then(v0_hints.cmp(&v1_hints))
             .then(v0_time.cmp(&v1_time))
         });
+        let mut last = 0;
         'allocate: for (key, reg) in vregs.drain(..) {
             if reg.backing.is_some() { continue; }
             let (start, end) = (
                 self.ports[*reg.ports.first().unwrap()].time.unwrap(),
                 self.ports[*reg.ports.last().unwrap()].time.unwrap()
             );
+            last = max(last, end);
             println!("allocating virtual register alive {}-{}", start, end);
             let range = start..=end;
             // try to use a free register
             println!("hints {:?}", reg.hints);
-            for candidate in reg.hints.iter().chain(REGS.iter()) {
+            'candidate: for candidate in reg.hints.iter().chain(REGS.iter()) {
                 let reg_live = live.entry(*candidate).or_insert_with(|| {
                     println!("first allocation for {} unconstrained at {:?}", candidate, range); RangeInclusiveMap::new()
                 });
-                let already = reg_live.get_key_value(range.start());
-                if let Some(overlap) = already {
-                    continue;
+                let already = reg_live.gaps(&range);
+                let mut empty = false;
+                for gap in already {
+                    println!("gap {:?}", gap);
+                    if gap.start() != range.start() || gap.end() != range.end() {
+                        continue 'candidate;
+                    }
+                    empty = true;
+                    break;
                 }
+                if !empty { continue 'candidate };
                 // we have a free register for this time slice
                 reg_live.insert(range.clone(), *key);
                 virts.get_mut(key).unwrap().backing = Some(*candidate);
@@ -559,9 +568,8 @@ impl Region {
         }
 
         // print out a pretty graph of the register live ranges
-        let len = 10;
         for reg in live {
-            let mut graph: String = "[".to_owned() + &" ".repeat(len) + &"]".to_owned();
+            let mut graph: String = "[".to_owned() + &" ".repeat(last) + &"]".to_owned();
             for range in reg.1 {
                 let size = range.0.end() - range.0.start();
                 let new = (range.0.start() + 1)..(range.0.end() + 1);
@@ -1284,6 +1292,32 @@ mod test {
         ir.set_body(f);
         let hello_fn: extern "C" fn((usize, usize)) -> (usize, usize) = ir.compile_fn().unwrap();
         assert_eq!(hello_fn((1, 2)), (2, 3));
+    }
+
+    #[test]
+    pub fn function_inc_a_lot() {
+        let mut ir = IR::new();
+        let mut f = Node::function::<1, 1>(&mut ir);
+        let mut input = f.add_argument(&mut ir);
+        let output = f.add_return(&mut ir);
+        // TODO: make the port virtual register proprogation better so we can
+        // bump this up
+        let count = 200;
+        for i in 0..count {
+            let mut inc_0 = Node::simple(Operation::Inc);
+            f.add_body(inc_0, &mut ir, |inc, r| {
+                inc.connect_input(0, input, r);
+                input = inc.sinks()[0];
+            });
+        }
+        ir.in_region(f.region, |r, ir| {
+            r.connect_ports(input, output);
+        });
+
+
+        ir.set_body(f);
+        let hello_fn: extern "C" fn(usize) -> (usize) = ir.compile_fn().unwrap();
+        assert_eq!(hello_fn(0), count);
     }
 
 }
