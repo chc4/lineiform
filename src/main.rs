@@ -2,7 +2,6 @@
 #![deny(unused_must_use, improper_ctypes_definitions)]
 #![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, inline_const, inherent_associated_types, associated_type_bounds, let_chains, asm, destructuring_assignment)]
 //extern crate nom;
-extern crate jemallocator;
 extern crate thiserror;
 #[macro_use]
 extern crate enum_display_derive;
@@ -24,16 +23,11 @@ use std::fmt::Display;
 //use parser::parse_expr;
 //mod closure;
 //use closure::{CompileError, EvalError, compile_expr, generate_closure};
-mod tracer;
-use tracer::{Tracer, TracerError};
-mod block;
-use block::{Function, BlockError};
-mod lift;
-use lift::{Jit, LiftError};
-mod lineiform;
+extern crate lineiform;
 use lineiform::{Lineiform};
-mod ir;
-use ir::IR;
+use lineiform::tracer::{Tracer, TracerError};
+use lineiform::block::{Function, BlockError};
+use lineiform::lift::{Jit, LiftError, Location, JitValue};
 
 use std::collections::HashMap;
 
@@ -119,9 +113,7 @@ fn main() -> Result<(), MainError> {
         a + Wrapping(2)
     }
 
-    use crate::lift::Location;
     use yaxpeax_x86::long_mode::RegSpec;
-    use crate::lift::JitValue;
     let mut tracer = Tracer::new()?;
     let assumed_test = Function::<(usize, usize), usize>::new(&mut tracer, test as *const ())?
         .assume_args(vec![(Location::Reg(RegSpec::rdi()), JitValue::Const(Wrapping(3)))]);
@@ -174,6 +166,7 @@ fn test_jit() -> Result<(), MainError> {
 
 #[cfg(test)]
 mod test {
+    use crate::*;
     #[test]
     pub fn test_can_pin_argument() -> Result<(), crate::MainError> {
         use core::num::Wrapping;
@@ -181,9 +174,6 @@ mod test {
             a + Wrapping(2)
         }
 
-        use crate::lift::*;
-        use crate::tracer::Tracer;
-        use crate::block::Function;
         use yaxpeax_x86::long_mode::RegSpec;
         let mut tracer = Tracer::new()?;
         let assumed_test = Function::<(usize, usize), usize>::new(&mut tracer, test as *const ())?
@@ -206,6 +196,18 @@ mod test {
         use core::hint::black_box;
         let clos = jit.speedup(move |()| { black_box(a) + Wrapping(2) });
         assert_eq!(clos(()), Wrapping(3));
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_can_optimize_two_closures() -> Result<(), crate::MainError> {
+        use core::num::Wrapping;
+        let a: Wrapping<usize> = Wrapping(1);
+        let mut jit = crate::Lineiform::new();
+        use core::hint::black_box;
+        let clos1 = black_box(move |()| { black_box(a) });
+        let clos2 = jit.speedup(move |()| { black_box(clos1)(()) + Wrapping(2) });
+        assert_eq!(clos2(()), Wrapping(3));
         Ok(())
     }
 

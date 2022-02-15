@@ -7,6 +7,24 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+thiserror = "1.0"
+enum-display-derive = "0.1.1"
+yaxpeax-arch = "0.2.5"
+goblin = "0.4"
+cranelift = "0.75.0"
+cranelift-codegen = "0.75.0"
+cranelift-jit = "0.75.0"
+cranelift-module = "0.75.0"
+target-lexicon = "0.12.1"
+bitvec = "0.22.3"
+bitflags = "1.3.1"
+rangemap = "0.1.11"
+lineiform = { path = "./lineiform" }
+
+[dependencies.yaxpeax-x86]
+version = "1.0.4"
+features = ["fmt"]
+path = "../yaxpeax-x86" # FIXME when yax x86 1.1 comes out
 
 [profile.dev]
 opt-level = 2 # we use tailcalls a lot, which will blow the stack on O0
