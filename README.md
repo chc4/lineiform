@@ -3,6 +3,8 @@
 Lineiform is a meta-JIT library for Rust interpreters. Given an interpreter that uses closure generation, it allows an author to add minimal annotations and calls into Lineiform in order to automagically get an optimizing method JIT, via runtime function inlining and constant propagation to resolve dynamic calls to closed environment members. Internally it does lifting of closure bodies from x86 assembly to Cranelift IR for dynamic recompilation.
 
 # The Big Idea
+(There's a [blog post](https://blog.redvice.org/2022/lineiform-rust-meta-jit/) now).
+
 A normal tree-walking interpreter in Rust looks like this: (pseudocode but not much)
 ```rust
 fn eval(ast: Ast) -> usize {
@@ -53,15 +55,16 @@ You can create a JIT and feed it a closure, which does some constant propagation
 ## What doesn't
 The main missing lifting features are 1) it never merges divergant flow control back together 2) it doesn't handle loops at all 3) all operations are (currently) zero extended, instead of being zero or sign extended depending on the instruction. And just a whole bunch of instructions, of course, since I've mostly only been implementing exactly as much as I require to pass each test I add. C'est la vie.
 
-# A freezing allocator
-Currently we inline loads from a reference to our closed environment. This is good, but it doesn't scale: we also want to inline *functions of functions* we call, which requires us to also inline loads for closures that we are closed over. We can't just recursively inline everything from our environment, however, because our upvalues may have interior mutability that would invalidate our compiled function.
-Instead, we can use a freezing allocator: all closures that are candidates for inlining you `jit.freeze(move |e: Env| { ... body ... })`, which copies it to a read-only memory region. We can then inline any loads from pointers that are inside the frozen memory region, allowing us to recursively inline environments from any closure starting point.
-This has the small downside of causing segfaults if you have a `RefCell<usize>` in your environment and try to mutate it. That's a niche enough case, and easy enough to debug, that I'm just not going to worry about it: more complex interior mutable datastructures would be a pointer chase or more away, and so unfrozen and non-inlinable.
+# Warning
+This is extremely unsafe and under construction. It will silently miscompile closures so that they return the wrong values and/or eat your socks. The entire idea of using dynamic recompilation for a JIT is ill informed and foolish; the author is the epitome of hubris. There are dragons contained within.
+
+No license or warranty is provided. If you want to use it and care about licensing things, get in touch [on Twitter](https://twitter.com/sickeningsprawl).
 
 # TODO list
 - [x] Disassembling functions
 - [x] Lifting x86 to Cranelift IR
     - [ ] Enough instructions that anything non-trivial doesn't crash
+    - [ ] Tear out Cranelift and use our home-rolled Tangle IR instead
 - [x] Branches
     - [ ] Merging divergant flow back together
 - [ ] Loops

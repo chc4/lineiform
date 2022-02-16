@@ -504,10 +504,17 @@ impl Region {
                 let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
                     println!("first allocation for constrained {} at {:?}", reg.backing.unwrap(), range); RangeInclusiveMap::new()
                 });
-                let already = reg_live.get_key_value(range.start());
-                if let Some(overlap) = already {
-                    panic!("uh oh");
+                let already = reg_live.gaps(&range);
+                let mut empty = false;
+                for gap in already {
+                    println!("gap {:?}", gap);
+                    if gap.start() != range.start() || gap.end() != range.end() {
+                        panic!("bad gap");
+                    }
+                    empty = true;
+                    break;
                 }
+                if !empty { panic!("uh oh"); };
                 reg_live.insert(range.clone(), *key);
                 println!("allocated constrained {} register {} {:?}", *key, reg.backing.unwrap(), range);
                 // we were able to allocate the physical register requirement
@@ -702,9 +709,6 @@ mod NodeVariant {
     // The paper also has "Phi-Nodes" (mutually recursive functions) and
     // "Omega-Nodes" (translation units). We only ever JIT one function at a time.
 }
-// this is dumb, but rust's type inference chokes on the builder functions without
-// an explicit NodeVariant type, so just give it this.
-type S = NodeVariant::Simple;
 
 pub trait NodeBehavior: core::fmt::Debug {
     fn set_time(&mut self, time: usize) {
