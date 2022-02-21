@@ -14,10 +14,6 @@ dynasmrt = "1.1.0"
 ena = "0.14.0"
 rangemap = "0.1.11"
 
-[dependencies.lineiform]
-version = "*"
-path = "../lineiform"
-
 [dependencies.yaxpeax-x86]
 version = "1.0.4"
 features = ["fmt"]

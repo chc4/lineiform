@@ -1,6 +1,6 @@
 #![allow(unused_imports, unused_parens)]
 #![deny(unused_must_use, improper_ctypes_definitions)]
-#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, inline_const, inherent_associated_types, associated_type_bounds, let_chains, asm, destructuring_assignment)]
+#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, associated_type_bounds, asm, destructuring_assignment, generic_const_exprs)]
 
 #[deny(bare_trait_objects)]
 extern crate jemallocator;
@@ -10,13 +10,10 @@ extern crate enum_display_derive;
 extern crate yaxpeax_arch;
 extern crate yaxpeax_x86;
 extern crate goblin;
-extern crate cranelift;
-extern crate cranelift_jit;
-extern crate cranelift_codegen;
-extern crate target_lexicon;
 extern crate bitvec;
 extern crate bitflags;
 extern crate rangemap;
+extern crate tangle;
 use yaxpeax_x86::long_mode::{Operand, Instruction, RegSpec, Opcode};
 use std::collections::HashMap;
 use core::marker::PhantomData;
@@ -31,7 +28,7 @@ pub mod block;
 use crate::lift::JitValue;
 
 /// Rust closures are rust-call calling convention only. This is a problem, since
-/// we want to lift them to Cranelift, and we don't know what registers are "live"
+/// we want to lift them to our IR, and we don't know what registers are "live"
 /// at the start and end. We instead make it so that making a Function from an Fn
 /// actually starts the trace from the Trampoline call for the correct type,
 /// with it's call being extern "C". Rustc then emits a stdcall -> rust-call
@@ -90,8 +87,8 @@ pub struct Lineiform<A, O> {
     tracer: Tracer<'static>,
 }
 
+use std::mem::size_of;
 impl<A: std::fmt::Debug, O> Lineiform<A, O> {
-    type JitFn = fn(A) -> O;
     pub fn new() -> Self {
         Self {
             tracer: Tracer::new().unwrap(),
@@ -100,7 +97,11 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
         }
     }
 
-    pub fn speedup<F>(&mut self, f: F) -> impl Fn(A)->O where F: Fn(A)->O {
+    pub fn speedup<F>(&mut self, f: F) -> impl Fn(A)->O where
+        F: Fn(A)->O,
+        [(); size_of::<A>()]: Sized,
+        [(); size_of::<O>()]: Sized
+    {
         // We are given a [data, trait] fat pointer for f.
         // We want to feed c_fn into our lifter, calling F::call as arg 1, with
         // data as our argument 2.

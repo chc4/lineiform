@@ -11,8 +11,6 @@
 // itself is already reasonably optimized just by LLVM when it is first emitted,
 // we just want to elide checks and stop everything from moving back and forth for
 // the function ABI for each inlined closure body.
-use lineiform::lift::{JitValue, JitTemp};
-use lineiform::block::{Function};
 use petgraph::prelude::*;
 use petgraph::stable_graph::StableGraph;
 use petgraph::graph::{NodeIndex};
@@ -160,7 +158,7 @@ pub struct Region {
 }
 
 #[derive(Clone)]
-struct VirtualRegister {
+pub struct VirtualRegister {
     ports: Vec<PortIdx>, // these are reversed: the 0th element is the last port that uses it
     hints: HashSet<RegSpec>,
     backing: Option<RegSpec>,
@@ -633,7 +631,7 @@ impl Region {
 #[derive(Debug)]
 pub enum Operation {
     Nop,
-    Constant(JitTemp),
+    Constant(usize),
     Apply, // Call a Function node with arguments
     Inc,
     Add,
@@ -709,6 +707,8 @@ mod NodeVariant {
     // The paper also has "Phi-Nodes" (mutually recursive functions) and
     // "Omega-Nodes" (translation units). We only ever JIT one function at a time.
 }
+
+pub use NodeVariant::*;
 
 pub trait NodeBehavior: core::fmt::Debug {
     fn set_time(&mut self, time: usize) {
@@ -1116,7 +1116,7 @@ impl IR {
         (ops, start, end.0 - start.0)
     }
 
-    pub fn compile_fn<A, O>(&mut self) -> Result<extern "C" fn(A) -> O, Box<dyn std::error::Error>> {
+    pub fn compile_fn<A, O>(&mut self) -> Result<(extern "C" fn(A) -> O, usize), Box<dyn std::error::Error>> {
         self.regalloc();
         self.validate();
         let (mut ops, off, size) = self.codegen();
@@ -1135,7 +1135,7 @@ impl IR {
         }
         println!("{}", fmt);
         std::mem::forget(buf);
-        Ok(hello_fn)
+        Ok((hello_fn, size))
     }
 
     pub fn print(&self) {
@@ -1266,10 +1266,6 @@ mod test {
         });
         ir.set_body(f);
 
-        extern "C" fn foo(a: usize, b: usize) -> usize {
-            (a + 1) + (b + 1)
-        }
-        assert_eq!(foo(1, 2), 5);
         let hello_fn: extern "C" fn((usize, usize)) -> usize = ir.compile_fn().unwrap();
         assert_eq!(hello_fn((1, 2)), 5);
     }
