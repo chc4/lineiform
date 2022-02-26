@@ -498,6 +498,7 @@ impl Region {
         // Add all the constrained registers first
         for (key, reg) in &mut *virts {
             if reg.backing.is_some() {
+                println!("---- constrained {}", key);
                 let range = self.ports[*reg.ports.first().unwrap()].time.unwrap()..=self.ports[*reg.ports.last().unwrap()].time.unwrap();
                 let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
                     println!("first allocation for constrained {} at {:?}", reg.backing.unwrap(), range); RangeInclusiveMap::new()
@@ -523,6 +524,7 @@ impl Region {
         // and then do reverse linear scan for any unconstrained virtual registers
         let vregs = virts.clone();
         let mut vregs = vregs.iter()
+            .filter(|(_, r)| r.backing.is_none() )
             .collect::<Vec<_>>();
         vregs.sort_by(|(_, v0), (_, v1)| {
             // We want registers with hints scheduled first, and registers with
@@ -537,7 +539,7 @@ impl Region {
         });
         let mut last = 0;
         'allocate: for (key, reg) in vregs.drain(..) {
-            if reg.backing.is_some() { continue; }
+            println!("---- uncontrained {}", key);
             let (start, end) = (
                 self.ports[*reg.ports.first().unwrap()].time.unwrap(),
                 self.ports[*reg.ports.last().unwrap()].time.unwrap()
@@ -574,10 +576,10 @@ impl Region {
 
         // print out a pretty graph of the register live ranges
         for reg in live {
-            let mut graph: String = "[".to_owned() + &" ".repeat(last) + &"]".to_owned();
+            let mut graph: String = "[".to_owned() + &" ".repeat(last*2) + &"]".to_owned();
             for range in reg.1 {
-                let size = range.0.end() - range.0.start();
-                let new = (range.0.start() + 1)..(range.0.end() + 1);
+                let size = (range.0.end() + 1) - range.0.start();
+                let new = (range.0.start() + 1)..(range.0.end() + 2);
                 graph.replace_range(new, &"=".repeat(size));
             }
             println!("{}: {}", reg.0, graph);
@@ -824,6 +826,7 @@ impl NodeBehavior for NodeVariant::Simple {
         match &self.0 {
             Operation::Inc => 1,
             Operation::Add => 2,
+            Operation::Constant(_) => 0,
             _ => unimplemented!(),
         }
     }
@@ -832,6 +835,7 @@ impl NodeBehavior for NodeVariant::Simple {
         match &self.0 {
             Operation::Inc => 1,
             Operation::Add => 1,
+            Operation::Constant(_) => 1,
             _ => unimplemented!(),
         }
     }
@@ -869,7 +873,19 @@ impl NodeBehavior for NodeVariant::Simple {
                     },
                     _ => unimplemented!(),
                 }
-            }
+            },
+            Operation::Constant(n) => {
+                let output = &r.ports[outputs[0]];
+                match output.storage.as_ref().unwrap() {
+                    Storage::Physical(r0) => match r0.class() {
+                        register_class::Q => dynasm!(ops
+                            ; mov Rq(r0.num()), (*n).try_into().unwrap()
+                        ),
+                        x => unimplemented!("unknown class {:?} for constant", x),
+                    },
+                    _ => unimplemented!(),
+                }
+            },
             x => unimplemented!("unimplemented codegen for {:?}", x),
         }
     }
@@ -878,9 +894,10 @@ impl NodeBehavior for NodeVariant::Simple {
         println!("{:?} <- {:?} ", outputs, inputs);
         match &self.0 {
             Operation::Inc =>
-                r.connect_ports(inputs[0], outputs[0]),
+                { r.connect_ports(inputs[0], outputs[0]); },
             Operation::Add =>
-                r.connect_ports(inputs[0], outputs[0]),
+                { r.connect_ports(inputs[0], outputs[0]); },
+            Operation::Constant(_) => {},
             _ => unimplemented!("ports_callback for {:?}", self.tag()),
         };
     }
@@ -889,6 +906,7 @@ impl NodeBehavior for NodeVariant::Simple {
         match &self.0 {
             Operation::Inc => "inc".to_string(),
             Operation::Add => "add".to_string(),
+            Operation::Constant(n) => n.to_string(),
             _ => unimplemented!(),
         }
     }
@@ -910,8 +928,8 @@ impl NodeBehavior for NodeVariant::Move {
     }
 
     fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
-        let source = &r.ports[inputs[0]];
         let sink = &r.ports[outputs[0]];
+        let source = &r.ports[inputs[0]];
         match (sink.storage.as_ref().unwrap(), source.storage.as_ref().unwrap()) {
             (Storage::Physical(r0), Storage::Physical(r1)) => {
                 // we can simply not emit any move at all if it was trying to move
@@ -1197,7 +1215,7 @@ mod test {
             inc.connect_output(0, ret_port, r);
         });
         ir.set_body(f);
-        let hello_fn: extern "C" fn(usize) -> usize = ir.compile_fn().unwrap();
+        let hello_fn: extern "C" fn(usize) -> usize = ir.compile_fn().unwrap().0;
         assert_eq!(hello_fn(1), 2);
     }
 
@@ -1215,7 +1233,7 @@ mod test {
             add.connect_output(0, ret_port, r);
         });
         ir.set_body(f);
-        let hello_fn: extern "C" fn((usize, usize)) -> usize = ir.compile_fn().unwrap();
+        let hello_fn: extern "C" fn((usize, usize)) -> usize = ir.compile_fn().unwrap().0;
         assert_eq!(hello_fn((1, 2)), 3);
     }
 
@@ -1239,7 +1257,7 @@ mod test {
         });
 
         ir.set_body(f);
-        let hello_fn: extern "C" fn((usize, usize)) -> (usize, usize) = ir.compile_fn().unwrap();
+        let hello_fn: extern "C" fn((usize, usize)) -> (usize, usize) = ir.compile_fn().unwrap().0;
         assert_eq!(hello_fn((1, 2)), (2, 3));
     }
 
@@ -1266,7 +1284,7 @@ mod test {
         });
         ir.set_body(f);
 
-        let hello_fn: extern "C" fn((usize, usize)) -> usize = ir.compile_fn().unwrap();
+        let hello_fn: extern "C" fn((usize, usize)) -> usize = ir.compile_fn().unwrap().0;
         assert_eq!(hello_fn((1, 2)), 5);
     }
 
@@ -1290,7 +1308,7 @@ mod test {
         });
 
         ir.set_body(f);
-        let hello_fn: extern "C" fn((usize, usize)) -> (usize, usize) = ir.compile_fn().unwrap();
+        let hello_fn: extern "C" fn((usize, usize)) -> (usize, usize) = ir.compile_fn().unwrap().0;
         assert_eq!(hello_fn((1, 2)), (2, 3));
     }
 
@@ -1316,8 +1334,35 @@ mod test {
 
 
         ir.set_body(f);
-        let hello_fn: extern "C" fn(usize) -> (usize) = ir.compile_fn().unwrap();
+        let hello_fn: extern "C" fn(usize) -> (usize) = ir.compile_fn().unwrap().0;
         assert_eq!(hello_fn(0), count);
     }
+
+    #[test]
+    pub fn function_add_constant() {
+        let mut ir = IR::new();
+        let mut f = Node::function::<1, 1>(&mut ir);
+        let input = f.add_argument(&mut ir);
+        let output = f.add_return(&mut ir);
+
+        let mut two = Node::simple(Operation::Constant(2));
+        let mut add = Node::simple(Operation::Add);
+        let mut two_const = None;
+        f.add_body(two, &mut ir, |two, r| {
+            two_const = Some(two.sinks()[0]);
+        });
+        f.add_body(add, &mut ir, |add, r| {
+            add.connect_input(0, input, r);
+            add.connect_input(1, two_const.unwrap(), r);
+            add.connect_output(0, output, r);
+        });
+
+        ir.set_body(f);
+        let hello_fn: extern "C" fn(usize) -> usize = ir.compile_fn().unwrap().0;
+        assert_eq!(hello_fn(0), 2);
+        assert_eq!(hello_fn(1), 3);
+    }
+
+
 
 }
