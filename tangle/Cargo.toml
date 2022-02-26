@@ -13,6 +13,7 @@ dynasm = "1.1.0"
 dynasmrt = "1.1.0"
 ena = "0.14.0"
 rangemap = "0.1.11"
+frunk = "0.4.0"
 
 [dependencies.yaxpeax-x86]
 version = "1.0.4"

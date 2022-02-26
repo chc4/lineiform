@@ -23,6 +23,9 @@ use dynasmrt::x64::Assembler;
 use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
 use core::cmp::max;
+use frunk::prelude::*;
+use frunk::hlist::*;
+use frunk::*;
 
 // yaxpeax decoder example
 mod decoder {
@@ -71,6 +74,7 @@ pub type NodeIdx = NodeIndex;
 pub enum Storage {
     Virtual(u16), // todo: width?
     Physical(RegSpec),
+    Immaterial, // used for constant operands and state edges - does not receive a vreg
 }
 
 impl core::fmt::Display for Storage {
@@ -78,6 +82,7 @@ impl core::fmt::Display for Storage {
         match self {
             Storage::Virtual(v) => write!(fmt, "v{}", v),
             Storage::Physical(p) => write!(fmt, "{}", p),
+            Storage::Immaterial => write!(fmt, "imm"),
         }
     }
 }
@@ -100,11 +105,20 @@ impl Deref for OptionalStorage {
     }
 }
 
+mod PortMeta {
+    use frunk::HList;
+    #[derive(Debug, Clone)]
+    pub struct Constant(pub usize);
+    #[derive(Debug, Clone)]
+    pub struct SomethingElse(pub f64);
+    pub type All = HList![Option<Constant>, Option<SomethingElse>];
+}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Port {
     id: u32,
     variant: EdgeVariant,
+    meta: Option<PortMeta::All>,
     storage: OptionalStorage,
     time: Option<usize>,
     done: bool,
@@ -118,12 +132,49 @@ impl Port {
         let curr = *guard;
         *guard += 1;
         println!("created port v{:?}", curr);
-        Port { id: curr, variant: EdgeVariant::Data, storage: OptionalStorage(None), time: None, done: false, node: None }
+        Port {
+            id: curr,
+            variant: EdgeVariant::Data,
+            storage: OptionalStorage(None),
+            time: None,
+            done: false,
+            node: None,
+            meta: None,
+        }
     }
 
     pub fn set_storage(&mut self, store: Storage) {
         assert!(self.variant != EdgeVariant::State, "tried to set storage on a state port");
         self.storage = OptionalStorage(Some(store));
+    }
+
+    pub fn set_meta<'this, 'a, K, T>(&'this mut self, meta_val: K) where
+        PortMeta::All: LiftFrom<Option<K>, T>,
+        <PortMeta::All as ToMut<'this>>::Output: Plucker<&'a mut Option<K>, T>,
+        Option<K>: core::fmt::Debug,
+        'this: 'a,
+        K: 'static,
+    {
+        if let None = self.meta {
+            let x: Option<PortMeta::All> = Some(Some(meta_val).lift_into());
+            self.meta = x;
+        } else {
+            self.meta.as_mut().map(|mut m| {
+                let (head, _): (&'a mut Option<K>, _) = m.to_mut().pluck();
+                *head = Some(meta_val);
+            });
+        }
+    }
+
+    pub fn get_meta<'this, 'a, K, T>(&'this self) -> Option<&'a K> where
+        <PortMeta::All as ToRef<'a>>::Output: Plucker<&'this Option<K>, T>,
+        K: 'static + Clone,
+        'this: 'a,
+    {
+        self.meta.as_ref().and_then(|m| {
+            let (head, _) = m.to_ref().pluck::<&'this Option<K>, _>();
+             head.as_ref()
+        })
     }
 
     pub fn set_node(&mut self, n: NodeIdx) {
@@ -284,6 +335,53 @@ impl Region {
         self.ports[port].set_storage(store)
     }
 
+    /// If instructions that use constants can fix the constant in an operand,
+    /// convert them to that instead of using a virtual register
+    pub fn move_constants_to_operands(&mut self) {
+        let mut consts = self.nodes.node_weights_mut().map(|mut n| {
+            let sinks = n.sinks();
+            let mut s = (&mut *n.variant as &mut (dyn core::any::Any + 'static)).downcast_mut::<NodeVariant::Simple>();
+            s.as_mut().map(|mut s| { if let Operation::Constant(c) = s.0 {
+                println!("constant {}", c);
+                let mut uses = self.ports.neighbors_directed(sinks[0], Direction::Incoming).detach();
+                let has_uses = false;
+                while let Some((an_edge, a_use)) = uses.next(&self.ports) {
+                    //let node_use = &self.nodes[self.ports[a_use].node.unwrap()];
+                    // TODO: sanity check that the instruction supports an operand
+                    // of the given width, set has_uses = true if so
+                    //println!("used {:?}", node_use);
+                    let port_use = &mut self.ports[a_use];
+                    // we can set the port to be immaterial instead
+                    port_use.set_storage(Storage::Immaterial);
+                    // and that it is a constant value
+                    port_use.set_meta(PortMeta::Constant(c));
+                    // and that it doesn't depend on the constant node anymore
+                    self.ports.remove_edge(an_edge);
+                }
+
+                if !has_uses {
+                    s.0 = Operation::Nop;
+                }
+            }})
+        }).for_each(drop);
+    }
+
+    pub fn remove_nops(&mut self) {
+        let mut removed = HashSet::new();
+        self.nodes.retain_nodes(|node, idx| {
+            let mut s = (&*node[idx].variant as &(dyn core::any::Any + 'static)).downcast_ref::<NodeVariant::Simple>();
+            s.map_or_else(|| true, |s| if let Operation::Nop = s.0 {
+                removed.insert(idx);
+                false
+            } else { true })
+        });
+
+        self.ports.retain_nodes(|port, idx| {
+            port[idx].node.map_or_else(|| true, |n| !removed.contains(&n))
+        })
+    }
+
+    /// Create and populate virtual registers for all ports
     pub fn create_virtual_registers(&mut self) -> VirtualRegisterMap {
         let mut reg = 0;
         let mut virts: VirtualRegisterMap = HashMap::new();
@@ -324,8 +422,8 @@ impl Region {
             println!("propogating edges, {} left", ports_edges.len());
             println!("{:?}", ports_edges);
             ports_edges = ports_edges.drain(..).filter(|e| {
-                let mut source = self.ports[e.target()];
-                let mut sink = self.ports[e.source()];
+                let mut source = &self.ports[e.target()];
+                let mut sink = &self.ports[e.source()];
                 println!("v{} <- v{}", sink.id, source.id);
                 println!("storages {} <- {}", sink.storage, source.storage);
                 if let (None, _) = (*sink.storage, *source.storage) {
@@ -406,7 +504,11 @@ impl Region {
         // Make sure all ports have storages now
         for p in self.ports.node_indices() {
             assert!(self.ports[p].storage.is_some(), "port {:?} without storage", p);
-            let vreg = if let Storage::Virtual(v) = self.ports[p].storage.unwrap() { v } else { panic!("port {:?} has physical storage", p) };
+            let vreg = match self.ports[p].storage.unwrap() {
+                Storage::Virtual(v) => v,
+                Storage::Physical(p) => panic!("port {:?} has physical storage", p),
+                Storage::Immaterial => continue,
+            };
             // and add them to their virtual registers' port list
             virts.get_mut(&vreg.into()).unwrap().ports.push(p);
         }
@@ -667,7 +769,7 @@ mod NodeVariant {
             &mut self,
             mut n: T,
             ir: &mut IR,
-            f: F) -> NodeIdx where F: FnOnce(&mut Node, &mut Region) -> (), T: NodeBehavior + 'static + core::fmt::Debug
+            f: F) -> NodeIdx where F: FnOnce(&mut Node, &mut Region) -> (), T: NodeBehavior + core::any::Any + 'static + core::fmt::Debug
         {
             ir.in_region(self.region, |mut r, ir| {
                 r.add_node(n, f)
@@ -712,7 +814,7 @@ mod NodeVariant {
 
 pub use NodeVariant::*;
 
-pub trait NodeBehavior: core::fmt::Debug {
+pub trait NodeBehavior: core::fmt::Debug + core::any::Any {
     fn set_time(&mut self, time: usize) {
        unimplemented!();
     }
@@ -871,6 +973,13 @@ impl NodeBehavior for NodeVariant::Simple {
                         ),
                         x => unimplemented!("unknown class {:?} for add", x),
                     },
+                    (Storage::Physical(r0), Storage::Immaterial) => match r0.class() {
+                        register_class::Q => dynasm!(ops
+                            ; add Rq(r0.num()),
+                                operand_1.get_meta::<PortMeta::Constant, _>().unwrap().0.try_into().unwrap()
+                        ),
+                        x => unimplemented!("unknown class {:?} for add", x),
+                    }
                     _ => unimplemented!(),
                 }
             },
@@ -1095,6 +1204,8 @@ impl IR {
                 continue;
             }
             r.attach_ports();
+            r.move_constants_to_operands();
+            r.remove_nops();
             // Create virtual register storages for all nodes and ports
             let mut virt_map = r.create_virtual_registers();
             println!("created virtual registers");
@@ -1334,7 +1445,7 @@ mod test {
 
 
         ir.set_body(f);
-        let hello_fn: extern "C" fn(usize) -> (usize) = ir.compile_fn().unwrap().0;
+        let hello_fn: extern "C" fn(usize) -> usize = ir.compile_fn().unwrap().0;
         assert_eq!(hello_fn(0), count);
     }
 
@@ -1362,7 +1473,4 @@ mod test {
         assert_eq!(hello_fn(0), 2);
         assert_eq!(hello_fn(1), 3);
     }
-
-
-
 }
