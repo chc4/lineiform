@@ -340,7 +340,7 @@ impl Region {
     pub fn move_constants_to_operands(&mut self) {
         let mut consts = self.nodes.node_weights_mut().map(|mut n| {
             let sinks = n.sinks();
-            let mut s = (&mut *n.variant as &mut (dyn core::any::Any + 'static)).downcast_mut::<NodeVariant::Simple>();
+            let mut s = n.as_variant_mut::<NodeVariant::Simple>();
             s.as_mut().map(|mut s| { if let Operation::Constant(c) = s.0 {
                 println!("constant {}", c);
                 let mut uses = self.ports.neighbors_directed(sinks[0], Direction::Incoming).detach();
@@ -369,7 +369,7 @@ impl Region {
     pub fn remove_nops(&mut self) {
         let mut removed = HashSet::new();
         self.nodes.retain_nodes(|node, idx| {
-            let mut s = (&*node[idx].variant as &(dyn core::any::Any + 'static)).downcast_ref::<NodeVariant::Simple>();
+            let mut s = node[idx].as_variant::<NodeVariant::Simple>();
             s.map_or_else(|| true, |s| if let Operation::Nop = s.0 {
                 removed.insert(idx);
                 false
@@ -846,6 +846,14 @@ pub trait NodeBehavior: core::fmt::Debug + core::any::Any {
 }
 
 impl Node {
+    fn as_variant<T>(&self) -> Option<&T> where T: 'static {
+        (&*self.variant as &(dyn core::any::Any + 'static)).downcast_ref::<T>()
+    }
+
+    fn as_variant_mut<T>(&mut self) -> Option<&mut T> where T: 'static {
+        (&mut *self.variant as &mut (dyn core::any::Any + 'static)).downcast_mut::<T>()
+    }
+
     fn set_time(&mut self, time: usize) {
         self.time = time;
     }
