@@ -577,7 +577,7 @@ impl Region {
             // and give its ports the correct timings
             for p in n.sources() { self.ports[p].time = Some(n.time); }
             // TODO: latency
-            for p in n.sinks() { self.ports[p].time = Some(n.time.increment()); }
+            for p in n.sinks() { self.ports[p].time = Some(n.time.push()); }
         }
 
         // and our functions entry/exit ports also need a time
@@ -585,7 +585,7 @@ impl Region {
             self.ports[*p].time = Some(Timestamp::new());
         }
         for p in &self.sinks {
-            self.ports[*p].time = Some(final_time);
+            self.ports[*p].time = Some(final_time.push());
         }
 
         // sort the uses for virtual registers by timings for later
@@ -599,11 +599,13 @@ impl Region {
     // in order to create disjoint ranges
     pub fn optimize_vreg_live_ranges(&mut self, virts: &mut VirtualRegisterMap) {
         for (i, vreg) in virts {
-            let last = vreg.ports.last().unwrap();
-            //self.ports[*last].time.as_mut().map(|t| *t = t.pull());
-            //self.ports[*last].node.map(|n| { let n = &mut self.nodes[n]; n.time = n.time.pull() });
-            //vreg.ports.sort_by(|a, b| self.ports[*a].time.unwrap().partial_cmp(&self.ports[*b].time.unwrap()).unwrap());
+            //let last = vreg.ports.last().unwrap();
+            //self.ports[*last].time.as_mut().map(|t| *t = t.push());
+            //self.ports[*last].node.map(|n| { let n = &mut self.nodes[n]; n.time = n.time.push() });
 
+            //let first = vreg.ports.first().unwrap();
+            //self.ports[*first].time.as_mut().map(|t| *t = t.pull());
+            //self.ports[*first].node.map(|n| { let n = &mut self.nodes[n]; n.time = n.time.pull() });
         }
     }
 
@@ -627,7 +629,7 @@ impl Region {
                 println!("---- constrained {}", key);
                 let (start, end) = (
                     self.ports[*reg.ports.first().unwrap()].time.unwrap(),
-                    self.ports[*reg.ports.last().unwrap()].time.unwrap().increment()
+                    self.ports[*reg.ports.last().unwrap()].time.unwrap().push()
                 );
                 let range = start..=end;
                 let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
@@ -672,12 +674,22 @@ impl Region {
             println!("---- uncontrained {}", key);
             let (start, end) = (
                 self.ports[*reg.ports.first().unwrap()].time.unwrap(),
-                self.ports[*reg.ports.last().unwrap()].time.unwrap().increment()
+                self.ports[*reg.ports.last().unwrap()].time.unwrap()
             );
             last = max(last, end);
             println!("allocating virtual register alive {}-{}", start, end);
             let range = start..=end;
             // try to use a free register
+            // PROBLEM: we never actually create mov X, X; allocations anymore,
+            // since we can never have a register live as both an input and output
+            // in a timeslice anymore since otherwise mov X, Y; mov Z, X; would be
+            // legal, and we don't guarantee that they won't be re-orderer backwards
+            // when emitting instructions.
+            // SOLUTION: lol. lmao.
+            // we can check if reg_live.get(start.pull()) is set when we think the
+            // register is free. if so, we can get the instruction that is the use
+            // and sequence it before us, and only then use the register
+            // does this work???
             println!("hints {:?}", reg.hints);
             'candidate: for candidate in reg.hints.iter().chain(REGS.iter()) {
                 let reg_live = live.entry(*candidate).or_insert_with(|| {
@@ -694,8 +706,17 @@ impl Region {
                     break;
                 }
                 if !empty { continue 'candidate };
+                if let Some(last) = reg_live.get(&end.push()) {
+                    let last_use = self.ports[*virts[last].ports.first().unwrap()].node;
+                    if let Some(n) = last_use {
+                        let n = &mut self.nodes[n];
+                        n.time = n.time.decrement().push();
+                    } else {
+                        continue 'candidate
+                    }
+                }
                 // we have a free register for this time slice
-                reg_live.insert(range.clone(), *key);
+                reg_live.insert(start..=end.push(), *key);
                 virts.get_mut(key).unwrap().backing = Some(*candidate);
                 println!("allocated unconstrained {} register {} {:?}", *key, candidate, range);
                 continue 'allocate;
