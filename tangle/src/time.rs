@@ -20,7 +20,7 @@ impl Timestamp {
     pub fn new() -> Self {
         Timestamp {
             major: 0,
-            minor: 0,
+            minor: 8,
         }
     }
 
@@ -57,11 +57,11 @@ impl PartialOrd for Timestamp {
 
 impl StepLite for Timestamp {
     fn add_one(&self) -> Self {
-        self.increment()
+        self.push()
     }
 
     fn sub_one(&self) -> Self {
-        self.decrement()
+        self.pull()
     }
 }
 
