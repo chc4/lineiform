@@ -710,7 +710,8 @@ impl Region {
                     let last_use = self.ports[*virts[last].ports.first().unwrap()].node;
                     if let Some(n) = last_use {
                         let n = &mut self.nodes[n];
-                        n.time = n.time.decrement().push();
+                        if n.time.major != end.major { continue 'candidate }
+                        n.time = n.time.pull();
                     } else {
                         continue 'candidate
                     }
