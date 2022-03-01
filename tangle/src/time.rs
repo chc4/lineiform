@@ -55,6 +55,23 @@ impl PartialOrd for Timestamp {
     }
 }
 
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn timestamp_cmp() {
+        assert!(Timestamp::new() == Timestamp::new());
+        assert!(Timestamp::new() <= Timestamp::new());
+        assert!(Timestamp::new() >= Timestamp::new());
+        assert!(Timestamp::new().increment() > Timestamp::new());
+        assert!(Timestamp::new().push() > Timestamp::new());
+        assert!(Timestamp::new().push() < Timestamp::new().increment());
+        assert!(Timestamp::new().increment().push() > Timestamp::new().push());
+        assert!(Timestamp::new().increment().push() > Timestamp::new().increment());
+    }
+}
+
 impl StepLite for Timestamp {
     fn add_one(&self) -> Self {
         if self.minor == u16::MAX { let mut new = self.increment(); new.minor = u16::MIN; new }

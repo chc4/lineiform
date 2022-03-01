@@ -590,14 +590,21 @@ impl Region {
 
         // sort the uses for virtual registers by timings for later
         for (i, vreg) in virts {
-            self.ports[*vreg.ports.last().unwrap()].time.as_mut().map(|t| *t = t.pull());
-            self.ports[*vreg.ports.first().unwrap()].time.as_mut().map(|t| *t = t.push());
             vreg.ports.sort_by(|a, b| self.ports[*a].time.unwrap().partial_cmp(&self.ports[*b].time.unwrap()).unwrap());
-            // optimize virtual register lifetimes: if a port is the last use of a vreg
-            // it can be pulled backwards, if it's the first use it can be pushed later.
-            // this allows vreg uses in the time major timeslice to not conflict unneeded.
         }
 
+    }
+
+    // Push and pull instructions forward or backwards inside their major timeslice
+    // in order to create disjoint ranges
+    pub fn optimize_vreg_live_ranges(&mut self, virts: &mut VirtualRegisterMap) {
+        for (i, vreg) in virts {
+            let last = vreg.ports.last().unwrap();
+            //self.ports[*last].time.as_mut().map(|t| *t = t.pull());
+            //self.ports[*last].node.map(|n| { let n = &mut self.nodes[n]; n.time = n.time.pull() });
+            //vreg.ports.sort_by(|a, b| self.ports[*a].time.unwrap().partial_cmp(&self.ports[*b].time.unwrap()).unwrap());
+
+        }
     }
 
 
@@ -618,7 +625,11 @@ impl Region {
         for (key, reg) in &mut *virts {
             if reg.backing.is_some() {
                 println!("---- constrained {}", key);
-                let range = self.ports[*reg.ports.first().unwrap()].time.unwrap()..=(self.ports[*reg.ports.last().unwrap()].time.unwrap().increment());
+                let (start, end) = (
+                    self.ports[*reg.ports.first().unwrap()].time.unwrap(),
+                    self.ports[*reg.ports.last().unwrap()].time.unwrap().increment()
+                );
+                let range = start..=end;
                 let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
                     println!("first allocation for constrained {} at {:?}", reg.backing.unwrap(), range); RangeInclusiveMap::new()
                 });
@@ -943,7 +954,7 @@ impl Node {
     }
 
     fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
-        println!("node codegen for {:?}", self.variant);
+        println!("node codegen for {:?} @ {}", self.variant, self.time);
         self.variant.codegen(self.inputs.clone(), self.outputs.clone(), r, ir, ops)
     }
 }
@@ -1237,6 +1248,8 @@ impl IR {
             r.create_dependencies();
             r.annotate_port_times_and_hints(&mut virt_map);
             println!("annoated port times and hints");
+            r.optimize_vreg_live_ranges(&mut virt_map);
+            println!("optimized vreg live ranges");
             r.allocate_physical_for_virtual(&mut virt_map);
             println!("allocated physical registers for virtual register");
             r.replace_virtual_with_backing(&mut virt_map);
