@@ -629,7 +629,7 @@ impl Region {
                 println!("---- constrained {}", key);
                 let (start, end) = (
                     self.ports[*reg.ports.first().unwrap()].time.unwrap(),
-                    self.ports[*reg.ports.last().unwrap()].time.unwrap().push()
+                    self.ports[*reg.ports.last().unwrap()].time.unwrap()
                 );
                 let range = start..=end;
                 let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
@@ -646,7 +646,7 @@ impl Region {
                     break;
                 }
                 if !empty { panic!("uh oh"); };
-                reg_live.insert(range.clone(), *key);
+                reg_live.insert(start..=end.push(), *key);
                 println!("allocated constrained {} register {} {:?}", *key, reg.backing.unwrap(), range);
                 // we were able to allocate the physical register requirement
                 continue;
@@ -706,16 +706,6 @@ impl Region {
                     break;
                 }
                 if !empty { continue 'candidate };
-                if let Some(last) = reg_live.get(&end.push()) {
-                    let last_use = self.ports[*virts[last].ports.first().unwrap()].node;
-                    if let Some(n) = last_use {
-                        let n = &mut self.nodes[n];
-                        if n.time.major != end.major { continue 'candidate }
-                        n.time = n.time.pull();
-                    } else {
-                        continue 'candidate
-                    }
-                }
                 // we have a free register for this time slice
                 reg_live.insert(start..=end.push(), *key);
                 virts.get_mut(key).unwrap().backing = Some(*candidate);
