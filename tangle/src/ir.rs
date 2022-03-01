@@ -26,6 +26,7 @@ use core::cmp::max;
 use frunk::prelude::*;
 use frunk::hlist::*;
 use frunk::*;
+use crate::time::Timestamp;
 
 // yaxpeax decoder example
 mod decoder {
@@ -120,7 +121,7 @@ pub struct Port {
     variant: EdgeVariant,
     meta: Option<PortMeta::All>,
     storage: OptionalStorage,
-    time: Option<usize>,
+    time: Option<Timestamp>,
     done: bool,
     // The node the port is attached to. If none, it isn't attached to any (e.g. a region
     // source/sink)
@@ -264,11 +265,15 @@ lazy_static! {
     // The prefered allocation order for registers
     static ref REGS: Vec<RegSpec> = vec![
         RegSpec::rax(),
-        //RegSpec::rbx(),
-        RegSpec::rcx(),
-        RegSpec::rdx(),
-        RegSpec::rsi(),
         RegSpec::rdi(),
+        RegSpec::rsi(),
+        RegSpec::rdx(),
+        RegSpec::rcx(),
+        RegSpec::r8(),
+        RegSpec::r9(),
+        RegSpec::r10(),
+        RegSpec::r11(),
+        //RegSpec::rbx(),
         //RegSpec::rbp(), // there's only a bp() helper in real_mode
     ];
 }
@@ -533,7 +538,7 @@ impl Region {
         // and having their time be the max of their dependants' time
         // We work from the "bottom up" so that all instructions are scheduled the
         // latest they possibly can.
-        let mut final_time = 0;
+        let mut final_time = Timestamp::new();
         'process: while let Some(sink) = &nodes.pop_first() {
             let mut dependencies = self.nodes.neighbors_directed(*sink, Direction::Outgoing).detach();
             let mut time = self.nodes[*sink].time;
@@ -547,9 +552,9 @@ impl Region {
                     println!("node {:?} too soon", self.nodes[*sink]);
                     continue 'process;
                 };
-                time = max(time, dependency.time + 1); // TODO: latency
+                time = max(time, dependency.time.increment()); // TODO: latency
             }
-            println!("node {:?} has time {:?}", self.nodes[*sink], time);
+            println!("node {:?} has time {}", self.nodes[*sink], time);
             self.nodes[*sink].time = time;
             final_time = max(final_time, time);
             self.nodes[*sink].done = true;
@@ -561,23 +566,23 @@ impl Region {
             }
         }
         // and add one for the function return ports
-        final_time += 1;
+        final_time = final_time.increment();
         println!("final time is {}", final_time);
 
         // validate all nodes were given times
         for n in self.nodes.node_weights_mut().into_iter() {
             assert_eq!(n.done, true, "no time for {:?}", n);
             // renumber nodes so they are increasing in program time
-            n.time = final_time - n.time;
+            n.time.major = final_time.major - n.time.major;
             // and give its ports the correct timings
             for p in n.sources() { self.ports[p].time = Some(n.time); }
             // TODO: latency
-            for p in n.sinks() { self.ports[p].time = Some(n.time + 1); }
+            for p in n.sinks() { self.ports[p].time = Some(n.time.push()); }
         }
 
         // and our functions entry/exit ports also need a time
         for p in &self.sources {
-            self.ports[*p].time = Some(0);
+            self.ports[*p].time = Some(Timestamp::new());
         }
         for p in &self.sinks {
             self.ports[*p].time = Some(final_time);
@@ -595,13 +600,19 @@ impl Region {
         use rangemap::RangeInclusiveMap;
         // The rangemap is (end..start, vreg). vreg is the virtual register that is
         // live for that timeslice on the physical register.
-        let mut live: HashMap<RegSpec, RangeInclusiveMap<usize, usize>> = HashMap::new();
+        let mut live: HashMap<RegSpec, RangeInclusiveMap<Timestamp, usize>> = HashMap::new();
+
+
+        // TODO: split timestamps into (major, minor), so that we can schedule
+        // instructions within the scheduled timeslice.
+        // this is needed so that we can e.g. allow instructions in the same timeslice
+        // to re-use registers if the only instruction in the slice that 
 
         // Add all the constrained registers first
         for (key, reg) in &mut *virts {
             if reg.backing.is_some() {
                 println!("---- constrained {}", key);
-                let range = self.ports[*reg.ports.first().unwrap()].time.unwrap()..=self.ports[*reg.ports.last().unwrap()].time.unwrap();
+                let range = self.ports[*reg.ports.first().unwrap()].time.unwrap()..=(self.ports[*reg.ports.last().unwrap()].time.unwrap().increment());
                 let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
                     println!("first allocation for constrained {} at {:?}", reg.backing.unwrap(), range); RangeInclusiveMap::new()
                 });
@@ -639,12 +650,12 @@ impl Region {
             .then(v0_hints.cmp(&v1_hints))
             .then(v0_time.cmp(&v1_time))
         });
-        let mut last = 0;
+        let mut last = Timestamp::new();
         'allocate: for (key, reg) in vregs.drain(..) {
             println!("---- uncontrained {}", key);
             let (start, end) = (
                 self.ports[*reg.ports.first().unwrap()].time.unwrap(),
-                self.ports[*reg.ports.last().unwrap()].time.unwrap()
+                self.ports[*reg.ports.last().unwrap()].time.unwrap().increment()
             );
             last = max(last, end);
             println!("allocating virtual register alive {}-{}", start, end);
@@ -658,7 +669,7 @@ impl Region {
                 let already = reg_live.gaps(&range);
                 let mut empty = false;
                 for gap in already {
-                    println!("gap {:?}", gap);
+                    println!("{} gap {:?}", candidate, gap);
                     if gap.start() != range.start() || gap.end() != range.end() {
                         continue 'candidate;
                     }
@@ -678,11 +689,11 @@ impl Region {
 
         // print out a pretty graph of the register live ranges
         for reg in live {
-            let mut graph: String = "[".to_owned() + &" ".repeat(last*2) + &"]".to_owned();
+            let mut graph: String = "[".to_owned() + &" ".repeat((last.major*2).into()) + &"]".to_owned();
             for range in reg.1 {
-                let size = (range.0.end() + 1) - range.0.start();
-                let new = (range.0.start() + 1)..(range.0.end() + 2);
-                graph.replace_range(new, &"=".repeat(size));
+                let size = (range.0.end().major + 1) - range.0.start().major;
+                let new = (range.0.start().major as usize + 1)..(range.0.end().major as usize + 2);
+                graph.replace_range(new, &"=".repeat(size as usize));
             }
             println!("{}: {}", reg.0, graph);
         }
@@ -815,10 +826,10 @@ mod NodeVariant {
 pub use NodeVariant::*;
 
 pub trait NodeBehavior: core::fmt::Debug + core::any::Any {
-    fn set_time(&mut self, time: usize) {
+    fn set_time(&mut self, time: Timestamp) {
        unimplemented!();
     }
-    fn get_time(&self) -> usize {
+    fn get_time(&self) -> Timestamp {
         unimplemented!();
     }
 
@@ -854,10 +865,10 @@ impl Node {
         (&mut *self.variant as &mut (dyn core::any::Any + 'static)).downcast_mut::<T>()
     }
 
-    fn set_time(&mut self, time: usize) {
+    fn set_time(&mut self, time: Timestamp) {
         self.time = time;
     }
-    fn get_time(&self) -> usize {
+    fn get_time(&self) -> Timestamp {
         self.time
     }
 
@@ -1094,7 +1105,7 @@ pub struct Node {
     outputs: Vec<PortIdx>,
     label: Option<String>,
     containing_region: Option<RegionIdx>,
-    time: usize,
+    time: Timestamp,
     done: bool,
 }
 
@@ -1120,7 +1131,7 @@ impl Node {
             outputs: vec![],
             label: None,
             containing_region: None,
-            time: 1,
+            time: Timestamp::new().increment(),
             done: false,
         }
     }
@@ -1212,7 +1223,7 @@ impl IR {
                 continue;
             }
             r.attach_ports();
-            r.move_constants_to_operands();
+            //r.move_constants_to_operands();
             r.remove_nops();
             // Create virtual register storages for all nodes and ports
             let mut virt_map = r.create_virtual_registers();

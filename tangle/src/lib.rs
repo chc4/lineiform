@@ -8,4 +8,5 @@ extern crate dynasmrt;
 extern crate ena;
 extern crate rangemap;
 pub mod ir;
+pub mod time;
 pub use ir::*;
