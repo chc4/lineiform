@@ -577,7 +577,7 @@ impl Region {
             // and give its ports the correct timings
             for p in n.sources() { self.ports[p].time = Some(n.time); }
             // TODO: latency
-            for p in n.sinks() { self.ports[p].time = Some(n.time.push()); }
+            for p in n.sinks() { self.ports[p].time = Some(n.time.increment()); }
         }
 
         // and our functions entry/exit ports also need a time
@@ -590,12 +590,12 @@ impl Region {
 
         // sort the uses for virtual registers by timings for later
         for (i, vreg) in virts {
+            self.ports[*vreg.ports.last().unwrap()].time.as_mut().map(|t| *t = t.pull());
+            self.ports[*vreg.ports.first().unwrap()].time.as_mut().map(|t| *t = t.push());
             vreg.ports.sort_by(|a, b| self.ports[*a].time.unwrap().partial_cmp(&self.ports[*b].time.unwrap()).unwrap());
             // optimize virtual register lifetimes: if a port is the last use of a vreg
             // it can be pulled backwards, if it's the first use it can be pushed later.
             // this allows vreg uses in the time major timeslice to not conflict unneeded.
-            //self.ports[*vreg.ports.last().unwrap()].time.as_mut().map(|t| *t = t.pull());
-            //self.ports[*vreg.ports.first().unwrap()].time.as_mut().map(|t| *t = t.push());
         }
 
     }
@@ -618,7 +618,7 @@ impl Region {
         for (key, reg) in &mut *virts {
             if reg.backing.is_some() {
                 println!("---- constrained {}", key);
-                let range = self.ports[*reg.ports.first().unwrap()].time.unwrap()..=(self.ports[*reg.ports.last().unwrap()].time.unwrap().push());
+                let range = self.ports[*reg.ports.first().unwrap()].time.unwrap()..=(self.ports[*reg.ports.last().unwrap()].time.unwrap().increment());
                 let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
                     println!("first allocation for constrained {} at {:?}", reg.backing.unwrap(), range); RangeInclusiveMap::new()
                 });
@@ -661,7 +661,7 @@ impl Region {
             println!("---- uncontrained {}", key);
             let (start, end) = (
                 self.ports[*reg.ports.first().unwrap()].time.unwrap(),
-                self.ports[*reg.ports.last().unwrap()].time.unwrap().push()
+                self.ports[*reg.ports.last().unwrap()].time.unwrap().increment()
             );
             last = max(last, end);
             println!("allocating virtual register alive {}-{}", start, end);

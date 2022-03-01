@@ -51,17 +51,19 @@ impl Timestamp {
 
 impl PartialOrd for Timestamp {
     fn partial_cmp(&self, other: &Timestamp) -> Option<std::cmp::Ordering> {
-        Some(self.major.cmp(&other.major).then(self.minor.cmp(&other.major)))
+        Some(self.major.cmp(&other.major).then(self.minor.cmp(&other.minor)))
     }
 }
 
 impl StepLite for Timestamp {
     fn add_one(&self) -> Self {
-        self.push()
+        if self.minor == u16::MAX { let mut new = self.increment(); new.minor = u16::MIN; new }
+        else { self.push() }
     }
 
     fn sub_one(&self) -> Self {
-        self.pull()
+        if self.minor == u16::MIN { let mut new = self.decrement(); new.minor = u16::MAX; new }
+        else { self.pull() }
     }
 }
 
