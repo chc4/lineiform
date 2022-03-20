@@ -2,10 +2,11 @@ use petgraph::graph::{NodeIndex, EdgeIndex};
 use frunk::prelude::*;
 use frunk::hlist::*;
 use frunk::*;
-use core::ops::{Deref, DerefMut};
 use yaxpeax_x86::long_mode::RegSpec;
 
-use crate::node::{Node, NodeIdx};
+use core::ops::{Deref};
+
+use crate::node::{NodeIdx};
 use crate::time::Timestamp;
 
 #[derive(PartialEq, Debug, Copy, Clone)]

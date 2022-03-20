@@ -7,7 +7,7 @@
 // while the 'minor' time allows us to order instructions within it; overflowing
 // the minor time will just panic for now.
 
-use core::num::Wrapping;
+
 use rangemap::StepLite;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord)]
@@ -84,7 +84,7 @@ impl StepLite for Timestamp {
     }
 }
 
-use core::fmt::{Display, Formatter, Error};
+use core::fmt::{Display, Formatter};
 impl Display for Timestamp {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(fmt, "{}.{}", self.major, self.minor)

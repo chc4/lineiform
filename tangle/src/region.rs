@@ -1,18 +1,18 @@
 use dynasmrt::x64::Assembler;
 use petgraph::graph::{NodeIndex};
 use petgraph::stable_graph::StableGraph;
-use petgraph::visit::{EdgeRef, Dfs, Reversed, depth_first_search, DfsEvent, ControlFlow, IntoEdgeReferences};
+use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 use petgraph::Direction;
 use yaxpeax_x86::long_mode::RegSpec;
-use yaxpeax_x86::long_mode::register_class;
+
+use core::cmp::max;
+use std::collections::{HashMap, HashSet};
 
 use crate::node::{Node, NodeIdx, NodeBehavior, NodeVariant, Operation};
 use crate::port::{Port, PortMeta, PortIdx, PortEdge, Edge, Storage, OptionalStorage};
 use crate::ir::{IR, VirtualRegister, VirtualRegisterMap};
 use crate::time::Timestamp;
 
-use core::cmp::max;
-use std::collections::{HashMap, HashSet};
 
 pub type RegionEdge = ();
 pub type RegionIdx = NodeIndex;

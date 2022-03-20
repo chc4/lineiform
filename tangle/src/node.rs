@@ -1,12 +1,12 @@
 use dynasmrt::x64::Assembler;
-use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, AssemblyOffset};
+use dynasmrt::{dynasm, DynasmApi};
 use yaxpeax_x86::long_mode::RegSpec;
 use yaxpeax_x86::long_mode::register_class;
 use petgraph::graph::NodeIndex;
 
 use crate::time::Timestamp;
 use crate::ir::IR;
-use crate::port::{Port, PortMeta, PortIdx, PortEdge, Storage};
+use crate::port::{PortMeta, PortIdx, PortEdge, Storage};
 use crate::region::{Region, RegionIdx};
 
 pub type NodeIdx = NodeIndex;
@@ -32,7 +32,7 @@ pub enum Operation {
 
 pub mod NodeVariant {
     use super::{Operation, Region};
-    use std::marker::PhantomData;
+    
     use super::*;
     #[derive(Debug)]
     pub struct Move(pub Storage, pub Storage); // A move operation, sink <- source.

@@ -10,28 +10,22 @@
 // itself is already reasonably optimized just by LLVM when it is first emitted,
 // we just want to elide checks and stop everything from moving back and forth for
 // the function ABI for each inlined closure body.
-use petgraph::prelude::*;
+
 use petgraph::stable_graph::StableGraph;
 use petgraph::graph::{NodeIndex};
-use petgraph::Direction;
-use petgraph::visit::{EdgeRef, Dfs, Reversed, depth_first_search, DfsEvent, ControlFlow, IntoEdgeReferences};
-use yaxpeax_x86::long_mode::{Operand, RegSpec, register_class};
-use yaxpeax_x86::x86_64;
+use yaxpeax_x86::long_mode::{RegSpec};
 use dynasmrt::x64::Assembler;
 use dynasmrt::{AssemblyOffset, DynasmApi};
 
 use std::collections::{HashMap, HashSet};
-use std::cmp::Ordering;
-use core::cmp::max;
 
-use crate::time::Timestamp;
-use crate::node::{Node, NodeBehavior, NodeVariant, NodeIdx, Operation};
-use crate::port::{Port, PortIdx, PortMeta, PortEdge, Edge, Storage, OptionalStorage};
+use crate::node::{NodeBehavior, NodeVariant, NodeIdx};
+use crate::port::{PortIdx};
 use crate::region::{Region, RegionIdx, RegionEdge};
 
 // yaxpeax decoder example
 mod decoder {
-    use yaxpeax_arch::{Arch, AddressDisplay, Decoder, Reader, ReaderBuilder};
+    use yaxpeax_arch::{Decoder, Reader, ReaderBuilder};
 
     pub fn decode_stream<
         'data,
