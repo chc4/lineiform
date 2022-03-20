@@ -1,4 +1,3 @@
-// Fuck it we're doing it live!
 // Cranelift (and probably any other codegen IR like LLVM or libgccjit) is just
 // a bit too abstact for us; specifically, they target multiple ISAs, so try not
 // to expose processor flags behavior to the user.
