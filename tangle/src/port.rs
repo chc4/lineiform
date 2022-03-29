@@ -19,7 +19,7 @@ pub enum EdgeVariant {
 pub enum Storage {
     Virtual(u16), // todo: width?
     Physical(RegSpec),
-    Immaterial, // used for constant operands and state edges - does not receive a vreg
+    Immaterial(Option<u16>), // used for constant operands and state edges - does not receive a vreg
 }
 
 impl core::fmt::Display for Storage {
@@ -27,12 +27,12 @@ impl core::fmt::Display for Storage {
         match self {
             Storage::Virtual(v) => write!(fmt, "v{}", v),
             Storage::Physical(p) => write!(fmt, "{}", p),
-            Storage::Immaterial => write!(fmt, "imm"),
+            Storage::Immaterial(_) => write!(fmt, "imm"),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OptionalStorage(pub Option<Storage>);
 impl core::fmt::Display for OptionalStorage {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> Result<(), std::fmt::Error> {
@@ -57,8 +57,8 @@ pub mod PortMeta {
     #[derive(Debug, Clone)]
     pub struct Constant(pub usize);
     #[derive(Debug, Clone)]
-    pub struct SomethingElse(pub f64);
-    pub type All = HList![Option<Constant>, Option<SomethingElse>];
+    pub struct StackOff(pub i32);
+    pub type All = HList![Option<Constant>, Option<StackOff>];
 }
 
 #[derive(Clone, Debug)]
@@ -90,8 +90,17 @@ impl Port {
         }
     }
 
+    pub fn set_variant(&mut self, var: EdgeVariant) {
+        self.variant = var;
+    }
+
     pub fn set_storage(&mut self, store: Storage) {
-        assert!(self.variant != EdgeVariant::State, "tried to set storage on a state port");
+        //assert!(self.variant != EdgeVariant::State, "tried to set storage on a state port");
+        if let Some(exist) = self.storage.0 {
+            if exist != store {
+                println!("port already has storage {}, setting to {}", exist, store);
+            }
+        }
         self.storage = OptionalStorage(Some(store));
     }
 

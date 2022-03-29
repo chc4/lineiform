@@ -9,13 +9,25 @@ use core::cmp::max;
 use std::collections::{HashMap, HashSet};
 
 use crate::node::{Node, NodeIdx, NodeBehavior, NodeVariant, Operation};
-use crate::port::{Port, PortMeta, PortIdx, PortEdge, Edge, Storage, OptionalStorage};
+use crate::port::{Port, PortMeta, PortIdx, PortEdge, Edge, EdgeVariant, Storage, OptionalStorage};
 use crate::ir::{IR, VirtualRegister, VirtualRegisterMap};
 use crate::time::Timestamp;
 
 
 pub type RegionEdge = ();
 pub type RegionIdx = NodeIndex;
+
+#[derive(Debug)]
+pub enum StateVariant {
+    Stack(u32),
+}
+
+#[derive(Debug)]
+pub struct State {
+    pub name: String,
+    pub variant: StateVariant,
+    pub producers: Vec<PortIdx>,
+}
 
 #[derive(Default)]
 pub struct Region {
@@ -29,6 +41,7 @@ pub struct Region {
     pub live: bool,
     pub idx: RegionIdx,
     pub order: Vec<usize>,
+    pub states: Vec<State>,
 }
 
 use lazy_static::lazy_static;
@@ -106,18 +119,18 @@ impl Region {
         }
     }
 
-    pub fn add_node<T, F>(&mut self, mut n: T,
-        f: F) -> NodeIdx where F: FnOnce(&mut Node, &mut Region) -> (), T: NodeBehavior + 'static {
+    pub fn add_node<T, F, F_O>(&mut self, mut n: T,
+        f: F) -> (NodeIdx, F_O) where F: FnOnce(&mut Node, &mut Region) -> F_O, T: NodeBehavior + 'static {
         let mut n = Node::new(box n as Box<dyn NodeBehavior>);
         n.containing_region = Some(self.idx);
         n.create_ports(self);
-        f(&mut n, self);
+        let f_o = f(&mut n, self);
         let idx = self.nodes.add_node(n);
         // Now we can attach the ports to the actual node
         for port in self.nodes[idx].ports() {
             self.ports[port].node = Some(idx);
         }
-        idx
+        (idx, f_o)
     }
 
     pub fn add_port(&mut self) -> PortIdx {
@@ -128,7 +141,7 @@ impl Region {
     pub fn connect_ports(&mut self, input: PortIdx, output: PortIdx) -> PortEdge {
         let input_kind = self.ports[input].variant;
         let output_kind = self.ports[output].variant;
-        assert_eq!(input_kind, output_kind);
+        assert_eq!(input_kind, output_kind, "port {:?} -> {:?} variant mismatch", self.ports[input], self.ports[output]);
         let e = Edge {
             variant: input_kind,
         };
@@ -169,7 +182,7 @@ impl Region {
                     //println!("used {:?}", node_use);
                     let port_use = &mut self.ports[a_use];
                     // we can set the port to be immaterial instead
-                    port_use.set_storage(Storage::Immaterial);
+                    port_use.set_storage(Storage::Immaterial(None));
                     // and that it is a constant value
                     port_use.set_meta(PortMeta::Constant(c));
                     // and that it doesn't depend on the constant node anymore
@@ -204,7 +217,10 @@ impl Region {
         let mut virts: VirtualRegisterMap = HashMap::new();
         let mut ports = self.ports.clone();
         // Give all ports that have no incoming edges and no storage a new virtual register
-        self.ports.clone().externals(Direction::Incoming).filter(|e| ports[*e].storage.is_none() ).map(|e| {
+        ports.clone().externals(Direction::Incoming).filter(|e| {
+            let e = &ports[*e];
+            (match e.variant { EdgeVariant::Data => true, _ => false }) && e.storage.is_none()
+        }).map(|e| {
             self.ports[e].set_storage(Storage::Virtual(reg));
             println!("gave {:?} virtual register {}", e, reg);
             virts.insert(reg.into(), VirtualRegister { ports: vec![], hints: HashSet::new(), backing: None, allocated: false });
@@ -226,7 +242,8 @@ impl Region {
         ports = self.ports.clone();
 
         // We have a set of all the ports and edges between them
-        let mut ports_edges: Vec<_> = ports.edge_references().collect();
+        let mut ports_edges: Vec<_> = ports.edge_references()
+            .filter(|e| self.ports[e.source()].variant == EdgeVariant::Data ).collect();
         ports_edges.sort_by_key(|e| self.ports[e.target()].time);
         ports_edges.reverse();
         // And we repeatedly propogate any edges we can. If we do propogate, we
@@ -250,14 +267,14 @@ impl Region {
                     return true
                 }
                 let (sink_backing, source_backing) = (
-                    sink.storage.and_then(|s| if let Storage::Virtual(v) = s { virts[&v.into()].backing } else { None } ),
-                    source.storage.and_then(|s| if let Storage::Virtual(v) = s { virts[&v.into()].backing } else { None } ),
+                    sink.storage,
+                    source.storage,
                 );
                 println!("storages {} <- {}", sink.storage, source.storage);
 
                 match (
-                    sink.storage.clone().map(|s| if let Storage::Virtual(s) = s { s } else { panic!("l") }),
-                    source.storage.clone().map(|s| if let Storage::Virtual(s) = s { s } else { panic!("r") }),
+                    sink.storage.clone().0,
+                    source.storage.clone().0,
                 ) {
                     (Some(sink_store), Some(source_store))
                     if sink_store == source_store && sink_backing == source_backing => {
@@ -269,47 +286,67 @@ impl Region {
                         // storage already allocated, or two virtual registers
                         // use the same previous register
                         self.ports.remove_edge(e.id());
-                        let mut n = Node::r#move(Storage::Virtual(p0), Storage::Virtual(source_store));
-                        println!("INSERT MOVE");
+                        let mut n = Node::r#move(p0, source_store);
+                        println!("INSERT MOVE1");
                         self.add_node(n, |n, r| {
                             n.connect_input(0, e.target(), r);
                             n.connect_output(0, e.source(), r);
                             // TODO: we need a way to say that these values *depend* on eachother
                             // but don't share storage
-                            r.connect_ports(n.sources()[0], n.sinks()[0]);
-                            r.ports[n.sources()[0]].set_storage(Storage::Virtual(source_store));
-                            r.ports[n.sinks()[0]].set_storage(Storage::Virtual(p0));
+                            //r.connect_ports(n.sources()[0], n.sinks()[0]);
+                            r.ports[n.sources()[0]].set_storage(source_store);
+                            r.ports[n.sinks()[0]].set_storage(p0);
                         });
-                        use std::ops::BitOr;
-                        let require = &virts[&p0.into()].hints.clone();
-                        virts.entry(source_store.into()).and_modify(|e| {
-                            e.hints = e.hints.bitor(&require);
-                        });
+                        if let (Storage::Virtual(p0), Storage::Virtual(source_store)) = (p0, source_store) {
+                            use std::ops::BitOr;
+                            let require = &virts[&p0.into()].hints.clone();
+                            virts.entry(source_store.into()).and_modify(|e| {
+                                e.hints = e.hints.bitor(&require);
+                            });
+                        }
                     },
-                    (Some(p0), None) if sink_backing.is_some() => {
-                        // create a new virtual register + move before any physical sinks
-                        virts.insert(reg.into(), VirtualRegister { ports: vec![], hints: HashSet::from([sink_backing.unwrap()]), backing: None, allocated: false });
-                        let new_virt = Storage::Virtual(reg);
-                        self.ports[e.target()].set_storage(new_virt);
-                        reg += 1;
-                        self.ports.remove_edge(e.id());
-                        let mut n = Node::r#move(Storage::Virtual(p0), new_virt);
-                        println!("INSERT MOVE");
-                        self.add_node(n, |n, r| {
-                            n.connect_input(0, e.target(), r);
-                            n.connect_output(0, e.source(), r);
-                            // TODO: we need a way to say that these values *depend* on eachother
-                            // but don't share storage
-                            r.connect_ports(n.sources()[0], n.sinks()[0]);
-                            r.ports[n.sources()[0]].set_storage(new_virt);
-                            r.ports[n.sinks()[0]].set_storage(Storage::Virtual(p0));
-                        });
+                    (Some(p0), None) => {
+                        let mut okay = false;
+                        if let Storage::Virtual(r0) = p0 {
+                            if let Some(phys) = virts[&(r0 as usize)].backing {
+                                // create a new virtual register + move before any physical sinks
+                                virts.insert(reg.into(),
+                                    VirtualRegister {
+                                        ports: vec![],
+                                        hints: HashSet::from([phys]),
+                                        backing: None,
+                                        allocated: false
+                                });
+                                let new_virt = Storage::Virtual(reg);
+                                self.ports[e.target()].set_storage(new_virt);
+                                reg += 1;
+                                self.ports.remove_edge(e.id());
+                                let mut n = Node::r#move(p0, new_virt);
+                                println!("INSERT MOVE2");
+                                self.add_node(n, |n, r| {
+                                    n.connect_input(0, e.target(), r);
+                                    n.connect_output(0, e.source(), r);
+                                    // TODO: we need a way to say that these values *depend* on eachother
+                                    // but don't share storage
+                                    //r.connect_ports(n.sources()[0], n.sinks()[0]);
+                                    r.ports[n.sources()[0]].set_storage(new_virt);
+                                    r.ports[n.sinks()[0]].set_storage(p0);
+                                });
+                                okay = true;
+                            }
+                        }
+                        if !okay {
+                            println!("just propogating");
+                            // we can't just use source.set_storage because it's
+                            // a clone.
+                            self.ports[e.target()].set_storage(p0);
+                        }
                     },
                     (Some(sink_store), _) if sink_backing.is_none() => {
                         println!("just propogating");
                         // we can't just use source.set_storage because it's
                         // a clone.
-                        self.ports[e.target()].set_storage(Storage::Virtual(sink_store));
+                        self.ports[e.target()].set_storage(sink_store);
                     },
                     (x, y) => {
                         unimplemented!("create_virtual_registers unhandled {:?} {:?} {:?} {:?}", x, sink_backing, y, source_backing);
@@ -320,17 +357,41 @@ impl Region {
         };
         // Make sure all ports have storages now
         for p in self.ports.node_indices() {
-            assert!(self.ports[p].storage.is_some(), "port {:?} without storage", p);
+            assert!(&self.ports[p].storage.is_some(), "port {:?} without storage", p);
             let vreg = match self.ports[p].storage.unwrap() {
                 Storage::Virtual(v) => v,
                 Storage::Physical(p) => panic!("port {:?} has physical storage", p),
-                Storage::Immaterial => continue,
+                Storage::Immaterial(_) => continue,
             };
             // and add them to their virtual registers' port list
             virts.get_mut(&vreg.into()).unwrap().ports.push(p);
         }
 
         virts
+    }
+
+    pub fn propogate_state_edges(&mut self) {
+        let mut ports = self.ports.externals(Direction::Outgoing).filter(|e| {
+            let e = &self.ports[*e];
+            match e.variant { EdgeVariant::State => true, _ => false }
+        }).collect::<Vec<_>>();
+        for port in ports {
+            println!("got state port start {:?}", port);
+            let mut frontier = vec![port];
+            let state = match self.ports[port].storage {
+                OptionalStorage(Some(Storage::Immaterial(Some(s)))) => s,
+                x => panic!("state port source has storage {:?}", x),
+            };
+            println!("state variant {}", state);
+            while let Some(source) = frontier.pop() {
+                let mut edges = self.ports.neighbors_directed(source, Direction::Incoming).detach();
+                while let Some((e, sink)) = edges.next(&self.ports) {
+                    println!("state edge {:?} -> {:?}", source, sink);
+                    self.ports[sink].set_storage(Storage::Immaterial(Some(state)));
+                    frontier.push(sink);
+                }
+            }
+        }
     }
 
     pub fn annotate_port_times_and_hints(&mut self, virts: &mut VirtualRegisterMap) {

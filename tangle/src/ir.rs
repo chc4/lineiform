@@ -140,6 +140,9 @@ impl IR {
                 continue;
             }
             r.attach_ports();
+            r.propogate_state_edges();
+            println!("propogated state edges");
+
             //r.move_constants_to_operands();
             r.remove_nops();
             // Create virtual register storages for all nodes and ports
@@ -214,6 +217,7 @@ impl IR {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::node::{Node, Operation};
 
     type S = NodeVariant::Simple;
     #[test]
@@ -322,10 +326,10 @@ mod test {
         let mut add = Node::simple(Operation::Add);
         let inc_0_i = f.add_body(inc_0, &mut ir, |inc_0, r| {
             inc_0.connect_input(0, port_0, r);
-        });
+        }).0;
         let inc_1_i = f.add_body(inc_1, &mut ir, |inc_1, r| {
             inc_1.connect_input(0, port_1, r);
-        });
+        }).0;
         f.add_body(add, &mut ir, |add, r| {
             add.connect_input(0, r.nodes[inc_0_i].sinks()[0], r);
             add.connect_input(1, r.nodes[inc_1_i].sinks()[0], r);
@@ -411,4 +415,63 @@ mod test {
         assert_eq!(hello_fn(0), 2);
         assert_eq!(hello_fn(1), 3);
     }
+
+    #[test]
+    pub fn function_use_stack() {
+        let mut ir = IR::new();
+        let mut f = Node::function::<1, 1>(&mut ir);
+        let input = f.add_argument(&mut ir);
+        let output = f.add_return(&mut ir);
+        // We create a stack slot
+        let mut ss1 = f.add_stack_slot(&mut ir);
+
+        // ...and push, which should resolve to a use of ss1
+        let mut push = Node::simple(Operation::StoreStack);
+        ss1 = f.add_body(push, &mut ir, |i, r| {
+            i.connect_input(0, ss1, r);
+            i.connect_input(1, input, r);
+            i.sinks()[0]
+        }).1;
+
+        // get the value
+        let mut pop = Node::simple(Operation::LoadStack);
+        let ss_val = f.add_body(pop, &mut ir, |i, r| {
+            i.connect_input(0, ss1, r);
+            i.sinks()[0]
+        }).1;
+
+        // then add to it via ss1
+        let mut two = Node::simple(Operation::Constant(2));
+        let mut add = Node::simple(Operation::Add);
+        let mut two_const = f.add_body(two, &mut ir, |two, r| {
+            two.sinks()[0]
+        }).1;
+        let added_val = f.add_body(add, &mut ir, |add, r| {
+            println!("add closure {}", r.ports[ss1].storage);
+            add.connect_input(0, ss_val, r);
+            add.connect_input(1, two_const, r);
+            add.sinks()[0]
+        }).1;
+
+        // and store it again
+        let mut push = Node::simple(Operation::StoreStack);
+        f.add_body(push, &mut ir, |i, r| {
+            i.connect_input(0, ss1, r);
+            i.connect_input(1, added_val, r);
+            ss1 = i.sinks()[0];
+        });
+
+        // ...then pop it into the result register
+        let mut pop = Node::simple(Operation::LoadStack);
+        f.add_body(pop, &mut ir, |i, r| {
+            i.connect_input(0, ss1, r);
+            i.connect_output(0, output, r);
+        });
+
+        ir.set_body(f);
+        let hello_fn: extern "C" fn(usize) -> usize = ir.compile_fn().unwrap().0;
+        assert_eq!(hello_fn(0), 2);
+        assert_eq!(hello_fn(1), 3);
+    }
+
 }

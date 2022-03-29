@@ -6,8 +6,8 @@ use petgraph::graph::NodeIndex;
 
 use crate::time::Timestamp;
 use crate::ir::IR;
-use crate::port::{PortMeta, PortIdx, PortEdge, Storage};
-use crate::region::{Region, RegionIdx};
+use crate::port::{PortMeta, PortIdx, PortEdge, Storage, EdgeVariant};
+use crate::region::{Region, RegionIdx, State, StateVariant};
 
 pub type NodeIdx = NodeIndex;
 #[derive(Debug)]
@@ -28,6 +28,8 @@ pub enum Operation {
     Apply, // Call a Function node with arguments
     Inc,
     Add,
+    LoadStack,
+    StoreStack
 }
 
 pub mod NodeVariant {
@@ -42,6 +44,7 @@ pub mod NodeVariant {
     pub struct Function<const A: usize, const O: usize> {
         pub args: u8,
         pub outs: u8,
+        pub stack_slots: u32,
         pub region: RegionIdx,
     } // "Lambda-Nodes"; procedures and functions
     impl<const A: usize, const O: usize> Function<A, O> {
@@ -50,15 +53,16 @@ pub mod NodeVariant {
             Self {
                 region: r,
                 args: 0,
-                outs: 0
+                outs: 0,
+                stack_slots: 0,
             }
         }
 
-        pub fn add_body<T, F>(
+        pub fn add_body<T, F, F_O>(
             &mut self,
             mut n: T,
             ir: &mut IR,
-            f: F) -> NodeIdx where F: FnOnce(&mut Node, &mut Region) -> (), T: NodeBehavior + core::any::Any + 'static + core::fmt::Debug
+            f: F) -> (NodeIdx, F_O) where F: FnOnce(&mut Node, &mut Region) -> F_O, T: NodeBehavior + core::any::Any + 'static + core::fmt::Debug
         {
             ir.in_region(self.region, |mut r, ir| {
                 r.add_node(n, f)
@@ -91,6 +95,25 @@ pub mod NodeVariant {
                 port
             });
             self.outs += 1;
+            port
+        }
+
+        pub fn add_stack_slot(&mut self, ir: &mut IR) -> PortIdx {
+            let port = ir.in_region(self.region, |mut r, ir| {
+                let new_state = r.states.len();
+                let port = r.add_port();
+                r.states.push(State {
+                    name: "stack".to_string(),
+                    variant: StateVariant::Stack(self.stack_slots),
+                    producers: vec![port],
+                });
+
+                r.constrain(port, Storage::Immaterial(Some(new_state.try_into().unwrap())));
+                r.ports[port].set_variant(EdgeVariant::State);
+                port
+            });
+
+            self.stack_slots += 1;
             port
         }
     }
@@ -226,6 +249,8 @@ impl NodeBehavior for NodeVariant::Simple {
             Operation::Inc => 1,
             Operation::Add => 2,
             Operation::Constant(_) => 0,
+            Operation::LoadStack => 1,
+            Operation::StoreStack => 2,
             _ => unimplemented!(),
         }
     }
@@ -235,6 +260,7 @@ impl NodeBehavior for NodeVariant::Simple {
             Operation::Inc => 1,
             Operation::Add => 1,
             Operation::Constant(_) => 1,
+            Operation::LoadStack | Operation::StoreStack => 1,
             _ => unimplemented!(),
         }
     }
@@ -270,7 +296,7 @@ impl NodeBehavior for NodeVariant::Simple {
                         ),
                         x => unimplemented!("unknown class {:?} for add", x),
                     },
-                    (Storage::Physical(r0), Storage::Immaterial) => match r0.class() {
+                    (Storage::Physical(r0), Storage::Immaterial(None)) => match r0.class() {
                         register_class::Q => dynasm!(ops
                             ; add Rq(r0.num()),
                                 operand_1.get_meta::<PortMeta::Constant, _>().unwrap().0.try_into().unwrap()
@@ -292,6 +318,53 @@ impl NodeBehavior for NodeVariant::Simple {
                     _ => unimplemented!(),
                 }
             },
+            // val <- ss
+            // out: val'
+            // THIS IS FUCKED:
+            // stack slots actually have to be a STATE edge and not a data edge,
+            // so that we can propogate them without having any conflicts.
+            // otherwise we have a Stack storage for the ss, but not any uses,
+            // and physical registers propogate upwards into it and it doesn't
+            // know what it is anymore.
+            Operation::LoadStack => {
+                let ss = &r.ports[inputs[0]];
+                let output = &r.ports[outputs[0]];
+                NodeVariant::Move::codegen(&NodeVariant::Move(output.storage.unwrap(), ss.storage.unwrap()),
+                    vec![inputs[0]], vec![outputs[0]], r, ir, ops);
+                //match output.storage.as_ref().unwrap() {
+                //    Storage::Physical(r0) => match r0.class() {
+                //        register_class::Q => dynasm!(ops
+                //            ; mov Rq(r0.num()), QWORD [rsp+ss_off]
+                //        ),
+                //        x => unimplemented!("unknown class {:?} for load_ss", x)
+                //    },
+                //    _ => unimplemented!(),
+                //}
+            },
+            // ss <- val
+            // out: ss'
+            Operation::StoreStack => {
+                let ss = &r.ports[inputs[0]];
+                let input = &r.ports[inputs[1]];
+                if let Storage::Immaterial(Some(state)) = ss.storage.unwrap() {
+                    if let Some(state) = r.states.get(state as usize) {
+                        NodeVariant::Move::codegen(&NodeVariant::Move(ss.storage.unwrap(), input.storage.unwrap()),
+                            vec![inputs[1]], vec![inputs[0]], r, ir, ops);
+                    } else {
+                        panic!("bad state for ss storage")
+                    }
+                } else { panic!("bad storage for ss {:?}", ss) }
+                //let ss_off = ss.get_meta::<PortMeta::StackOff, _>().unwrap().0;
+                //match input.storage.as_ref().unwrap() {
+                //    Storage::Physical(r0) => match r0.class() {
+                //        register_class::Q => dynasm!(ops
+                //            ; mov QWORD [rsp+ss_off], Rq(r0.num())
+                //        ),
+                //        x => unimplemented!("unknown class {:?} for load_ss", x)
+                //    },
+                //    _ => unimplemented!(),
+                //}
+            },
             x => unimplemented!("unimplemented codegen for {:?}", x),
         }
     }
@@ -304,6 +377,12 @@ impl NodeBehavior for NodeVariant::Simple {
             Operation::Add =>
                 { r.connect_ports(inputs[0], outputs[0]); },
             Operation::Constant(_) => {},
+            Operation::LoadStack => { r.ports[inputs[0]].set_variant(EdgeVariant::State); },
+            Operation::StoreStack => {
+                r.ports[inputs[0]].set_variant(EdgeVariant::State);
+                r.ports[outputs[0]].set_variant(EdgeVariant::State);
+                r.connect_ports(inputs[0], outputs[0]);
+            }, // this connects the state ports
             _ => unimplemented!("ports_callback for {:?}", self.tag()),
         };
     }
@@ -313,6 +392,8 @@ impl NodeBehavior for NodeVariant::Simple {
             Operation::Inc => "inc".to_string(),
             Operation::Add => "add".to_string(),
             Operation::Constant(n) => n.to_string(),
+            Operation::LoadStack => "load_ss".to_string(),
+            Operation::StoreStack => "store_ss".to_string(),
             _ => unimplemented!(),
         }
     }
@@ -349,7 +430,29 @@ impl NodeBehavior for NodeVariant::Move {
                     (x, y) => unimplemented!("{:?} <- {:?} unimplemented", x, y),
                 }
             },
-            _ => unimplemented!(),
+            (Storage::Physical(r0), Storage::Immaterial(Some(state))) => {
+                let off = match r.states[*state as usize].variant {
+                    StateVariant::Stack(o) => (o * 8).try_into().unwrap(),
+                };
+                match r0.class() {
+                    register_class::Q => dynasm!(ops
+                        ; mov Rq(r0.num()), QWORD [rsp+off]
+                    ),
+                    _ => unimplemented!()
+                }
+            },
+            (Storage::Immaterial(Some(state)), Storage::Physical(r1)) => {
+                let off = match r.states[*state as usize].variant {
+                    StateVariant::Stack(o) => (o * 8).try_into().unwrap(),
+                };
+                match r1.class() {
+                    register_class::Q => dynasm!(ops
+                        ; mov QWORD [rsp+off], Rq(r1.num())
+                    ),
+                    _ => unimplemented!()
+                }
+            },
+            (x, y) => unimplemented!("codegen for {:?} <- {:?}", x, y),
         }
     }
 
@@ -368,8 +471,20 @@ impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O
     }
 
     fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        if self.stack_slots != 0 {
+            // allocate stack space
+            dynasm!(ops
+                ; sub rsp, (self.stack_slots*8).try_into().unwrap()
+            );
+        }
         // if we're calling codegen on a function, it should be the only one.
         ir.in_region(self.region, |r, ir| { r.codegen(ir, ops); });
+        if self.stack_slots != 0 {
+            // cleanup stack space
+            dynasm!(ops
+                ; add rsp, (self.stack_slots*8).try_into().unwrap()
+            );
+        }
         dynasm!(ops
             ; ret
         );
