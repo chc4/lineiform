@@ -12,6 +12,7 @@ use crate::node::{Node, NodeIdx, NodeBehavior, NodeVariant, Operation};
 use crate::port::{Port, PortMeta, PortIdx, PortEdge, Edge, EdgeVariant, Storage, OptionalStorage};
 use crate::ir::{IR, VirtualRegister, VirtualRegisterMap};
 use crate::time::Timestamp;
+use crate::abi::Abi;
 
 
 pub type RegionEdge = ();
@@ -42,6 +43,7 @@ pub struct Region {
     pub idx: RegionIdx,
     pub order: Vec<usize>,
     pub states: Vec<State>,
+    pub abi: Option<Box<dyn Abi>>,
 }
 
 use lazy_static::lazy_static;
@@ -158,6 +160,16 @@ impl Region {
         let p = self.add_port();
         self.sinks.push(p);
         p
+    }
+
+    pub fn apply_constaints(&mut self) {
+        let mut abi = None;
+        core::mem::swap(&mut self.abi, &mut abi);
+        abi.as_ref().map(|abi| {
+            abi.constrain_arguments(self);
+            abi.constrain_returns(self);
+        });
+        core::mem::swap(&mut self.abi, &mut abi);
     }
 
     pub fn constrain(&mut self, port: PortIdx, store: Storage) {
@@ -299,8 +311,9 @@ impl Region {
                         });
                         if let (Storage::Virtual(p0), Storage::Virtual(source_store)) = (p0, source_store) {
                             use std::ops::BitOr;
-                            let require = &virts[&p0.into()].hints.clone();
-                            virts.entry(source_store.into()).and_modify(|e| {
+                            let require = &virts[&source_store.into()].hints.clone();
+                            virts.entry(p0.into()).and_modify(|e| {
+                                println!("adding hint {:?} to {:?}", require, p0);
                                 e.hints = e.hints.bitor(&require);
                             });
                         }
@@ -455,7 +468,7 @@ impl Region {
 
         // and our functions entry/exit ports also need a time
         for p in &self.sources {
-            self.ports[*p].time = Some(Timestamp::new());
+            self.ports[*p].time = Some(Timestamp::new().pull());
         }
         for p in &self.sinks {
             self.ports[*p].time = Some(final_time.push());
@@ -564,6 +577,9 @@ impl Region {
                 for gap in already {
                     println!("{} gap {:?}", candidate, gap);
                     if gap.start() != range.start() || gap.end() != range.end() {
+                        // TODO: we can actually still use the range if the only overlap
+                        // is from an input of the same instruction
+                        // figure out an efficient way of checking that
                         continue 'candidate;
                     }
                     empty = true;
@@ -571,7 +587,7 @@ impl Region {
                 }
                 if !empty { continue 'candidate };
                 // we have a free register for this time slice
-                reg_live.insert(start..=end.push(), *key);
+                reg_live.insert(start.pull()..=end.push(), *key);
                 virts.get_mut(key).unwrap().backing = Some(*candidate);
                 println!("allocated unconstrained {} register {} {:?}", *key, candidate, range);
                 continue 'allocate;

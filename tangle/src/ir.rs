@@ -20,8 +20,9 @@ use dynasmrt::{AssemblyOffset, DynasmApi};
 use std::collections::{HashMap, HashSet};
 
 use crate::node::{NodeBehavior, NodeVariant, NodeIdx};
-use crate::port::{PortIdx};
+pub use crate::port::{PortIdx, EdgeVariant};
 use crate::region::{Region, RegionIdx, RegionEdge};
+use crate::abi::Abi;
 
 // yaxpeax decoder example
 mod decoder {
@@ -92,9 +93,10 @@ impl IR {
     }
 
     /// Create a region in this IR instance at the top-most level.
-    pub fn new_region(&mut self) -> RegionIdx {
+    pub fn new_region<ABI: Abi + 'static>(&mut self, abi: Option<ABI>) -> RegionIdx {
         let mut r = Region::new();
         r.live = true;
+        r.abi = abi.map(|a| (box a) as Box<dyn Abi>);
         let r_x = self.regions.add_node(r);
         { self.regions.node_weight_mut(r_x).unwrap().idx = r_x; }
         self.regions.add_edge(self.master_region, r_x, ());
@@ -187,6 +189,10 @@ impl IR {
     }
 
     pub fn compile_fn<A, O>(&mut self) -> Result<(extern "C" fn(A) -> O, usize), Box<dyn std::error::Error>> {
+        for r in self.regions.node_weights_mut() {
+            // apply all ABI constrainments that regions need to enforce for regalloc
+            r.apply_constaints();
+        }
         self.regalloc();
         self.validate();
         let (mut ops, off, size) = self.codegen();
@@ -473,5 +479,76 @@ mod test {
         assert_eq!(hello_fn(0), 2);
         assert_eq!(hello_fn(1), 3);
     }
+
+    #[test]
+    pub fn function_stack_ordering() {
+        let mut ir = IR::new();
+        let mut f = Node::function::<1, 1>(&mut ir);
+        let input = f.add_argument(&mut ir);
+        let output = f.add_return(&mut ir);
+        // We create a stack slot
+        let mut ss1 = f.add_stack_slot(&mut ir);
+        let initial_ss = ss1;
+
+        // ...and push, which should resolve to a use of ss1
+        let mut push = Node::simple(Operation::StoreStack);
+        ss1 = f.add_body(push, &mut ir, |i, r| {
+            i.connect_input(0, ss1, r);
+            i.connect_input(1, input, r);
+            i.sinks()[0]
+        }).1;
+
+        let mut pop = Node::simple(Operation::LoadStack);
+        let ss_val_0 = f.add_body(pop, &mut ir, |i, r| {
+            i.connect_input(0, ss1, r);
+            i.sinks()[0]
+        }).1;
+
+        // then add to it via ss1
+        let mut two = Node::simple(Operation::Constant(2));
+        let mut add = Node::simple(Operation::Add);
+        let mut two_const = f.add_body(two, &mut ir, |two, r| {
+            two.sinks()[0]
+        }).1;
+        let added_val = f.add_body(add, &mut ir, |add, r| {
+            println!("add closure {}", r.ports[ss1].storage);
+            add.connect_input(0, ss_val_0, r);
+            add.connect_input(1, two_const, r);
+            add.sinks()[0]
+        }).1;
+
+        // and store it again
+        let mut push = Node::simple(Operation::StoreStack);
+        f.add_body(push, &mut ir, |i, r| {
+            i.connect_input(0, ss1, r);
+            i.connect_input(1, added_val, r);
+            ss1 = i.sinks()[0];
+        });
+
+        // make a use of the *initial* stack value from before the load
+        let mut pop = Node::simple(Operation::LoadStack);
+        let ss_val_1 = f.add_body(pop, &mut ir, |i, r| {
+            i.connect_input(0, initial_ss, r);
+            i.sinks()[0]
+        }).1;
+
+        let mut three = Node::simple(Operation::Constant(3));
+        let mut add = Node::simple(Operation::Add);
+        let mut three_const = f.add_body(three, &mut ir, |three, r| {
+            three.sinks()[0]
+        }).1;
+        f.add_body(add, &mut ir, |add, r| {
+            add.connect_input(0, ss_val_1, r);
+            add.connect_input(1, three_const, r);
+            add.connect_output(0, output, r);
+        });
+
+
+        ir.set_body(f);
+        let hello_fn: extern "C" fn(usize) -> usize = ir.compile_fn().unwrap().0;
+        assert_eq!(hello_fn(0), 3);
+        assert_eq!(hello_fn(1), 4);
+    }
+
 
 }

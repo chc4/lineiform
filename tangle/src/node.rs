@@ -8,6 +8,7 @@ use crate::time::Timestamp;
 use crate::ir::IR;
 use crate::port::{PortMeta, PortIdx, PortEdge, Storage, EdgeVariant};
 use crate::region::{Region, RegionIdx, State, StateVariant};
+use crate::abi::{x86_64, Abi};
 
 pub type NodeIdx = NodeIndex;
 #[derive(Debug)]
@@ -34,7 +35,7 @@ pub enum Operation {
 
 pub mod NodeVariant {
     use super::{Operation, Region};
-    
+
     use super::*;
     #[derive(Debug)]
     pub struct Move(pub Storage, pub Storage); // A move operation, sink <- source.
@@ -44,17 +45,19 @@ pub mod NodeVariant {
     pub struct Function<const A: usize, const O: usize> {
         pub args: u8,
         pub outs: u8,
-        pub stack_slots: u32,
+        pub stack_slots: Vec<PortIdx>,
+        pub highwater: u8,
         pub region: RegionIdx,
     } // "Lambda-Nodes"; procedures and functions
     impl<const A: usize, const O: usize> Function<A, O> {
-        pub fn new(ir: &mut IR) -> Function<A, O> {
-            let r = ir.new_region();
+        pub fn new<ABI: Abi + Default + 'static>(ir: &mut IR) -> Function<A, O> {
+            let r = ir.new_region(Some(<ABI as Default>::default()));
             Self {
                 region: r,
                 args: 0,
                 outs: 0,
-                stack_slots: 0,
+                stack_slots: vec![],
+                highwater: 0,
             }
         }
 
@@ -70,14 +73,8 @@ pub mod NodeVariant {
         }
 
         pub fn add_argument(&mut self, ir: &mut IR) -> PortIdx {
-            let arg_map = vec![
-                RegSpec::rdi(),
-                RegSpec::rsi(),
-                RegSpec::rdx(),
-            ];
             let port = ir.in_region(self.region, |mut r, ir| {
                 let port = r.add_source();
-                r.constrain(port, Storage::Physical(arg_map[self.args as usize].clone()));
                 port
             });
             self.args += 1;
@@ -85,13 +82,8 @@ pub mod NodeVariant {
         }
 
         pub fn add_return(&mut self, ir: &mut IR) -> PortIdx {
-            let out_map = vec![
-                RegSpec::rax(),
-                RegSpec::rdx(),
-            ];
             let port = ir.in_region(self.region, |mut r, ir| {
                 let port = r.add_sink();
-                r.constrain(port, Storage::Physical(out_map[self.outs as usize].clone()));
                 port
             });
             self.outs += 1;
@@ -104,7 +96,7 @@ pub mod NodeVariant {
                 let port = r.add_port();
                 r.states.push(State {
                     name: "stack".to_string(),
-                    variant: StateVariant::Stack(self.stack_slots),
+                    variant: StateVariant::Stack(self.stack_slots.len().try_into().unwrap()),
                     producers: vec![port],
                 });
 
@@ -113,7 +105,8 @@ pub mod NodeVariant {
                 port
             });
 
-            self.stack_slots += 1;
+            self.stack_slots.push(port);
+            self.highwater = core::cmp::max(self.highwater, self.stack_slots.len().try_into().unwrap());
             port
         }
     }
@@ -471,18 +464,18 @@ impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O
     }
 
     fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
-        if self.stack_slots != 0 {
+        if self.highwater != 0 {
             // allocate stack space
             dynasm!(ops
-                ; sub rsp, (self.stack_slots*8).try_into().unwrap()
+                ; sub rsp, (self.highwater*8).try_into().unwrap()
             );
         }
         // if we're calling codegen on a function, it should be the only one.
         ir.in_region(self.region, |r, ir| { r.codegen(ir, ops); });
-        if self.stack_slots != 0 {
+        if self.highwater != 0 {
             // cleanup stack space
             dynasm!(ops
-                ; add rsp, (self.stack_slots*8).try_into().unwrap()
+                ; add rsp, (self.highwater*8).try_into().unwrap()
             );
         }
         dynasm!(ops
@@ -525,8 +518,10 @@ impl Node {
         NodeVariant::Move(sink, source)
     }
 
+    // id like for this to just take an ABI parameter but rust deprececated
+    // default generic arguments for functions :/
     pub fn function<const A: usize, const O: usize>(ir: &mut IR) -> NodeVariant::Function<A, O> {
-        NodeVariant::Function::new(ir)
+        NodeVariant::Function::new::<x86_64>(ir)
     }
 }
 

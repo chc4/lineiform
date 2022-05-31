@@ -25,24 +25,28 @@ impl Timestamp {
     }
 
     /// Increment the timestamp's major time
+    #[must_use]
     pub fn increment(mut self) -> Self {
         self.major = self.major.checked_add(1).unwrap();
         self
     }
 
     /// Decrement the timestamp's major time
+    #[must_use]
     pub fn decrement(mut self) -> Self {
         self.major = self.major.checked_sub(1).unwrap();
         self
     }
 
     /// Push the timestamp to a later minor time
+    #[must_use]
     pub fn push(mut self) -> Self {
         self.minor = self.minor.checked_add(1).unwrap();
         self
     }
 
     /// Pull the timestamp to a sooner minor time
+    #[must_use]
     pub fn pull(mut self) -> Self {
         self.minor = self.minor.checked_sub(1).unwrap();
         self
@@ -90,3 +94,44 @@ impl Display for Timestamp {
         write!(fmt, "{}.{}", self.major, self.minor)
     }
 }
+
+/// Vector clock used for state effect ordering.
+struct Clock {
+    members: Vec<Timestamp>
+}
+
+impl Clock {
+    pub fn new() -> Self {
+        Clock { members: vec![] }
+    }
+
+    #[must_use]
+    pub fn increment(mut self, member: usize) -> Self {
+        self.members[member] = self.members[member].increment();
+        self
+    }
+
+    #[must_use]
+    pub fn decrement(mut self, member: usize) -> Self {
+        self.members[member] = self.members[member].decrement();
+        self
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
