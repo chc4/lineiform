@@ -141,6 +141,7 @@ impl IR {
             if r.idx == self.master_region {
                 continue;
             }
+            r.apply_constaints();
             r.attach_ports();
             r.propogate_state_edges();
             println!("propogated state edges");
@@ -189,10 +190,6 @@ impl IR {
     }
 
     pub fn compile_fn<A, O>(&mut self) -> Result<(extern "C" fn(A) -> O, usize), Box<dyn std::error::Error>> {
-        for r in self.regions.node_weights_mut() {
-            // apply all ABI constrainments that regions need to enforce for regalloc
-            r.apply_constaints();
-        }
         self.regalloc();
         self.validate();
         let (mut ops, off, size) = self.codegen();
