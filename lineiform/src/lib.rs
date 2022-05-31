@@ -1,6 +1,6 @@
 #![allow(unused_imports, unused_parens)]
 #![deny(unused_must_use, improper_ctypes_definitions)]
-#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, associated_type_bounds, asm, destructuring_assignment, generic_const_exprs, inline_const, inline_const_pat)]
+#![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, associated_type_bounds, asm, destructuring_assignment, generic_const_exprs, inline_const, inline_const_pat, int_roundings)]
 
 #[deny(bare_trait_objects)]
 extern crate jemallocator;
@@ -101,9 +101,9 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
 
     pub fn speedup<F>(&mut self, f: F) -> impl Fn(A)->O where
         F: Fn(A)->O,
-        [(); size_of::<A>()]: Sized,
-        [(); size_of::<(extern fn(data: *const c_void, A)->O, *const c_void, A)>()]: Sized,
-        [(); size_of::<O>()]: Sized
+        [(); usize::div_ceil(size_of::<A>(), size_of::<usize>())]: Sized,
+        [(); usize::div_ceil(size_of::<(extern fn(data: *const c_void, A)->O, *const c_void, A)>(), size_of::<usize>())]: Sized,
+        [(); usize::div_ceil(size_of::<O>() ,size_of::<usize>())]: Sized
     {
         // We are given a [data, trait] fat pointer for f.
         // We want to feed c_fn into our lifter, calling F::call as arg 1, with
@@ -128,7 +128,7 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
             ]);
         let mut inlined = Jit::new(&mut self.tracer);
         //inlined.assume(vec![call as *const u8, f_body as *const u8]);
-        let (inlined, _size) = inlined.lower(func).unwrap();
+        let (inlined, _size) = inlined.lower::<_, O>(func).unwrap();
 
         if true {
             let new_func_dis = self.tracer.disassemble(inlined as *const (), _size as usize).unwrap();

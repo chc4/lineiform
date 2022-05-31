@@ -464,6 +464,8 @@ impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O
     }
 
     fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        assert_eq!(self.args as usize, A);
+        assert_eq!(self.outs as usize, O);
         if self.highwater != 0 {
             // allocate stack space
             dynasm!(ops

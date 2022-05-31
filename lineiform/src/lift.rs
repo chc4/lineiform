@@ -241,11 +241,11 @@ impl<'a> Jit<'a> {
 
     pub fn lower<A, O>(&mut self, f: Function<A, O>)
     -> Result<(extern "C" fn((A,))->O, usize),LiftError> where
-    [(); size_of::<A>()]: Sized,
-    [(); size_of::<O>()]: Sized {
+    [(); usize::div_ceil(size_of::<A>(), size_of::<usize>())]: Sized,
+    [(); usize::div_ceil(size_of::<O>(), size_of::<usize>())]: Sized {
         let mut ir = tangle::IR::new();
         let ctx = Context::new();
-        let mut tangle_f = tangle::node::Node::function::<{ size_of::<A>() }, { size_of::<O>() }>(&mut ir);
+        let mut tangle_f = tangle::node::Node::function::<{ usize::div_ceil(size_of::<A>(), size_of::<usize>()) }, { usize::div_ceil(size_of::<O>() ,size_of::<usize>()) }>(&mut ir);
         let mut func = JitFunction {
             ir: ir,
             f: tangle_f,
