@@ -8,9 +8,6 @@ extern crate enum_display_derive;
 extern crate yaxpeax_arch;
 extern crate yaxpeax_x86;
 extern crate goblin;
-extern crate cranelift;
-extern crate cranelift_jit;
-extern crate cranelift_codegen;
 extern crate target_lexicon;
 extern crate bitvec;
 extern crate bitflags;
@@ -151,8 +148,6 @@ fn test_jit() -> Result<(), MainError> {
     tracer.format(&func.instructions)?;
 
     let mut jitted = Jit::new(&mut tracer);
-    //
-    jitted.format();
     let (new_func, new_size) = jitted.lower(func)?;
     let new_func_dis = tracer.disassemble(new_func as *const (), new_size as usize)?;
     println!("recompiled function:");

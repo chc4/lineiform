@@ -16,6 +16,9 @@ use core::num::Wrapping;
 use core::cmp::max;
 use rangemap::RangeInclusiveMap;
 
+const HOST_WIDTH: u8 = std::mem::size_of::<usize>() as u8;
+const STACK_TOP: usize = 0xFFFF_FFFF_FFFF_FFF0;
+
 use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum LiftError {
@@ -210,9 +213,7 @@ impl Context {
 }
 
 pub struct Jit<'a> {
-    ir: tangle::IR,
     tracer: &'a mut Tracer<'static>,
-    context: Context,
 }
 
 enum EmitEffect {
@@ -223,16 +224,18 @@ enum EmitEffect {
     Ret(Option<usize>),
 }
 
+struct JitFunction<const A_n: usize, const O_n: usize> {
+    ir: tangle::IR,
+    f: tangle::node::Function<A_n, O_n>,
+    context: Context,
+}
+
 use std::mem::size_of;
 impl<'a> Jit<'a> {
     pub fn new(tracer: &'a mut Tracer<'static>) -> Jit<'a> {
-        let ctx = Context::new();
-        let mut ir = tangle::IR::new();
 
         Self {
-            ir: ir,
             tracer,
-            context: ctx,
         }
     }
 
@@ -240,20 +243,34 @@ impl<'a> Jit<'a> {
     -> Result<(extern "C" fn((A,))->O, usize),LiftError> where
     [(); size_of::<A>()]: Sized,
     [(); size_of::<O>()]: Sized {
-        let mut func = tangle::Function::<{ size_of::<A>() }, { size_of::<O>() }>::new(&mut self.ir);
-        let translate_result = self.translate(f, &mut func)?;
-        self.ir.set_body(func);
-        Ok(self.ir.compile_fn().unwrap())
+        let mut ir = tangle::IR::new();
+        let ctx = Context::new();
+        let mut tangle_f = tangle::node::Node::function::<{ size_of::<A>() }, { size_of::<O>() }>(&mut ir);
+        let mut func = JitFunction {
+            ir: ir,
+            f: tangle_f,
+            context: ctx,
+        };
+        let translate_result = func.translate(f, self)?;
+        Ok(func.ir.compile_fn().unwrap())
     }
+}
 
+impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
     /// Translate a Function into Cranelift IR.
     /// Calling conventions here are a bit weird: essentially we only ever build
     ///
-    fn translate<A, O, const A_n: usize, const O_n: usize>
-    (&mut self, f: Function<A, O>, func: &mut tangle::Function<A_n, O_n>) -> Result<(), LiftError> {
+    fn translate<'a, A, O>
+    (&mut self, f: Function<A, O>, jit: &mut Jit<'a>) -> Result<(), LiftError> {
+        unimplemented!("{} {}", A_n, O_n);
+        // add and bind ports for all the function arguments
+        for i in 0..(A_n/8) {
+            println!("adding argument {}", i);
+            // TODO
+        }
         let mut base = (f.base as usize) + f.offset.0;
         let mut ip = base;
-        println!("starting emitting @ base+0x{:x}", ip - self.tracer.get_base()?);
+        println!("starting emitting @ base+0x{:x}", ip - jit.tracer.get_base()?);
         let mut stream = f.instructions.clone();
         let mut start_i = f.offset.1;
         let mut i = f.offset.1;
@@ -270,7 +287,18 @@ impl<'a> Jit<'a> {
             let inst = inst.unwrap();
             ip += inst.len().to_const() as usize;
             let mut eff = self.emit(ip, inst)?;
+            match eff {
+                EmitEffect::Advance => {
+                    i += 1;
+                },
+                _ => unimplemented!("emit effect"),
+            }
         }
+        for i in 0..O_n {
+            unimplemented!("adding output {}", i);
+        }
+
+        self.ir.set_body(self.f);
         Ok(())
     }
 
@@ -278,13 +306,12 @@ impl<'a> Jit<'a> {
         println!("---- {}", inst);
         let ms = inst.mem_size().and_then(|m| m.bytes_size());
         match inst.opcode() {
-            x => unimplemented!("unimplemented opcode {:?}", x),
-            //Opcode::MOV => {
-            //    // we need to support mov dword [eax+4], rcx and vice versa, so
-            //    // both the load and store need a mem_size for memory width.
-            //    let val = self.operand_value(ip, inst.operand(1), ms);
-            //    self.store(inst.operand(0), val, ms);
-            //},
+            Opcode::MOV => {
+                // we need to support mov dword [eax+4], rcx and vice versa, so
+                // both the load and store need a mem_size for memory width.
+                let val = self.port_for(ip, inst.operand(1), ms);
+                //self.store(inst.operand(0), val, ms);
+            },
             //Opcode::ADD => {
             //    let left = self.operand_value(ip, inst.operand(0), ms);
             //    let mut right = self.operand_value(ip, inst.operand(1), ms);
@@ -305,8 +332,76 @@ impl<'a> Jit<'a> {
             //    let added = self.adc::<true>(left, right, carry);
             //    self.store(inst.operand(0), added, ms);
             //},
+            op @ (Opcode::SUB | Opcode::CMP) => {
+                if let (Opcode::SUB, Operand::Register(const { RegSpec::rsp() })) = (op, inst.operand(0)) {
+                    // This is a sub rsp, 8; or whatever instruction allocating stack
+                    // space. We don't want to emit any instructions, just allocate
+                    // stack slots.
+                    let space = match inst.operand(1) {
+                        Operand::ImmediateI8(i) => usize::try_from(i).unwrap(),
+                        x => unimplemented!("unknown space for stack allocating {:?}", x),
+                    };
+                    println!("emitting {} stack slots", space / HOST_WIDTH as usize);
+                    assert!(space % HOST_WIDTH as usize == 0);
+                    for i in 0..(space / HOST_WIDTH as usize) {
+                        self.f.add_stack_slot(&mut self.ir);
+                    }
+                } else {
+                    // sub eax, ff
+                    // ff gets sign extended to 0xffff_ffff
+                    let left = self.port_for(ip, inst.operand(0), ms);
+                    let mut right = self.port_for(ip, inst.operand(1), ms);
+                    //if inst.operand(1).is_imm() {
+                    //    right = right.sign_extend(self.builder, inst.operand(0).width().or(ms).unwrap());
+                    //}
+                    //let subbed = self.sub::<true>(left, right);
+                    //if let Opcode::SUB = op {
+                    //    self.store(inst.operand(0), subbed, ms);
+                    //}
+                }
+            },
+            x => unimplemented!("unimplemented opcode {:?}", x),
         }
         Ok(EmitEffect::Advance)
+    }
+
+    /// Get the Tangle port that corrosponds with the requested operand.
+    ///
+    /// If we have `mov eax, ecx`, we want to resolve ecx to the last emitted ecx port.
+    /// This has to handle *all* operand types, however: if there's an `[ecx]` we need
+    /// to emit a StackLoad instruction and return the value result of that as well.
+    ///
+    /// If the location is a load, `width` is the memory operation size in bytes.
+    /// It is ignored for other operand types, so that e.g. `mov dword [rax+4], rcx`
+    /// doesn't mistakenly truncate rcx.
+    pub fn port_for(&mut self, ip: usize, operand: Operand, ms: Option<u8>) -> PortIdx {
+        println!("getting port for {}", operand);
+        match operand {
+            Operand::RegDisp(const { RegSpec::rsp() }, o) => {
+                unimplemented!("stack ref");
+            },
+            Operand::Register(const { RegSpec::rip() }) => {
+                unimplemented!("emit const")
+                //HOST_TMP(ip as _)
+            },
+            //Operand::RegDisp(const { RegSpec::rip() }, o) => {
+            //    HOST_TMP((Wrapping(ip) + Wrapping(o as isize as usize)).0 as _)
+            //},
+            //Operand::Register(r) if r.width() == 1 => {
+            //    match r {
+            //        const { RegSpec::al() } | const { RegSpec::bl() } |
+            //        const { RegSpec::cl() } => {
+            //            // I should probably re-think Const, and add variable
+            //            // widths to it: there's not really a good reason for
+            //            // `and al, 0x1` to have to mask out rax for the value
+            //            // and then bitselect it back in at the store.
+            //            self.get(Location::Reg(r)).tmp(self.builder, r.width())
+            //        },
+            //        _ => unimplemented!("al etc unimplemented")
+            //    }
+            //},
+            x => unimplemented!("getting a port_for {} unimplemented", x),
+        }
     }
 
     pub fn format(&self) {
