@@ -574,4 +574,36 @@ mod test {
         assert_eq!(hello_fn(0), 2);
         assert_eq!(hello_fn(1), 3);
     }
+
+    #[test]
+    pub fn function_tailcall_with_shuffle() {
+        let mut ir = IR::new();
+        let mut f = Node::function::<2, 1>(&mut ir);
+        let input_0 = f.add_argument(&mut ir);
+        let input_1 = f.add_argument(&mut ir);
+        let output = f.add_return(&mut ir);
+
+        extern "C" fn external_function(a: usize) -> usize {
+            a + 2
+        }
+
+        let mut addr = Node::simple(Operation::Constant(external_function as *const () as isize));
+        let mut tailcall = Node::leave();
+        let mut addr_const = None;
+        f.add_body(addr, &mut ir, |addr, r| {
+            addr_const = Some(addr.sinks()[0]);
+        });
+        f.add_body(tailcall, &mut ir, |tailcall, r| {
+            tailcall.connect_input(0, addr_const.unwrap(), r);
+            let arg = r.add_port();
+            r.constrain(arg, crate::port::Storage::Physical(RegSpec::rdi()));
+            tailcall.add_input(arg, r);
+            tailcall.connect_input(1, input_1, r);
+        });
+
+        ir.set_body(f);
+        let hello_fn: extern "C" fn((usize, usize)) -> usize = ir.compile_fn().unwrap().0;
+        assert_eq!(hello_fn((0, 0)), 2);
+        assert_eq!(hello_fn((0, 1)), 3);
+    }
 }
