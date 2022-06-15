@@ -12,7 +12,7 @@ use crate::node::{Node, NodeIdx, NodeBehavior, NodeVariant, Operation};
 use crate::port::{Port, PortMeta, PortIdx, PortEdge, Edge, EdgeVariant, Storage, OptionalStorage};
 use crate::ir::{IR, VirtualRegister, VirtualRegisterMap};
 use crate::time::Timestamp;
-use crate::abi::Abi;
+use crate::abi::{Abi, AbiRequest, AbiStorage};
 
 
 pub type RegionEdge = ();
@@ -162,12 +162,29 @@ impl Region {
         p
     }
 
-    pub fn apply_constaints(&mut self) {
+    pub fn constrain_abi_storage(&mut self, s: &AbiStorage, port: PortIdx) {
+        match s {
+            AbiStorage::Register(r) => self.constrain(port, Storage::Physical(*r)),
+            AbiStorage::StackSlot(s) => unimplemented!("abi stack slot"),
+            Problem => unimplemented!("unknown abi"),
+        }
+    }
+
+    pub fn apply_constraints(&mut self) {
         let mut abi = None;
         core::mem::swap(&mut self.abi, &mut abi);
         abi.as_ref().map(|abi| {
-            abi.constrain_arguments(self);
-            abi.constrain_returns(self);
+            // XXX: this will break for any function with floats
+            for (a,port) in abi.provide_arguments(vec![AbiRequest::Integer(self.sources.len())])
+                    .iter().zip(self.sources.clone().iter()) {
+                println!("constraining argument port {:?} to {:?}", port, a);
+                self.constrain_abi_storage(a, *port);
+            }
+            for (a,port) in abi.provide_returns(vec![AbiRequest::Integer(self.sources.len())])
+                    .iter().zip(self.sinks.clone().iter()) {
+                println!("constraining return port {:?} to {:?}", port, a);
+                self.constrain_abi_storage(a, *port);
+            }
         });
         core::mem::swap(&mut self.abi, &mut abi);
     }

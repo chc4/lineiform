@@ -141,7 +141,7 @@ impl IR {
             if r.idx == self.master_region {
                 continue;
             }
-            r.apply_constaints();
+            r.apply_constraints();
             r.attach_ports();
             r.propogate_state_edges();
             println!("propogated state edges");

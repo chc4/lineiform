@@ -5,32 +5,57 @@ use yaxpeax_x86::long_mode::RegSpec;
 use core::fmt::Debug;
 
 pub trait Abi: Debug {
-    fn constrain_arguments(&self, reg: &mut Region);
-    fn constrain_returns(&self, reg: &mut Region);
+    fn provide_arguments(&self, request: Vec<AbiRequest>) -> Vec<AbiStorage>;
+    fn provide_returns(&self, request: Vec<AbiRequest>) -> Vec<AbiStorage>;
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct x86_64;
 
+pub enum AbiRequest {
+    Integer(usize),
+    Float(usize),
+    Vector(usize),
+}
+
+#[derive(Clone, Debug)]
+pub enum AbiStorage {
+    Register(RegSpec),
+    // FPRegister
+    // XMMRegister
+    // etc
+    StackSlot(usize),
+    Problem(),
+}
+use AbiStorage::*;
+
 impl Abi for x86_64 {
-    fn constrain_arguments(&self, reg: &mut Region) {
-        let arg_map = vec![
-            RegSpec::rdi(),
-            RegSpec::rsi(),
-            RegSpec::rdx(),
-        ];
-        for (i, arg) in reg.sources.clone().iter().enumerate() {
-            reg.constrain(*arg, Storage::Physical(arg_map[i as usize].clone()));
-        }
+    // this probably has to be something to do with a generic argument that has a Tracable trait
+    fn provide_arguments(&self, request: Vec<AbiRequest>) -> Vec<AbiStorage> {
+        request.iter().map(|req| {
+            match req {
+                AbiRequest::Integer(n) =>
+                    vec![
+                        Register(RegSpec::rdi()),
+                        Register(RegSpec::rsi()),
+                        Register(RegSpec::rdx()),
+                        Problem()
+                    ].drain(..).take(*n).collect::<Vec<_>>(),
+                _ => unimplemented!()
+            }
+        }).flatten().collect()
     }
 
-    fn constrain_returns(&self, reg: &mut Region) {
-        let out_map = vec![
-            RegSpec::rax(),
-            RegSpec::rdx(),
-        ];
-        for (i, arg) in reg.sinks.clone().iter().enumerate() {
-            reg.constrain(*arg, Storage::Physical(out_map[i as usize].clone()));
-        }
-    }
+    fn provide_returns(&self, request: Vec<AbiRequest>) -> Vec<AbiStorage> {
+        request.iter().map(|req| {
+            match req {
+                AbiRequest::Integer(n) =>
+                    vec![
+                        Register(RegSpec::rax()),
+                        Register(RegSpec::rdi()),
+                        Problem()
+                    ].drain(..).take(*n).collect::<Vec<_>>(),
+                _ => unimplemented!()
+            }
+        }).flatten().collect()    }
 }
