@@ -25,7 +25,7 @@ pub struct Node {
 #[derive(Debug)]
 pub enum Operation {
     Nop,
-    Constant(usize),
+    Constant(isize),
     Apply, // Call a Function node with arguments
     Inc,
     Add,
@@ -97,7 +97,7 @@ pub mod NodeVariant {
                 r.states.push(State {
                     name: "stack".to_string(),
                     variant: StateVariant::Stack(self.stack_slots.len().try_into().unwrap()),
-                    producers: vec![port],
+                    producers: vec![],
                 });
 
                 r.constrain(port, Storage::Immaterial(Some(new_state.try_into().unwrap())));
@@ -113,6 +113,14 @@ pub mod NodeVariant {
     pub struct Global(pub Region); // "Delta-Nodes"; global variables
     pub struct Loop(pub Region); // "Theta-Nodes"; do-while loops. Only ever tail-controlled.
     pub struct Partition(pub Vec<Region>); // "Gamma-Nodes"; if-then-else statements and case-switch
+    /// Tailcalls or jumps into native code are represented as Leave nodes.
+    /// These nodes should have:
+    ///     1) an input port for the address to jump to
+    ///     2) some arbitrary number of input state or value ports for values
+    ///         that should be observed by the jump target (e.g. register state or side-effects)
+    ///     3) an output port state edge that should be connected to the function return
+    #[derive(Debug)]
+    pub struct Leave;
     // The paper also has "Phi-Nodes" (mutually recursive functions) and
     // "Omega-Nodes" (translation units). We only ever JIT one function at a time.
 }
@@ -304,7 +312,7 @@ impl NodeBehavior for NodeVariant::Simple {
                 match output.storage.as_ref().unwrap() {
                     Storage::Physical(r0) => match r0.class() {
                         register_class::Q => dynasm!(ops
-                            ; mov Rq(r0.num()), (*n).try_into().unwrap()
+                            ; mov Rq(r0.num()), QWORD (*n) as i64
                         ),
                         x => unimplemented!("unknown class {:?} for constant", x),
                     },
@@ -388,6 +396,40 @@ impl NodeBehavior for NodeVariant::Simple {
             Operation::LoadStack => "load_ss".to_string(),
             Operation::StoreStack => "store_ss".to_string(),
             _ => unimplemented!(),
+        }
+    }
+}
+
+impl NodeBehavior for NodeVariant::Leave {
+    fn input_count(&self) -> usize {
+        1
+    }
+
+    fn output_count(&self) -> usize {
+        1
+    }
+
+    fn ports_callback(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region) {
+        println!("tailcall leave ");
+        r.constrain(outputs[0], Storage::Immaterial(None));
+    }
+
+    fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        // "what happens if you try to tailcall with stack slots allocated?"
+        // haha. yeah.
+        let source = &r.ports[inputs[0]];
+        match source.storage.as_ref().unwrap() {
+            Storage::Physical(r0) => {
+                match r0.class() {
+                    register_class::Q => {
+                        dynasm!(ops
+                            ; jmp Rq(r0.num())
+                        );
+                    },
+                    _ => unimplemented!("tailcall class {:?}", r0.class())
+                }
+            },
+            _ => unimplemented!("unknown tailcall target")
         }
     }
 }
@@ -524,6 +566,10 @@ impl Node {
     // default generic arguments for functions :/
     pub fn function<const A: usize, const O: usize>(ir: &mut IR) -> NodeVariant::Function<A, O> {
         NodeVariant::Function::new::<x86_64>(ir)
+    }
+
+    pub fn leave() -> NodeVariant::Leave {
+        NodeVariant::Leave
     }
 }
 

@@ -144,6 +144,7 @@ impl IR {
             r.apply_constraints();
             r.attach_ports();
             r.propogate_state_edges();
+            r.observe_state_outputs();
             println!("propogated state edges");
 
             //r.move_constants_to_operands();
@@ -547,5 +548,30 @@ mod test {
         assert_eq!(hello_fn(1), 4);
     }
 
+    #[test]
+    pub fn function_tailcall_external() {
+        let mut ir = IR::new();
+        let mut f = Node::function::<1, 1>(&mut ir);
+        let input = f.add_argument(&mut ir);
+        let output = f.add_return(&mut ir);
 
+        extern "C" fn external_function(a: usize) -> usize {
+            a + 2
+        }
+
+        let mut addr = Node::simple(Operation::Constant(external_function as *const () as isize));
+        let mut tailcall = Node::leave();
+        let mut addr_const = None;
+        f.add_body(addr, &mut ir, |addr, r| {
+            addr_const = Some(addr.sinks()[0]);
+        });
+        f.add_body(tailcall, &mut ir, |tailcall, r| {
+            tailcall.connect_input(0, addr_const.unwrap(), r);
+        });
+
+        ir.set_body(f);
+        let hello_fn: extern "C" fn(usize) -> usize = ir.compile_fn().unwrap().0;
+        assert_eq!(hello_fn(0), 2);
+        assert_eq!(hello_fn(1), 3);
+    }
 }

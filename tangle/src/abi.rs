@@ -52,7 +52,7 @@ impl Abi for x86_64 {
                 AbiRequest::Integer(n) =>
                     vec![
                         Register(RegSpec::rax()),
-                        Register(RegSpec::rdi()),
+                        Register(RegSpec::rdx()),
                         Problem()
                     ].drain(..).take(*n).collect::<Vec<_>>(),
                 _ => unimplemented!()

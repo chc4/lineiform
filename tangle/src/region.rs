@@ -18,12 +18,12 @@ use crate::abi::{Abi, AbiRequest, AbiStorage};
 pub type RegionEdge = ();
 pub type RegionIdx = NodeIndex;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StateVariant {
     Stack(u32),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct State {
     pub name: String,
     pub variant: StateVariant,
@@ -414,6 +414,8 @@ impl Region {
             };
             println!("state variant {}", state);
             while let Some(source) = frontier.pop() {
+                // add the node to the producers list for the state value
+                self.states[state as usize].producers.push(source);
                 let mut edges = self.ports.neighbors_directed(source, Direction::Incoming).detach();
                 while let Some((e, sink)) = edges.next(&self.ports) {
                     println!("state edge {:?} -> {:?}", source, sink);
@@ -421,6 +423,19 @@ impl Region {
                     frontier.push(sink);
                 }
             }
+        }
+    }
+
+    pub fn observe_state_outputs(&mut self) {
+        // connect all state variables to the region return
+        for state in self.states.clone() {
+            let new_sink = self.add_sink();
+            self.ports[new_sink].set_variant(EdgeVariant::State);
+            let producer = *state.producers.last().unwrap();
+            assert!(matches!(self.ports[producer].storage.unwrap(), Storage::Immaterial(_)));
+            println!("here");
+            self.constrain(new_sink, self.ports[producer].storage.unwrap());
+            self.connect_ports(*state.producers.last().unwrap(), new_sink);
         }
     }
 

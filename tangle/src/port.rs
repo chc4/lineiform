@@ -55,7 +55,7 @@ impl Deref for OptionalStorage {
 pub mod PortMeta {
     use frunk::HList;
     #[derive(Debug, Clone)]
-    pub struct Constant(pub usize);
+    pub struct Constant(pub isize);
     #[derive(Debug, Clone)]
     pub struct StackOff(pub i32);
     pub type All = HList![Option<Constant>, Option<StackOff>];
