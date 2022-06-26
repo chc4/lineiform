@@ -1,4 +1,4 @@
-#![allow(unused_imports, unused_parens)]
+#![allow(unused_imports, unused_parens, unused_variables)]
 #![deny(unused_must_use, improper_ctypes_definitions)]
 #![feature(box_syntax, box_patterns, trait_alias, unboxed_closures, fn_traits, ptr_metadata, stmt_expr_attributes, entry_insert, map_try_insert, if_let_guard, bench_black_box, associated_type_bounds, asm, destructuring_assignment, generic_const_exprs, inline_const, inline_const_pat, int_roundings)]
 

@@ -210,6 +210,7 @@ impl Context {
             flags: Vec::new(),
         }
     }
+
 }
 
 pub struct Jit<'a> {
@@ -218,7 +219,7 @@ pub struct Jit<'a> {
 
 enum EmitEffect {
     Advance,
-    Jmp(usize),
+    Jmp(PortIdx),
     Branch(PortIdx, PortIdx, usize),
     Call(usize),
     Ret(Option<usize>),
@@ -243,8 +244,10 @@ impl<'a> Jit<'a> {
     -> Result<(extern "C" fn((A,))->O, usize),LiftError> where
     [(); usize::div_ceil(size_of::<A>(), size_of::<usize>())]: Sized,
     [(); usize::div_ceil(size_of::<O>(), size_of::<usize>())]: Sized {
+        //assert_eq!(f.pinned, vec![]);
         let mut ir = tangle::IR::new();
         let ctx = Context::new();
+        println!("lowering function {}->{}", size_of::<A>(), size_of::<O>());
         let mut tangle_f = tangle::node::Node::function::<{ usize::div_ceil(size_of::<A>(), size_of::<usize>()) }, { usize::div_ceil(size_of::<O>() ,size_of::<usize>()) }>(&mut ir);
         let mut func = JitFunction {
             ir: ir,
@@ -252,6 +255,8 @@ impl<'a> Jit<'a> {
             context: ctx,
         };
         let translate_result = func.translate(f, self)?;
+
+        func.ir.set_body(func.f);
         Ok(func.ir.compile_fn().unwrap())
     }
 }
@@ -262,12 +267,26 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
     ///
     fn translate<'a, A, O>
     (&mut self, f: Function<A, O>, jit: &mut Jit<'a>) -> Result<(), LiftError> {
-        unimplemented!("{} {}", A_n, O_n);
+        println!("translate for {}->{}", A_n, O_n);
         // add and bind ports for all the function arguments
-        for i in 0..(A_n/8) {
-            println!("adding argument {}", i);
+        use tangle::abi::{AbiRequest, AbiStorage};
+        let (abi_arg, abi_ret) = self.ir.in_region(self.f.region, |r, ir| {
+            let abi = r.abi.as_ref().unwrap();
+            (
+                abi.provide_arguments(vec![AbiRequest::Integer(A_n)]),
+                abi.provide_returns(vec![AbiRequest::Integer(O_n)])
+            )
+        });
+        for i in 0..A_n {
+            let p = self.f.add_argument(&mut self.ir);
+            println!("adding argument {} -> {:?}", i, p);
+            match abi_arg[i] {
+                AbiStorage::Register(r) => self.store(Operand::Register(r), p, None),
+                _ => unimplemented!(),
+            }
             // TODO
         }
+
         let mut base = (f.base as usize) + f.offset.0;
         let mut ip = base;
         println!("starting emitting @ base+0x{:x}", ip - jit.tracer.get_base()?);
@@ -291,14 +310,33 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                 EmitEffect::Advance => {
                     i += 1;
                 },
+                EmitEffect::Jmp(p) => {
+                    let mut tailcall = tangle::node::Node::leave();
+                    // TODO: add all the context registers here?
+                    self.f.add_body(tailcall, &mut self.ir, |tailcall, ir| {
+                        tailcall.connect_input(0, p, ir);
+                    });
+                    break;
+                },
                 _ => unimplemented!("emit effect"),
             }
         }
+
         for i in 0..O_n {
-            unimplemented!("adding output {}", i);
+            let p = self.f.add_return(&mut self.ir);
+            println!("adding return {} -> {:?}", i, p);
+            match abi_ret[i] {
+                AbiStorage::Register(r) => {
+                    let reg = self.port_for_register(r);
+                    self.ir.in_region(self.f.region,|r, ir| {
+                        r.connect_ports(reg, p)
+                    });
+                },
+                _ => unimplemented!(),
+            }
+            // TODO
         }
 
-        self.ir.set_body(self.f);
         Ok(())
     }
 
@@ -310,7 +348,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                 // we need to support mov dword [eax+4], rcx and vice versa, so
                 // both the load and store need a mem_size for memory width.
                 let val = self.port_for(ip, inst.operand(1), ms);
-                //self.store(inst.operand(0), val, ms);
+                self.store(inst.operand(0), val, ms);
             },
             //Opcode::ADD => {
             //    let left = self.operand_value(ip, inst.operand(0), ms);
@@ -351,6 +389,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                     // ff gets sign extended to 0xffff_ffff
                     let left = self.port_for(ip, inst.operand(0), ms);
                     let mut right = self.port_for(ip, inst.operand(1), ms);
+                    unimplemented!()
                     //if inst.operand(1).is_imm() {
                     //    right = right.sign_extend(self.builder, inst.operand(0).width().or(ms).unwrap());
                     //}
@@ -360,6 +399,19 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                     //}
                 }
             },
+            Opcode::JMP => {
+                let target = self.jump_target(inst.operand(0), ip, ms);
+                // If we know where the jump is going, we can try to inline
+                if let JitValue::Const(c) = target {
+                    println!("known jump location: 0x{:x}", c.0);
+                    unimplemented!();
+                    //return Ok(EmitEffect::Jmp(c.0));
+                } else if let JitValue::Value(v) = target {
+                    return Ok(EmitEffect::Jmp(v));
+                    unimplemented!("dynamic call");
+                }
+            },
+
             x => unimplemented!("unimplemented opcode {:?}", x),
         }
         Ok(EmitEffect::Advance)
@@ -400,7 +452,72 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
             //        _ => unimplemented!("al etc unimplemented")
             //    }
             //},
-            x => unimplemented!("getting a port_for {} unimplemented", x),
+            Operand::Register(r) => {
+                self.port_for_register(r)
+            },
+            x => unimplemented!("getting a port for {} unimplemented", x),
+        }
+    }
+
+    /// Store the value corrosponding with the given PortIdx in the storage location of the
+    /// operand, using the required memory width.
+    pub fn store(&mut self, operand: Operand, val: PortIdx, ms: Option<u8>) {
+        println!("storing port in {} width {:?}", operand, ms);
+        match operand {
+            Operand::Register(const { RegSpec::rip() }) => {
+                unimplemented!("store to ip to jump");
+            },
+            Operand::Register(const { RegSpec::rsp() }) => {
+                unimplemented!("store to stack register");
+            },
+            Operand::Register(r) if r.width() == HOST_WIDTH => {
+                self.context.bound.insert(Location::Reg(r), JitVariable::Variable(val))
+            },
+            _ => unimplemented!("store to unimplemented location {:?}", operand)
+        };
+    }
+
+    fn jump_target(&mut self, op: Operand, ip: usize, ms: Option<u8>) -> JitValue {
+        // Resolve the jump target (either absolute or relative)
+        let target: JitValue = match op {
+            absolute @ (
+                Operand::Register(_) |
+                Operand::RegDeref(_) |
+                Operand::RegDisp(_, _)
+            ) => {
+                JitValue::Value(self.port_for(ip, absolute, ms))
+            },
+            relative @ (
+                Operand::ImmediateI8(_)  |
+                Operand::ImmediateI16(_) |
+                Operand::ImmediateI32(_)
+            )=> {
+                let val = match relative {
+                    Operand::ImmediateI8(i) => i as isize as usize,
+                    Operand::ImmediateI16(i) => i as isize as usize,
+                    Operand::ImmediateI32(i) => i as isize as usize,
+                    _ => unreachable!(),
+                };
+                JitValue::Const(Wrapping(ip) + Wrapping(val))
+            },
+            _ => unimplemented!("jump target operand {}", op),
+        };
+        target
+    }
+
+    fn port_for_register(&mut self, reg: RegSpec) -> PortIdx {
+       match self.context.bound.entry(Location::Reg(reg)).or_insert_with(|| {
+            // We only get the variable on reads, and if we are reading from
+            // an unbound register than we have to create a port and bind it to
+            // the register as physical storage.
+            // This is because hypothetically we could get a Rust ABI function
+            // that reads one of the registers that isn't actually from an argument
+            // (though it would always be junk, so do we care to be correct about it?)
+            panic!("unset register {:?}", reg);
+            JitVariable::Variable(self.f.add_argument(&mut self.ir))
+        }) {
+           JitVariable::Variable(v) => *v,
+           JitVariable::Known(c) => unimplemented!("constant pool"),
         }
     }
 
