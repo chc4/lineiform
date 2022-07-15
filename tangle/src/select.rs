@@ -42,7 +42,7 @@
 //! The patterns themselves use an open recursion scheme, which should hopefully allow
 //! for the Rust compiler to fuse them together, instead of requiring a pre-build
 //! codegen step.
-use crate::node::{Node, NodeIdx, NodeVariant, NodeBehavior, Operation};
+use crate::node::{Node, NodeIdx, NodeVariant, NodeBehavior, Operation, NodeOwner, NodeCell};
 use crate::node::NodeVariant::*;
 use crate::region::{Region, NodeGraph};
 
@@ -60,7 +60,7 @@ use ascent::ascent;
 use std::collections::{HashMap, BTreeSet};
 use std::any::type_name;
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Pattern {
     Constant16,
     Constant16Jmp,
@@ -113,41 +113,92 @@ impl<T: ?Sized> std::hash::Hash for RefEquality<Rc<T>> {
     }
 }
 
+impl<'a, T: ?Sized> std::hash::Hash for RefEquality<&'a T> {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: std::hash::Hasher,
+    {
+        (self.0 as *const T).hash(state)
+    }
+}
+
 impl<T: ?Sized> PartialEq<RefEquality<Rc<T>>> for RefEquality<Rc<T>> {
     fn eq(&self, other: &RefEquality<Rc<T>>) -> bool {
         self.0.as_ref() as *const T == other.0.as_ref() as *const T
     }
 }
 
-impl<T: ?Sized> Eq for RefEquality<Rc<T>> where RefEquality<Rc<T>>: PartialEq { }
-
-use core::any::Any;
-fn variant<T: 'static>(n: &RefEquality<Rc<dyn NodeBehavior>>) -> bool {
-    (n.0.as_ref() as &(dyn core::any::Any + 'static)).downcast_ref::<T>().is_some()
+impl<'a, 'b, T: ?Sized> PartialEq<RefEquality<&'b T>> for RefEquality<&'a T> {
+    fn eq(&self, other: &RefEquality<&'b T>) -> bool {
+        self.0 as *const T == other.0 as *const T
+    }
 }
 
-type NodeRow = RefEquality<Rc<dyn NodeBehavior>>;
+impl<T: ?Sized> Eq for RefEquality<Rc<T>> where RefEquality<Rc<T>>: PartialEq { }
+impl<'a, T: ?Sized> Eq for RefEquality<&'a T> where RefEquality<&'a T>: PartialEq { }
+
+use core::any::Any;
+fn variant<T: 'static + NodeBehavior>(token: &RefEquality<&NodeOwner>, n: &RefEquality<Rc<NodeCell>>) -> bool {
+    (n.0.ro(token.0).as_ref() as &dyn Any).downcast_ref::<T>().is_some()
+}
+
+type NodeRow = RefEquality<Rc<NodeCell>>;
 
 use std::rc::Rc;
 use ascent::lattice::Product;
-ascent! {
-    relation edge(NodeIdx, NodeIdx, usize);
-    relation kind(NodeIdx, NodeRow);
-    lattice pattern(NodeIdx, PatternSet);
 
-    pattern(n, Set::singleton(Some(Pattern::Constant16))) <-- kind(n, ?c),
-        if variant::<NodeVariant::Constant>(c);
-}
 
 #[derive(Default)]
 pub struct PatternManager;
 
+ascent! {
+    struct AscentProgram<'a>;
+    relation edge(NodeIdx, NodeIdx, usize);
+    relation kind(NodeIdx, NodeRow);
+    relation token(RefEquality<&'a NodeOwner>);
+    lattice pattern(NodeIdx, PatternSet);
+
+    pattern(n, Set::singleton(Some(Pattern::Constant16))) <-- token(?t), kind(n, ?c),
+        if variant::<NodeVariant::Constant>(t, c);
+
+    pattern(jmp, Set::singleton(Some(Pattern::Constant16Jmp))) <-- token(?t),
+        kind(jmp, ?jmp_kind), edge(c, jmp, 0), pattern(c, c_pat),
+        if variant::<NodeVariant::Leave>(t, jmp_kind) && c_pat.contains(&Some(Pattern::Constant16));
+}
+
 impl PatternManager {
-    pub fn run(&mut self, region: &mut Region) {
+    pub fn run(&mut self, token: &NodeOwner, region: &mut Region) {
         let Region { nodes, ports, sinks, .. } = region;
 
+
         use petgraph::visit::Walker;
-        let mut visit_nodes = petgraph::visit::Topo::new(&*nodes).iter(&*nodes);
+        let mut visit_nodes: Vec<_> = petgraph::visit::Topo::new(&*nodes).iter(&*nodes)
+            .map(|n| (n, RefEquality(nodes[n].variant.clone()))).collect();
+
+        let mut edges = Vec::with_capacity(nodes.edge_count());
+        for local in nodes.node_indices() {
+            for (i, p) in nodes[local].inputs.iter().enumerate() {
+                for neighbor in ports.neighbors_directed(*p, Direction::Outgoing) {
+                    let neighbor_port = &ports[neighbor];
+                    neighbor_port.node.map(|remote| {
+                        let new_edge = (remote, local, i,);
+                        println!("new edge {:?}", new_edge);
+                        edges.push(new_edge);
+                    });
+                }
+            }
+        }
+
+        let mut ascent = AscentProgram::default();
+        ascent.token = vec![(RefEquality(token),)];
+        ascent.kind = visit_nodes;
+        ascent.edge = edges;
+        ascent.run();
+
+        println!("after ascent");
+        for (idx, pat) in ascent.pattern {
+            println!("{:?} {:?} {:?}", idx, nodes[idx].variant.ro(token), pat.iter().collect::<Vec<_>>());
+        }
     }
 }
 

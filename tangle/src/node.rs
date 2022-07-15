@@ -136,7 +136,7 @@ pub mod NodeVariant {
 
 pub use NodeVariant::*;
 
-pub trait NodeBehavior: /*core::fmt::Debug +*/ core::any::Any {
+pub trait NodeBehavior: core::fmt::Debug + core::any::Any {
     fn set_time(&mut self, time: Timestamp) {
        unimplemented!();
     }
@@ -164,10 +164,6 @@ pub trait NodeBehavior: /*core::fmt::Debug +*/ core::any::Any {
     }
     fn output_count(&self) -> usize {
         unimplemented!();
-    }
-
-    fn clone(&self) where Self: Sized + Sized {
-        self.clone()
     }
 }
 
@@ -254,7 +250,7 @@ impl Node {
     }
 
     pub fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
-        //println!("node codegen for {:?} @ {}", self.variant, self.time);
+        println!("node codegen for {:?} @ {}", self.variant.ro(token), self.time);
         self.variant.ro(token).codegen(token, self.inputs.clone(), self.outputs.clone(), r, ir, ops)
     }
 }
