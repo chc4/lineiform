@@ -5,15 +5,23 @@ use yaxpeax_x86::long_mode::register_class;
 use petgraph::graph::NodeIndex;
 
 use crate::time::Timestamp;
-use crate::ir::IR;
+use crate::ir::{IR};
 use crate::port::{PortMeta, PortIdx, PortEdge, Storage, EdgeVariant};
 use crate::region::{Region, RegionIdx, State, StateVariant};
 use crate::abi::{x86_64, Abi};
 
+use std::rc::Rc;
 pub type NodeIdx = NodeIndex;
-#[derive(Debug)]
+
+use qcell::{TCell, TCellOwner};
+use qcell::{QCell, QCellOwner};
+//pub struct NodeMarker;
+pub type NodeOwner = QCellOwner;
+pub type NodeCell = QCell<Box<dyn NodeBehavior>>;
+
+//#[derive(Debug)]
 pub struct Node {
-    pub variant: Box<dyn NodeBehavior>,
+    pub variant: Rc<NodeCell>,
     pub inputs: Vec<PortIdx>,
     pub outputs: Vec<PortIdx>,
     pub label: Option<String>,
@@ -22,10 +30,9 @@ pub struct Node {
     pub done: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Operation {
     Nop,
-    Constant(isize),
     Apply, // Call a Function node with arguments
     Inc,
     Add,
@@ -37,9 +44,11 @@ pub mod NodeVariant {
     use super::{Operation, Region};
 
     use super::*;
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
+    pub struct Constant(pub isize);
+    #[derive(Debug, Clone)]
     pub struct Move(pub Storage, pub Storage); // A move operation, sink <- source.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct Simple(pub Operation); // Instructions or constant operands
     #[derive(Debug)]
     pub struct Function<const A: usize, const O: usize> {
@@ -61,14 +70,14 @@ pub mod NodeVariant {
             }
         }
 
-        pub fn add_body<T, F, F_O>(
+        pub fn add_body<'id, T, F, F_O>(
             &mut self,
             mut n: T,
             ir: &mut IR,
             f: F) -> (NodeIdx, F_O) where F: FnOnce(&mut Node, &mut Region) -> F_O, T: NodeBehavior + core::any::Any + 'static + core::fmt::Debug
         {
             ir.in_region(self.region, |mut r, ir| {
-                r.add_node(n, f)
+                r.add_node(ir.owner.as_mut().unwrap(), n, f)
             })
         }
 
@@ -127,7 +136,7 @@ pub mod NodeVariant {
 
 pub use NodeVariant::*;
 
-pub trait NodeBehavior: core::fmt::Debug + core::any::Any {
+pub trait NodeBehavior: /*core::fmt::Debug +*/ core::any::Any {
     fn set_time(&mut self, time: Timestamp) {
        unimplemented!();
     }
@@ -135,13 +144,13 @@ pub trait NodeBehavior: core::fmt::Debug + core::any::Any {
         unimplemented!();
     }
 
-    fn create_ports(&mut self, r: &mut Region) {
+    fn create_ports(&self, r: &mut Region) {
     }
 
     fn ports_callback(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region) {
     }
 
-    fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+    fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
         unimplemented!();
     }
 
@@ -156,15 +165,21 @@ pub trait NodeBehavior: core::fmt::Debug + core::any::Any {
     fn output_count(&self) -> usize {
         unimplemented!();
     }
+
+    fn clone(&self) where Self: Sized + Sized {
+        self.clone()
+    }
 }
 
 impl Node {
-    pub fn as_variant<T>(&self) -> Option<&T> where T: 'static {
-        (&*self.variant as &(dyn core::any::Any + 'static)).downcast_ref::<T>()
+    pub fn as_variant<'a, T>(&'a self, token: &'a NodeOwner) -> Option<&'a T> where T: 'static {
+        (&*self.variant.ro(token).deref() as &dyn NodeBehavior as &(dyn core::any::Any + 'static)).downcast_ref::<T>()
     }
 
-    pub fn as_variant_mut<T>(&mut self) -> Option<&mut T> where T: 'static {
-        (&mut *self.variant as &mut (dyn core::any::Any + 'static)).downcast_mut::<T>()
+    pub fn as_variant_mut<'a, T>(&'a mut self, token: &'a mut NodeOwner) -> Option<&'a mut T> where T: 'static + Clone {
+        let x = self.as_variant::<T>(token);
+        //(&mut x?.clone() as &mut (dyn core::any::Any + 'static)).downcast_mut::<T>()
+        panic!()
     }
 
     fn set_time(&mut self, time: Timestamp) {
@@ -198,7 +213,7 @@ impl Node {
         p_x
     }
 
-    pub fn connect_input(&mut self, idx: usize, input: PortIdx, r: &mut Region) -> PortEdge {
+    pub fn connect_input<'a>(&'a mut self, idx: usize, input: PortIdx, r: &'a mut Region) -> PortEdge {
         let p = self.inputs[idx];
         r.connect_ports(input, p)
     }
@@ -214,33 +229,60 @@ impl Node {
         r.connect_ports(input, output)
     }
 
-    pub fn create_ports(&mut self, r: &mut Region) {
+    pub fn create_ports(&mut self, token: &mut NodeOwner, r: &mut Region) {
         println!("create_ports called");
-        self.variant.create_ports(r);
+        self.variant.rw(token).create_ports(r);
         let mut inputs = vec![];
         let mut outputs = vec![];
-        for i in 0..self.input_count() {
+        for i in 0..self.input_count(token) {
             let p = r.add_port();
             self.add_input(p, r);
             inputs.push(p);
         }
-        for i in 0..self.output_count() {
+        for i in 0..self.output_count(token) {
             outputs.push(self.add_output(r));
         }
-        self.variant.ports_callback(inputs, outputs, r);
+        self.variant.rw(token).ports_callback(inputs, outputs, r);
     }
 
-   pub fn input_count(&self) -> usize {
-        self.variant.input_count()
+   pub fn input_count(&self, token: &NodeOwner) -> usize {
+        self.variant.ro(token).input_count()
     }
 
-    pub fn output_count(&self) -> usize {
-        self.variant.output_count()
+    pub fn output_count(&self, token: &NodeOwner) -> usize {
+        self.variant.ro(token).output_count()
     }
 
-    pub fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
-        println!("node codegen for {:?} @ {}", self.variant, self.time);
-        self.variant.codegen(self.inputs.clone(), self.outputs.clone(), r, ir, ops)
+    pub fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        //println!("node codegen for {:?} @ {}", self.variant, self.time);
+        self.variant.ro(token).codegen(token, self.inputs.clone(), self.outputs.clone(), r, ir, ops)
+    }
+}
+
+impl NodeBehavior for NodeVariant::Constant {
+    fn input_count(&self) -> usize {
+        0
+    }
+
+    fn output_count(&self) -> usize {
+        1
+    }
+
+    fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        let output = &r.ports[outputs[0]];
+        match output.storage.as_ref().unwrap() {
+            Storage::Physical(r0) => match r0.class() {
+                register_class::Q => dynasm!(ops
+                    ; mov Rq(r0.num()), QWORD (self.0) as i64
+                ),
+                x => unimplemented!("unknown class {:?} for constant", x),
+            },
+            _ => unimplemented!(),
+        }
+    }
+
+    fn tag(&self) -> String {
+        self.0.to_string()
     }
 }
 
@@ -249,10 +291,10 @@ impl NodeBehavior for NodeVariant::Simple {
         match &self.0 {
             Operation::Inc => 1,
             Operation::Add => 2,
-            Operation::Constant(_) => 0,
             Operation::LoadStack => 1,
             Operation::StoreStack => 2,
-            _ => unimplemented!(),
+            Operation::Nop => 0,
+            Operation::Apply => unimplemented!()
         }
     }
 
@@ -260,14 +302,14 @@ impl NodeBehavior for NodeVariant::Simple {
         match &self.0 {
             Operation::Inc => 1,
             Operation::Add => 1,
-            Operation::Constant(_) => 1,
             Operation::LoadStack | Operation::StoreStack => 1,
-            _ => unimplemented!(),
+            Operation::Nop => 0,
+            Operation::Apply => unimplemented!()
         }
     }
 
 
-    fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+    fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
         match &self.0 {
             Operation::Inc => {
                 let operand = &r.ports[inputs[0]];
@@ -297,25 +339,13 @@ impl NodeBehavior for NodeVariant::Simple {
                         ),
                         x => unimplemented!("unknown class {:?} for add", x),
                     },
-                    (Storage::Physical(r0), Storage::Immaterial(None)) => match r0.class() {
-                        register_class::Q => dynasm!(ops
-                            ; add Rq(r0.num()),
-                                operand_1.get_meta::<PortMeta::Constant, _>().unwrap().0.try_into().unwrap()
-                        ),
-                        x => unimplemented!("unknown class {:?} for add", x),
-                    }
-                    _ => unimplemented!(),
-                }
-            },
-            Operation::Constant(n) => {
-                let output = &r.ports[outputs[0]];
-                match output.storage.as_ref().unwrap() {
-                    Storage::Physical(r0) => match r0.class() {
-                        register_class::Q => dynasm!(ops
-                            ; mov Rq(r0.num()), QWORD (*n) as i64
-                        ),
-                        x => unimplemented!("unknown class {:?} for constant", x),
-                    },
+                    //(Storage::Physical(r0), Storage::Immaterial(None)) => match r0.class() {
+                    //    register_class::Q => dynasm!(ops
+                    //        ; add Rq(r0.num()),
+                    //            operand_1.get_meta::<PortMeta::Constant, _>().unwrap().0.try_into().unwrap()
+                    //    ),
+                    //    x => unimplemented!("unknown class {:?} for add", x),
+                    //}
                     _ => unimplemented!(),
                 }
             },
@@ -331,7 +361,7 @@ impl NodeBehavior for NodeVariant::Simple {
                 let ss = &r.ports[inputs[0]];
                 let output = &r.ports[outputs[0]];
                 NodeVariant::Move::codegen(&NodeVariant::Move(output.storage.unwrap(), ss.storage.unwrap()),
-                    vec![inputs[0]], vec![outputs[0]], r, ir, ops);
+                    token, vec![inputs[0]], vec![outputs[0]], r, ir, ops);
                 //match output.storage.as_ref().unwrap() {
                 //    Storage::Physical(r0) => match r0.class() {
                 //        register_class::Q => dynasm!(ops
@@ -350,7 +380,7 @@ impl NodeBehavior for NodeVariant::Simple {
                 if let Storage::Immaterial(Some(state)) = ss.storage.unwrap() {
                     if let Some(state) = r.states.get(state as usize) {
                         NodeVariant::Move::codegen(&NodeVariant::Move(ss.storage.unwrap(), input.storage.unwrap()),
-                            vec![inputs[1]], vec![inputs[0]], r, ir, ops);
+                            token, vec![inputs[1]], vec![inputs[0]], r, ir, ops);
                     } else {
                         panic!("bad state for ss storage")
                     }
@@ -377,14 +407,14 @@ impl NodeBehavior for NodeVariant::Simple {
                 { r.connect_ports(inputs[0], outputs[0]); },
             Operation::Add =>
                 { r.connect_ports(inputs[0], outputs[0]); },
-            Operation::Constant(_) => {},
             Operation::LoadStack => { r.ports[inputs[0]].set_variant(EdgeVariant::State); },
             Operation::StoreStack => {
                 r.ports[inputs[0]].set_variant(EdgeVariant::State);
                 r.ports[outputs[0]].set_variant(EdgeVariant::State);
                 r.connect_ports(inputs[0], outputs[0]);
             }, // this connects the state ports
-            _ => unimplemented!("ports_callback for {:?}", self.tag()),
+            Operation::Nop => {},
+            Operation::Apply => unimplemented!(),
         };
     }
 
@@ -392,10 +422,10 @@ impl NodeBehavior for NodeVariant::Simple {
         match &self.0 {
             Operation::Inc => "inc".to_string(),
             Operation::Add => "add".to_string(),
-            Operation::Constant(n) => n.to_string(),
             Operation::LoadStack => "load_ss".to_string(),
             Operation::StoreStack => "store_ss".to_string(),
-            _ => unimplemented!(),
+            Operation::Nop => "nop".to_string(),
+            Operation::Apply => "apply".to_string(),
         }
     }
 }
@@ -414,7 +444,7 @@ impl NodeBehavior for NodeVariant::Leave {
         r.constrain(outputs[0], Storage::Immaterial(None));
     }
 
-    fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+    fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
         // "what happens if you try to tailcall with stack slots allocated?"
         // haha. yeah.
         let source = &r.ports[inputs[0]];
@@ -449,7 +479,7 @@ impl NodeBehavior for NodeVariant::Move {
         r.constrain(inputs[0], self.1.clone());
     }
 
-    fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+    fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
         let sink = &r.ports[outputs[0]];
         let source = &r.ports[inputs[0]];
         match (sink.storage.as_ref().unwrap(), source.storage.as_ref().unwrap()) {
@@ -505,7 +535,7 @@ impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O
         1
     }
 
-    fn codegen(&self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+    fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
         assert_eq!(self.args as usize, A);
         assert_eq!(self.outs as usize, O);
         if self.highwater != 0 {
@@ -515,7 +545,7 @@ impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O
             );
         }
         // if we're calling codegen on a function, it should be the only one.
-        ir.in_region(self.region, |r, ir| { r.codegen(ir, ops); });
+        ir.in_region(self.region, |r, ir| { r.codegen(token, ir, ops); });
         if self.highwater != 0 {
             // cleanup stack space
             dynasm!(ops
@@ -530,7 +560,7 @@ impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O
 
 use core::ops::Deref;
 impl Deref for Node {
-    type Target = Box<dyn NodeBehavior>;
+    type Target = Rc<NodeCell>;
     fn deref(&self) -> &<Self as Deref>::Target {
         &self.variant
     }
@@ -543,9 +573,9 @@ impl DerefMut for Node {
 }
 
 impl Node {
-    pub fn new(var: Box<dyn NodeBehavior>) -> Node {
+    pub fn new(owner: &NodeOwner, var: Box<dyn NodeBehavior>) -> Node {
         Node {
-            variant: var,
+            variant: Rc::new(NodeCell::new(owner, var)),
             inputs: vec![],
             outputs: vec![],
             label: None,
@@ -554,6 +584,10 @@ impl Node {
             done: false,
         }
     }
+    pub fn constant(n: isize) -> NodeVariant::Constant {
+        NodeVariant::Constant(n)
+    }
+
     pub fn simple(op: Operation) -> NodeVariant::Simple {
         NodeVariant::Simple(op)
     }

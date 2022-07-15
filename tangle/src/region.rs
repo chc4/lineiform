@@ -8,12 +8,11 @@ use yaxpeax_x86::long_mode::RegSpec;
 use core::cmp::max;
 use std::collections::{HashMap, HashSet};
 
-use crate::node::{Node, NodeIdx, NodeBehavior, NodeVariant, Operation};
+use crate::node::{Node, NodeIdx, NodeBehavior, NodeVariant, Operation, NodeOwner};
 use crate::port::{Port, PortMeta, PortIdx, PortEdge, Edge, EdgeVariant, Storage, OptionalStorage};
 use crate::ir::{IR, VirtualRegister, VirtualRegisterMap};
 use crate::time::Timestamp;
 use crate::abi::{Abi, AbiRequest, AbiStorage};
-
 
 pub type RegionEdge = ();
 pub type RegionIdx = NodeIndex;
@@ -30,11 +29,13 @@ pub struct State {
     pub producers: Vec<PortIdx>,
 }
 
+pub type NodeGraph = StableGraph<Node, (), petgraph::Directed>;
+pub type PortGraph = StableGraph<Port, Edge, petgraph::Directed>;
 #[derive(Default)]
 pub struct Region {
-    pub nodes: StableGraph<Node, (), petgraph::Directed>,
+    pub nodes: NodeGraph,
     /// The list of all ports inside this region, such as those attached to nodes.
-    pub ports: StableGraph<Port, Edge, petgraph::Directed>,
+    pub ports: PortGraph,
     /// The input ports to this region
     pub sources: Vec<PortIdx>,
     /// The output ports for this region
@@ -121,11 +122,12 @@ impl Region {
         }
     }
 
-    pub fn add_node<T, F, F_O>(&mut self, mut n: T,
+    pub fn add_node<T, F, F_O>(&mut self, token: &mut NodeOwner, mut n: T,
         f: F) -> (NodeIdx, F_O) where F: FnOnce(&mut Node, &mut Region) -> F_O, T: NodeBehavior + 'static {
-        let mut n = Node::new(box n as Box<dyn NodeBehavior>);
+        use std::rc::Rc;
+        let mut n = Node::new(token, box n as Box<dyn NodeBehavior>);
         n.containing_region = Some(self.idx);
-        n.create_ports(self);
+        n.create_ports(token, self);
         let f_o = f(&mut n, self);
         let idx = self.nodes.add_node(n);
         // Now we can attach the ports to the actual node
@@ -194,41 +196,41 @@ impl Region {
         self.ports[port].set_storage(store)
     }
 
-    /// If instructions that use constants can fix the constant in an operand,
-    /// convert them to that instead of using a virtual register
-    pub fn move_constants_to_operands(&mut self) {
-        let mut consts = self.nodes.node_weights_mut().map(|mut n| {
-            let sinks = n.sinks();
-            let mut s = n.as_variant_mut::<NodeVariant::Simple>();
-            s.as_mut().map(|mut s| { if let Operation::Constant(c) = s.0 {
-                println!("constant {}", c);
-                let mut uses = self.ports.neighbors_directed(sinks[0], Direction::Incoming).detach();
-                let has_uses = false;
-                while let Some((an_edge, a_use)) = uses.next(&self.ports) {
-                    //let node_use = &self.nodes[self.ports[a_use].node.unwrap()];
-                    // TODO: sanity check that the instruction supports an operand
-                    // of the given width, set has_uses = true if so
-                    //println!("used {:?}", node_use);
-                    let port_use = &mut self.ports[a_use];
-                    // we can set the port to be immaterial instead
-                    port_use.set_storage(Storage::Immaterial(None));
-                    // and that it is a constant value
-                    port_use.set_meta(PortMeta::Constant(c));
-                    // and that it doesn't depend on the constant node anymore
-                    self.ports.remove_edge(an_edge);
-                }
+    ///// If instructions that use constants can fix the constant in an operand,
+    ///// convert them to that instead of using a virtual register
+    //pub fn move_constants_to_operands(&mut self) {
+    //    let mut consts = self.nodes.node_weights_mut().map(|mut n| {
+    //        let sinks = n.sinks();
+    //        let mut s = n.as_variant_mut::<NodeVariant::Simple>();
+    //        s.as_mut().map(|mut s| { if let Operation::Constant(c) = s.0 {
+    //            println!("constant {}", c);
+    //            let mut uses = self.ports.neighbors_directed(sinks[0], Direction::Incoming).detach();
+    //            let has_uses = false;
+    //            while let Some((an_edge, a_use)) = uses.next(&self.ports) {
+    //                //let node_use = &self.nodes[self.ports[a_use].node.unwrap()];
+    //                // TODO: sanity check that the instruction supports an operand
+    //                // of the given width, set has_uses = true if so
+    //                //println!("used {:?}", node_use);
+    //                let port_use = &mut self.ports[a_use];
+    //                // we can set the port to be immaterial instead
+    //                port_use.set_storage(Storage::Immaterial(None));
+    //                // and that it is a constant value
+    //                port_use.set_meta(PortMeta::Constant(c));
+    //                // and that it doesn't depend on the constant node anymore
+    //                self.ports.remove_edge(an_edge);
+    //            }
 
-                if !has_uses {
-                    s.0 = Operation::Nop;
-                }
-            }})
-        }).for_each(drop);
-    }
+    //            if !has_uses {
+    //                s.0 = Operation::Nop;
+    //            }
+    //        }})
+    //    }).for_each(drop);
+    //}
 
-    pub fn remove_nops(&mut self) {
+    pub fn remove_nops(&mut self, token: &mut NodeOwner) {
         let mut removed = HashSet::new();
         self.nodes.retain_nodes(|node, idx| {
-            let mut s = node[idx].as_variant::<NodeVariant::Simple>();
+            let mut s = node[idx].as_variant::<NodeVariant::Simple>(token);
             s.map_or_else(|| true, |s| if let Operation::Nop = s.0 {
                 removed.insert(idx);
                 false
@@ -241,7 +243,7 @@ impl Region {
     }
 
     /// Create and populate virtual registers for all ports
-    pub fn create_virtual_registers(&mut self) -> VirtualRegisterMap {
+    pub fn create_virtual_registers(&mut self, token: &mut NodeOwner) -> VirtualRegisterMap {
         let mut reg = 0;
         let mut virts: VirtualRegisterMap = HashMap::new();
         let mut ports = self.ports.clone();
@@ -317,7 +319,7 @@ impl Region {
                         self.ports.remove_edge(e.id());
                         let mut n = Node::r#move(p0, source_store);
                         println!("INSERT MOVE1");
-                        self.add_node(n, |n, r| {
+                        self.add_node(token, n, |n, r| {
                             n.connect_input(0, e.target(), r);
                             n.connect_output(0, e.source(), r);
                             // TODO: we need a way to say that these values *depend* on eachother
@@ -353,7 +355,7 @@ impl Region {
                                 self.ports.remove_edge(e.id());
                                 let mut n = Node::r#move(p0, new_virt);
                                 println!("INSERT MOVE2");
-                                self.add_node(n, |n, r| {
+                                self.add_node(token, n, |n, r| {
                                     n.connect_input(0, e.target(), r);
                                     n.connect_output(0, e.source(), r);
                                     // TODO: we need a way to say that these values *depend* on eachother
@@ -446,11 +448,11 @@ impl Region {
         {
             // The initial set of nodes with no dependants can be marked done
             for n in &nodes {
-                println!("root {:?}", self.nodes[*n]);
+                //println!("root {:?}", self.nodes[*n]);
                 self.nodes[*n].done = true;
             }
         }
-        println!("all nodes {:#?}", self.nodes.node_weights().collect::<Vec<_>>());
+        //println!("all nodes {:#?}", self.nodes.node_weights().collect::<Vec<_>>());
 
         // Then give process the nodes, adding their dependencies to the working set
         // and having their time be the max of their dependants' time
@@ -467,12 +469,12 @@ impl Region {
                     // If so, we just remove it from the set and don't process it:
                     // it will be re-added to the set later once we *do* process its
                     // dependencies.
-                    println!("node {:?} too soon", self.nodes[*sink]);
+                    //println!("node {:?} too soon", self.nodes[*sink]);
                     continue 'process;
                 };
                 time = max(time, dependency.time.increment()); // TODO: latency
             }
-            println!("node {:?} has time {}", self.nodes[*sink], time);
+            //println!("node {:?} has time {}", self.nodes[*sink], time);
             self.nodes[*sink].time = time;
             final_time = max(final_time, time);
             self.nodes[*sink].done = true;
@@ -489,7 +491,7 @@ impl Region {
 
         // validate all nodes were given times
         for n in self.nodes.node_weights_mut().into_iter() {
-            assert_eq!(n.done, true, "no time for {:?}", n);
+            //assert_eq!(n.done, true, "no time for {:?}", n);
             // renumber nodes so they are increasing in program time
             n.time.major = final_time.major - n.time.major;
             // and give its ports the correct timings
@@ -669,7 +671,7 @@ impl Region {
         }
     }
 
-    pub fn codegen(&mut self, ir: &mut IR, ops: &mut Assembler) {
+    pub fn codegen(&mut self, token: &NodeOwner, ir: &mut IR, ops: &mut Assembler) {
         // TODO: emit all the constant values first?
         let mut nodes_graph = StableGraph::new();
         std::mem::swap(&mut self.nodes, &mut nodes_graph);
@@ -678,7 +680,7 @@ impl Region {
         // lol this is wrong. we actually want to thread a State edge through
         // nodes, and just visit the State edge uses in order.
         for n in nodes {
-            n.codegen(vec![], vec![], self, ir, ops);
+            n.codegen(token, vec![], vec![], self, ir, ops);
         }
         std::mem::swap(&mut self.nodes, &mut nodes_graph);
     }

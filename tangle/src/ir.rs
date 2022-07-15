@@ -19,10 +19,12 @@ use dynasmrt::{AssemblyOffset, DynasmApi};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::node::{NodeBehavior, NodeVariant, NodeIdx};
+use crate::node::{NodeBehavior, NodeVariant, NodeIdx, NodeOwner};
 pub use crate::port::{PortIdx, EdgeVariant};
 use crate::region::{Region, RegionIdx, RegionEdge};
 use crate::abi::Abi;
+//use crate::opt::PassRunner;
+use crate::select::PatternManager;
 
 // yaxpeax decoder example
 mod decoder {
@@ -77,6 +79,7 @@ pub struct IR {
     regions: StableGraph<Region, RegionEdge, petgraph::Directed>,
     /// The outer-most region that all other regions are under.
     master_region: RegionIdx,
+    pub owner: Option<NodeOwner>,
 }
 
 impl IR {
@@ -89,6 +92,7 @@ impl IR {
             body: None,
             regions: r_map,
             master_region: r_x,
+            owner: Some(NodeOwner::new()),
         }
     }
 
@@ -104,10 +108,12 @@ impl IR {
     }
 
     pub fn add_function<const A: usize, const O: usize>(&mut self, f: NodeVariant::Function<A, O>) {
+        let mut owner = self.owner.take().unwrap();
         self.in_region(self.master_region, |r, ir| {
-            r.add_node(f, |n, r| {
+            r.add_node(&mut owner, f, |n, r| {
             });
         });
+        self.owner = Some(owner);
     }
 
     pub fn set_body<const A: usize, const O: usize>(&mut self, f: NodeVariant::Function<A, O>) {
@@ -148,11 +154,18 @@ impl IR {
             println!("propogated state edges");
 
             //r.move_constants_to_operands();
-            r.remove_nops();
+            r.remove_nops(self.owner.as_mut().unwrap());
             // Create virtual register storages for all nodes and ports
-            let mut virt_map = r.create_virtual_registers();
+            let mut virt_map = r.create_virtual_registers(self.owner.as_mut().unwrap());
+            r.create_dependencies(); // we have to re-add node dependencies for the inserted movs
+
+            let mut patterner = PatternManager::default();
+            patterner.run(r);
+            //let runner = PassRunner;
+            //runner.run(r);
+            //panic!();
+
             println!("created virtual registers");
-            r.create_dependencies();
             r.annotate_port_times_and_hints(&mut virt_map);
             println!("annoated port times and hints");
             r.optimize_vreg_live_ranges(&mut virt_map);
@@ -180,10 +193,11 @@ impl IR {
         let mut ops = Assembler::new().unwrap();
         let start = ops.offset();
         let mut ret = None;
+        let mut owner = self.owner.take().unwrap();
         self.in_region(self.master_region, |r, ir| {
             let mut n = StableGraph::new();
             std::mem::swap(&mut r.nodes, &mut n);
-            ret = Some(n[ir.body.unwrap()].codegen(vec![], vec![], r, ir, &mut ops));
+            ret = Some(n[ir.body.unwrap()].codegen(&owner, vec![], vec![], r, ir, &mut ops));
             std::mem::swap(&mut r.nodes, &mut n);
         });
         let end = ops.offset();
@@ -224,6 +238,7 @@ mod test {
     use crate::node::{Node, Operation};
 
     type S = NodeVariant::Simple;
+
     #[test]
     pub fn simple_function() {
         let mut ir = IR::new();
@@ -402,7 +417,7 @@ mod test {
         let input = f.add_argument(&mut ir);
         let output = f.add_return(&mut ir);
 
-        let mut two = Node::simple(Operation::Constant(2));
+        let mut two = Node::constant(2);
         let mut add = Node::simple(Operation::Add);
         let mut two_const = None;
         f.add_body(two, &mut ir, |two, r| {
@@ -445,7 +460,7 @@ mod test {
         }).1;
 
         // then add to it via ss1
-        let mut two = Node::simple(Operation::Constant(2));
+        let mut two = Node::constant(2);
         let mut add = Node::simple(Operation::Add);
         let mut two_const = f.add_body(two, &mut ir, |two, r| {
             two.sinks()[0]
@@ -503,7 +518,7 @@ mod test {
         }).1;
 
         // then add to it via ss1
-        let mut two = Node::simple(Operation::Constant(2));
+        let mut two = Node::constant(2);
         let mut add = Node::simple(Operation::Add);
         let mut two_const = f.add_body(two, &mut ir, |two, r| {
             two.sinks()[0]
@@ -530,7 +545,7 @@ mod test {
             i.sinks()[0]
         }).1;
 
-        let mut three = Node::simple(Operation::Constant(3));
+        let mut three = Node::constant(3);
         let mut add = Node::simple(Operation::Add);
         let mut three_const = f.add_body(three, &mut ir, |three, r| {
             three.sinks()[0]
@@ -559,7 +574,7 @@ mod test {
             a + 2
         }
 
-        let mut addr = Node::simple(Operation::Constant(external_function as *const () as isize));
+        let mut addr = Node::constant(external_function as *const () as isize);
         let mut tailcall = Node::leave();
         let mut addr_const = None;
         f.add_body(addr, &mut ir, |addr, r| {
@@ -587,7 +602,7 @@ mod test {
             a + 2
         }
 
-        let mut addr = Node::simple(Operation::Constant(external_function as *const () as isize));
+        let mut addr = Node::constant(external_function as *const () as isize);
         let mut tailcall = Node::leave();
         let mut addr_const = None;
         f.add_body(addr, &mut ir, |addr, r| {

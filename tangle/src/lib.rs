@@ -1,5 +1,5 @@
-#![allow(unused_variables, unused_mut, non_snake_case, dead_code)]
-#![feature(box_syntax, let_chains, map_first_last, trait_upcasting)]
+#![allow(unused_variables, unused_mut, unused_imports, non_snake_case, dead_code, non_camel_case_types)]
+#![feature(box_syntax, let_chains, map_first_last, trait_upcasting, associated_type_defaults)]
 #![deny(unused_must_use, improper_ctypes_definitions)]
 extern crate lazy_static;
 extern crate petgraph;
@@ -13,4 +13,6 @@ pub mod region;
 pub mod ir;
 pub mod time;
 pub mod abi;
+pub mod opt;
+pub mod select;
 pub use ir::*;
