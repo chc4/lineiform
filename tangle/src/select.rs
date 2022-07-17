@@ -55,18 +55,10 @@ use frunk::hlist::Plucker;
 use frunk::hlist::LiftFrom;
 use frunk::hlist::h_cons;
 use frunk::traits::{ToRef, ToMut};
-use ascent::ascent;
+use ascent::{ascent, ascent_run};
 
 use std::collections::{HashMap, BTreeSet};
 use std::any::type_name;
-
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Pattern {
-    Constant16,
-    Constant16Jmp,
-}
-use ascent::lattice::set::Set;
-type PatternSet = Set<Option<Pattern>>;
 
 //// A bitmap for all of the possible patterns we can record on a node.
 //// Add a HashMap<T, T::Variables> probably for recording variables in a pattern?
@@ -100,6 +92,7 @@ type PatternSet = Set<Option<Pattern>>;
 //        (*head).0
 //    }
 //}
+
 
 #[derive(Clone)]
 pub struct RefEquality<T: Sized>(T) where RefEquality<Rc<T>>: PartialEq;
@@ -137,33 +130,66 @@ impl<'a, 'b, T: ?Sized> PartialEq<RefEquality<&'b T>> for RefEquality<&'a T> {
 impl<T: ?Sized> Eq for RefEquality<Rc<T>> where RefEquality<Rc<T>>: PartialEq { }
 impl<'a, T: ?Sized> Eq for RefEquality<&'a T> where RefEquality<&'a T>: PartialEq { }
 
-use core::any::Any;
-fn variant<T: 'static + NodeBehavior>(token: &RefEquality<&NodeOwner>, n: &RefEquality<Rc<NodeCell>>) -> bool {
-    (n.0.ro(token.0).as_ref() as &dyn Any).downcast_ref::<T>().is_some()
+
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Pattern {
+    Constant16 = 0isize,
+    Constant16Jmp,
+    MoveRegReg,
 }
+
+use ascent::Lattice;
+impl Lattice for Pattern {
+    fn meet(self, other: Self) -> Self {
+        self.min(other)
+    }
+    fn join(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
+use ascent::lattice::set::Set;
+type PatternSet = Set<Option<Pattern>>;
 
 type NodeRow = RefEquality<Rc<NodeCell>>;
 
 use std::rc::Rc;
 use ascent::lattice::Product;
 
+use core::any::Any;
+fn variant<T: 'static + NodeBehavior>(token: &RefEquality<&NodeOwner>, n: &RefEquality<Rc<NodeCell>>) -> bool {
+    (n.0.ro(token.0).as_ref() as &dyn Any).downcast_ref::<T>().is_some()
+}
 
 #[derive(Default)]
 pub struct PatternManager;
 
 ascent! {
     struct AscentProgram<'a>;
+    /// Stage 1
+    // Indicated that A is the C'th input of B
     relation edge(NodeIdx, NodeIdx, usize);
+    // Indicated what kind of operation a node is
     relation kind(NodeIdx, NodeRow);
+    // Capture the NodeCell token for query use
     relation token(RefEquality<&'a NodeOwner>);
-    lattice pattern(NodeIdx, PatternSet);
+    // Output the annotations that a node was given
+    lattice pattern(NodeIdx, Pattern, Set<NodeIdx>);
 
-    pattern(n, Set::singleton(Some(Pattern::Constant16))) <-- token(?t), kind(n, ?c),
-        if variant::<NodeVariant::Constant>(t, c);
+    // Constant patterns
+    pattern(n, Pattern::Constant16, Set::singleton(*n)) <--
+        token(?t), kind(n, ?c), if variant::<NodeVariant::Constant>(t, c);
 
-    pattern(jmp, Set::singleton(Some(Pattern::Constant16Jmp))) <-- token(?t),
-        kind(jmp, ?jmp_kind), edge(c, jmp, 0), pattern(c, c_pat),
-        if variant::<NodeVariant::Leave>(t, jmp_kind) && c_pat.contains(&Some(Pattern::Constant16));
+    // Mov patterns
+    pattern(n, Pattern::MoveRegReg, Set::singleton(*n)) <--
+        token(?t), kind(n, ?c), if variant::<NodeVariant::Move>(t, c);
+
+    // Leave patterns
+    // jmp constant
+    pattern(jmp, Pattern::Constant16Jmp, Set::singleton(*jmp).join(c_set.clone())) <--
+        token(?t), kind(jmp, ?jmp_kind), edge(c, jmp, 0), pattern(c, Pattern::Constant16, c_set),
+        if variant::<NodeVariant::Leave>(t, jmp_kind);
 }
 
 impl PatternManager {
@@ -172,8 +198,11 @@ impl PatternManager {
 
 
         use petgraph::visit::Walker;
-        let mut visit_nodes: Vec<_> = petgraph::visit::Topo::new(&*nodes).iter(&*nodes)
-            .map(|n| (n, RefEquality(nodes[n].variant.clone()))).collect();
+        use petgraph::algo::DfsSpace;
+        let mut dfs_space = DfsSpace::new(&*nodes);
+        let mut visit_nodes: Vec<_> = petgraph::algo::toposort(&*nodes, Some(&mut dfs_space)).unwrap();
+        let toposorted = visit_nodes.clone().drain(..).enumerate().map(|(i, n)| (n, i)).collect::<HashMap<_,_>>();
+        let visit_nodes = visit_nodes.drain(..).map(|n| (n, RefEquality(nodes[n].variant.clone()))).collect();
 
         let mut edges = Vec::with_capacity(nodes.edge_count());
         for local in nodes.node_indices() {
@@ -196,9 +225,48 @@ impl PatternManager {
         ascent.run();
 
         println!("after ascent");
-        for (idx, pat) in ascent.pattern {
-            println!("{:?} {:?} {:?}", idx, nodes[idx].variant.ro(token), pat.iter().collect::<Vec<_>>());
+        let mut emitted: Option<BTreeSet<_>> = None;
+        ascent.pattern.sort_by(|a, b|
+            toposorted[&a.0].cmp(&toposorted[&b.0]).reverse()
+            // for now we just return the largest pattern that matches first
+            // later on this can be some shortest-path (lowest cost) thing ig
+            .then(a.2.len().cmp(&b.2.len()))
+        );
+        let mut roots = ascent.pattern.drain(..).flat_map(|(root, pat, include_set)| {
+            // for not we just get the first pattern that matches
+
+            // If we already emitted the root, then it was a part of a pattern
+            // from higher topologically. (this can be done smarter)
+            if let Some(e) = emitted.as_ref() && e.contains(&root) {
+                return None
+            }
+            println!("pattern {:?} {:?} {:?} {:?}",
+                    root,
+                    nodes[root].variant.ro(token),
+                    pat,
+                    include_set.iter().collect::<Vec<_>>());
+
+            use std::ops::BitOr;
+            emitted = emitted.as_ref().map(|e| e.bitor(&include_set.0)).or_else(|| Some(include_set.0.clone()));
+            Some((root,pat,include_set,))
+        }).collect::<Vec<_>>();
+
+        for idx in &ascent.kind {
+            assert!(emitted.as_ref().unwrap().contains(&idx.0), "{:?} ({:?}) not covered", idx.0, idx.1.0.ro(&token).tag());
         }
+
+        //let mut phase2 = ascent_run! {
+        //    relation root(NodeIdx, Pattern, Set<NodeIdx>) = roots;
+        //    relation edge(NodeIdx, NodeIdx, usize) = ascent.edge;
+        //    relation external(NodeIdx, NodeIdx);
+
+        //    // An edge is external to a pattern if there is any edge that
+        //    external(a, b) <-- edge(a, b), 
+        //};
+
+        //for external in phase2.root {
+        //    //println!("external {:?}", external);
+        //}
     }
 }
 

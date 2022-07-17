@@ -155,9 +155,7 @@ pub trait NodeBehavior: core::fmt::Debug + core::any::Any {
     }
 
 
-    fn tag(&self) -> String {
-        "<unknown>".to_string()
-    }
+    fn tag(&self) -> String;
 
     fn input_count(&self) -> usize {
         unimplemented!();
@@ -427,6 +425,10 @@ impl NodeBehavior for NodeVariant::Simple {
 }
 
 impl NodeBehavior for NodeVariant::Leave {
+    fn tag(&self) -> String {
+        "leave".to_string()
+    }
+
     fn input_count(&self) -> usize {
         1
     }
@@ -461,6 +463,11 @@ impl NodeBehavior for NodeVariant::Leave {
 }
 
 impl NodeBehavior for NodeVariant::Move {
+
+    fn tag(&self) -> String {
+        format!("mov {} <- {}", self.0, self.1)
+    }
+
     fn input_count(&self) -> usize {
         1
     }
@@ -521,6 +528,10 @@ impl NodeBehavior for NodeVariant::Move {
 
 
 impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O> {
+    fn tag(&self) -> String {
+        "function".to_string()
+    }
+
     fn input_count(&self) -> usize {
         0
     }
