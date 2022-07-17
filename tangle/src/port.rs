@@ -15,7 +15,7 @@ pub enum EdgeVariant {
     Data,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, Eq)]
+#[derive(Clone, Copy, PartialEq, Debug, Eq, Hash)]
 pub enum Storage {
     Virtual(u16), // todo: width?
     Physical(RegSpec),
@@ -32,7 +32,7 @@ impl core::fmt::Display for Storage {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OptionalStorage(pub Option<Storage>);
 impl core::fmt::Display for OptionalStorage {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> Result<(), std::fmt::Error> {

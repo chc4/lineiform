@@ -42,12 +42,16 @@
 //! The patterns themselves use an open recursion scheme, which should hopefully allow
 //! for the Rust compiler to fuse them together, instead of requiring a pre-build
 //! codegen step.
+use crate::ir::VirtualRegisterMap;
 use crate::node::{Node, NodeIdx, NodeVariant, NodeBehavior, Operation, NodeOwner, NodeCell};
 use crate::node::NodeVariant::*;
+use crate::port::{Storage, OptionalStorage, PortEdge};
 use crate::region::{Region, NodeGraph};
 
 use petgraph::Direction;
-use petgraph::visit::Visitable;
+use petgraph::visit::{Visitable, EdgeRef};
+
+use yaxpeax_x86::long_mode::RegSpec;
 
 use frunk::prelude::HList;
 use frunk::{HList, HCons, HNil};
@@ -168,8 +172,10 @@ pub struct PatternManager;
 ascent! {
     struct AscentProgram<'a>;
     /// Stage 1
-    // Indicated that A is the C'th input of B
-    relation edge(NodeIdx, NodeIdx, usize);
+    // Indicated that Edge from A->B is the Nth input of B, which uses Vreg for storage
+    relation edge(petgraph::stable_graph::EdgeIndex, Option<NodeIdx>, Option<NodeIdx>, usize, u16);
+    // Indicates the storage of a Vreg is restricted to RegSpec
+    relation restricted(u16, RegSpec);
     // Indicated what kind of operation a node is
     relation kind(NodeIdx, NodeRow);
     // Capture the NodeCell token for query use
@@ -182,18 +188,21 @@ ascent! {
         token(?t), kind(n, ?c), if variant::<NodeVariant::Constant>(t, c);
 
     // Mov patterns
+    // mov reg, _
     pattern(n, Pattern::MoveRegReg, Set::singleton(*n)) <--
-        token(?t), kind(n, ?c), if variant::<NodeVariant::Move>(t, c);
+        token(?t), kind(n, ?c), edge(e, _, Some(*n), 0, vreg), restricted(vreg, _),
+        if variant::<NodeVariant::Move>(t, c);
 
     // Leave patterns
     // jmp constant
     pattern(jmp, Pattern::Constant16Jmp, Set::singleton(*jmp).join(c_set.clone())) <--
-        token(?t), kind(jmp, ?jmp_kind), edge(c, jmp, 0), pattern(c, Pattern::Constant16, c_set),
+        token(?t), kind(jmp, ?jmp_kind),
+        edge(e, ?Some(c), Some(*jmp), 0, _), pattern(c, Pattern::Constant16, c_set),
         if variant::<NodeVariant::Leave>(t, jmp_kind);
 }
 
 impl PatternManager {
-    pub fn run(&mut self, token: &NodeOwner, region: &mut Region) {
+    pub fn run(&mut self, token: &NodeOwner, region: &mut Region, virt_map: &mut VirtualRegisterMap) {
         let Region { nodes, ports, sinks, .. } = region;
 
 
@@ -205,23 +214,42 @@ impl PatternManager {
         let visit_nodes = visit_nodes.drain(..).map(|n| (n, RefEquality(nodes[n].variant.clone()))).collect();
 
         let mut edges = Vec::with_capacity(nodes.edge_count());
+        // hook up all the edges to node inputs. this includes from the region sources
         for local in nodes.node_indices() {
             for (i, p) in nodes[local].inputs.iter().enumerate() {
-                for neighbor in ports.neighbors_directed(*p, Direction::Outgoing) {
-                    let neighbor_port = &ports[neighbor];
-                    neighbor_port.node.map(|remote| {
-                        let new_edge = (remote, local, i,);
-                        println!("new edge {:?}", new_edge);
-                        edges.push(new_edge);
-                    });
+                let vreg: u16 = match ports[*p].storage{
+                    OptionalStorage(Some(Storage::Immaterial(state))) => continue,
+                    OptionalStorage(Some(Storage::Virtual(vreg))) => vreg,
+                    _ => panic!(),
+                };
+                for e in ports.edges_directed(*p, Direction::Outgoing) {
+                    let neighbor_port = &ports[e.target()];
+                    let new_edge = (e.id(), neighbor_port.node, Some(local), i, vreg);
+                    println!("new edge {:?}", new_edge);
+                    edges.push(new_edge);
                 }
             }
+        }
+        // we also hook up edges to the region sinks
+        for (i, output) in sinks.iter().enumerate() {
+            let vreg: u16 = match ports[*output].storage{
+                OptionalStorage(Some(Storage::Immaterial(state))) => continue,
+                OptionalStorage(Some(Storage::Virtual(vreg))) => vreg,
+                _ => panic!(),
+            };
+            for e in ports.edges_directed(*output, Direction::Outgoing) {
+                let neighbor_port = &ports[e.target()];
+                let new_edge = (e.id(), neighbor_port.node, None, i, vreg);
+                println!("new sink edge {:?}", new_edge);
+                edges.push(new_edge);
+             }
         }
 
         let mut ascent = AscentProgram::default();
         ascent.token = vec![(RefEquality(token),)];
         ascent.kind = visit_nodes;
         ascent.edge = edges;
+        ascent.restricted = virt_map.iter().flat_map(|(i,v)| v.backing.map(|back| (*i as u16,back))).collect::<Vec<_>>();
         ascent.run();
 
         println!("after ascent");
@@ -231,6 +259,7 @@ impl PatternManager {
             // for now we just return the largest pattern that matches first
             // later on this can be some shortest-path (lowest cost) thing ig
             .then(a.2.len().cmp(&b.2.len()))
+            .then(a.1.cmp(&b.1))
         );
         let mut roots = ascent.pattern.drain(..).flat_map(|(root, pat, include_set)| {
             // for not we just get the first pattern that matches
@@ -255,18 +284,35 @@ impl PatternManager {
             assert!(emitted.as_ref().unwrap().contains(&idx.0), "{:?} ({:?}) not covered", idx.0, idx.1.0.ro(&token).tag());
         }
 
-        //let mut phase2 = ascent_run! {
-        //    relation root(NodeIdx, Pattern, Set<NodeIdx>) = roots;
-        //    relation edge(NodeIdx, NodeIdx, usize) = ascent.edge;
-        //    relation external(NodeIdx, NodeIdx);
+        let mut phase2 = ascent_run! {
+            relation root(NodeIdx, Pattern, Set<NodeIdx>) = roots;
+            relation edge(PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16) = ascent.edge;
 
-        //    // An edge is external to a pattern if there is any edge that
-        //    external(a, b) <-- edge(a, b), 
-        //};
+            // given a pattern and a root we can have a Pattern::variables function
+            // that populates variables required as needed.
+            //relation variables(NodeIdx, NodeIdx);
 
-        //for external in phase2.root {
-        //    //println!("external {:?}", external);
-        //}
+            // We need all the external edges between patterns, which must be
+            // allocated vregs.
+            relation external(PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize);
+
+            // An edge is external if it is the result of a root node
+            //external(a, b) <-- edge(a, b, _), root(b, _, _);
+            // An edge is external if it isn't internal to a pattern
+            relation reachable(NodeIdx, NodeIdx);
+            // The only edges with None set for an idx are ones going to region
+            // input or outputs; those are always externals.
+            reachable(root, root) <-- root(root, _, _);
+            reachable(root, a) <-- edge(e, ?Some(a), ?Some(root), _, _), root(root, _, _);
+            reachable(root, b) <-- edge(e, ?Some(a), ?Some(b), _, _), reachable(root, b);
+            external(e, Some(*a), Some(*b), n) <-- edge(e, ?Some(a), ?Some(b), n, _), reachable(root, a), !reachable(root, b);
+            external(e, None, b, n) <-- edge(e, ?None, b, n, _);
+            external(e, a, None, n) <-- edge(e, a, ?None, n, _);
+        };
+
+        for external in phase2.external {
+            println!("external {:?}", external);
+        }
     }
 }
 

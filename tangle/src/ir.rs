@@ -160,7 +160,7 @@ impl IR {
             r.create_dependencies(); // we have to re-add node dependencies for the inserted movs
 
             let mut patterner = PatternManager::default();
-            patterner.run(self.owner.as_ref().unwrap(), r);
+            patterner.run(self.owner.as_ref().unwrap(), r, &mut virt_map);
             //let runner = PassRunner;
             //runner.run(r);
             //panic!();
