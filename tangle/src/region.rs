@@ -13,6 +13,7 @@ use crate::port::{Port, PortMeta, PortIdx, PortEdge, Edge, EdgeVariant, Storage,
 use crate::ir::{IR, VirtualRegister, VirtualRegisterMap};
 use crate::time::Timestamp;
 use crate::abi::{Abi, AbiRequest, AbiStorage};
+use crate::select::PatternManager;
 
 pub type RegionEdge = ();
 pub type RegionIdx = NodeIndex;
@@ -45,6 +46,9 @@ pub struct Region {
     pub order: Vec<usize>,
     pub states: Vec<State>,
     pub abi: Option<Box<dyn Abi>>,
+    /// Once we do pattern selection for node instructions, this is the set of roots
+    /// of patterns, and their covered nodes.
+    pub patterns: Option<PatternManager>,
 }
 
 use lazy_static::lazy_static;
@@ -543,6 +547,7 @@ impl Region {
         // this is needed so that we can e.g. allow instructions in the same timeslice
         // to re-use registers if the only instruction in the slice that 
 
+        let mut last = Timestamp::new();
         // Add all the constrained registers first
         for (key, reg) in &mut *virts {
             if reg.backing.is_some() {
@@ -551,6 +556,7 @@ impl Region {
                     self.ports[*reg.ports.first().unwrap()].time.unwrap(),
                     self.ports[*reg.ports.last().unwrap()].time.unwrap()
                 );
+                last = max(last, end);
                 let range = start..=end;
                 let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
                     println!("first allocation for constrained {} at {:?}", reg.backing.unwrap(), range); RangeInclusiveMap::new()
@@ -590,7 +596,6 @@ impl Region {
             // we also want to allocate vregs bottom-up
             .then(v0_time.cmp(&v1_time).reverse())
         });
-        let mut last = Timestamp::new();
         'allocate: for (key, reg) in vregs.drain(..) {
             println!("---- uncontrained {}", key);
             let (start, end) = (
@@ -632,20 +637,21 @@ impl Region {
 
         // print out a pretty graph of the register live ranges
         for reg in live {
-            let mut graph: String = "[".to_owned() + &" ".repeat((last.major*2).into()) + &"]".to_owned();
+            let mut graph: String = " ".repeat((last.major*2).into());
             for range in reg.1 {
-                let size = (range.0.end().major + 1) - range.0.start().major;
-                let new = (range.0.start().major as usize + 1)..(range.0.end().major as usize + 2);
+                let size = (range.0.end().major+1) - range.0.start().major;
+                let new = (range.0.start().major as usize)..(range.0.end().major as usize + 1);
+                dbg!(new.clone());
                 graph.replace_range(new, &"=".repeat(size as usize));
             }
-            println!("{}: {}", reg.0, graph);
+            println!("{}: [{}]", reg.0, graph);
         }
 
     }
 
     pub fn replace_virtual_with_backing(&mut self, virts: &mut VirtualRegisterMap) {
         for port in self.ports.node_weights_mut() {
-            if let Some(Storage::Virtual(vreg)) = *port.storage {
+            if let Some(Storage::Virtual(vreg)) = *port.storage && virts.contains_key(&(vreg as usize)) {
                 port.storage = OptionalStorage(Some(Storage::Physical(virts[&vreg.into()].backing.unwrap())));
             }
         }
@@ -673,16 +679,15 @@ impl Region {
 
     pub fn codegen(&mut self, token: &NodeOwner, ir: &mut IR, ops: &mut Assembler) {
         // TODO: emit all the constant values first?
-        let mut nodes_graph = StableGraph::new();
-        std::mem::swap(&mut self.nodes, &mut nodes_graph);
-        let mut nodes: Vec<_> = nodes_graph.node_weights().collect();
-        nodes.sort_by_key(|n| n.time );
+        //let mut nodes_graph = StableGraph::new();
+        //std::mem::swap(&mut self.nodes, &mut nodes_graph);
+        //let mut nodes: Vec<_> = nodes_graph.node_weights().collect();
+        //nodes.sort_by_key(|n| n.time );
         // lol this is wrong. we actually want to thread a State edge through
         // nodes, and just visit the State edge uses in order.
-        for n in nodes {
-            n.codegen(token, vec![], vec![], self, ir, ops);
-        }
-        std::mem::swap(&mut self.nodes, &mut nodes_graph);
+        let mut patterns = self.patterns.take().unwrap();
+        patterns.codegen(token, self, ops);
+        //std::mem::swap(&mut self.nodes, &mut nodes_graph);
     }
 }
 

@@ -47,11 +47,15 @@ use crate::node::{Node, NodeIdx, NodeVariant, NodeBehavior, Operation, NodeOwner
 use crate::node::NodeVariant::*;
 use crate::port::{Storage, OptionalStorage, PortEdge};
 use crate::region::{Region, NodeGraph};
+use crate::time::Timestamp;
 
 use petgraph::Direction;
 use petgraph::visit::{Visitable, EdgeRef};
+use petgraph::algo::DfsSpace;
+use fixedbitset::FixedBitSet;
 
 use yaxpeax_x86::long_mode::RegSpec;
+use yaxpeax_x86::long_mode::register_class;
 
 use frunk::prelude::HList;
 use frunk::{HList, HCons, HNil};
@@ -60,6 +64,9 @@ use frunk::hlist::LiftFrom;
 use frunk::hlist::h_cons;
 use frunk::traits::{ToRef, ToMut};
 use ascent::{ascent, ascent_run};
+
+use dynasmrt::x64::Assembler;
+use dynasmrt::{dynasm, DynasmApi};
 
 use std::collections::{HashMap, BTreeSet};
 use std::any::type_name;
@@ -140,8 +147,10 @@ impl<'a, T: ?Sized> Eq for RefEquality<&'a T> where RefEquality<&'a T>: PartialE
 pub enum Pattern {
     Constant16 = 0isize,
     Constant16Jmp,
+    RegJmp,
     MoveRegReg,
 }
+
 
 use ascent::Lattice;
 impl Lattice for Pattern {
@@ -167,7 +176,11 @@ fn variant<T: 'static + NodeBehavior>(token: &RefEquality<&NodeOwner>, n: &RefEq
 }
 
 #[derive(Default)]
-pub struct PatternManager;
+pub struct PatternManager {
+    roots: Vec<(NodeIdx, Pattern, Set<NodeIdx>)>,
+    toposorted: HashMap<NodeIdx, usize>,
+    pub virt_map: VirtualRegisterMap,
+}
 
 ascent! {
     struct AscentProgram<'a>;
@@ -199,20 +212,15 @@ ascent! {
         token(?t), kind(jmp, ?jmp_kind),
         edge(e, ?Some(c), Some(*jmp), 0, _), pattern(c, Pattern::Constant16, c_set),
         if variant::<NodeVariant::Leave>(t, jmp_kind);
+
+    pattern(jmp, Pattern::RegJmp, Set::singleton(*jmp)) <--
+        token(?t), kind(jmp, ?jmp_kind),
+        if variant::<NodeVariant::Leave>(t, jmp_kind);
 }
 
 impl PatternManager {
-    pub fn run(&mut self, token: &NodeOwner, region: &mut Region, virt_map: &mut VirtualRegisterMap) {
+    fn edges_row(&self, region: &Region) -> Vec<(petgraph::stable_graph::EdgeIndex, Option<NodeIdx>, Option<NodeIdx>, usize, u16)> {
         let Region { nodes, ports, sinks, .. } = region;
-
-
-        use petgraph::visit::Walker;
-        use petgraph::algo::DfsSpace;
-        let mut dfs_space = DfsSpace::new(&*nodes);
-        let mut visit_nodes: Vec<_> = petgraph::algo::toposort(&*nodes, Some(&mut dfs_space)).unwrap();
-        let toposorted = visit_nodes.clone().drain(..).enumerate().map(|(i, n)| (n, i)).collect::<HashMap<_,_>>();
-        let visit_nodes = visit_nodes.drain(..).map(|n| (n, RefEquality(nodes[n].variant.clone()))).collect();
-
         let mut edges = Vec::with_capacity(nodes.edge_count());
         // hook up all the edges to node inputs. this includes from the region sources
         for local in nodes.node_indices() {
@@ -244,8 +252,21 @@ impl PatternManager {
                 edges.push(new_edge);
              }
         }
+        edges
+    }
 
-        let mut ascent = AscentProgram::default();
+    pub fn run(&mut self, token: &NodeOwner, region: &mut Region, virt_map: &mut VirtualRegisterMap) {
+        let mut edges = self.edges_row(region);
+        let Region { nodes, ports, sinks, .. } = region;
+
+
+        use petgraph::visit::Walker;
+        let mut dfs_space = DfsSpace::new(&*nodes);
+        let mut visit_nodes: Vec<_> = petgraph::algo::toposort(&*nodes, Some(&mut dfs_space)).unwrap();
+        let toposorted = visit_nodes.clone().drain(..).enumerate().map(|(i, n)| (n, i)).collect::<HashMap<_,_>>();
+        let visit_nodes = visit_nodes.drain(..).map(|n| (n, RefEquality(nodes[n].variant.clone()))).collect();
+
+        let mut ascent: AscentProgram::<'_> = AscentProgram::default();
         ascent.token = vec![(RefEquality(token),)];
         ascent.kind = visit_nodes;
         ascent.edge = edges;
@@ -287,6 +308,7 @@ impl PatternManager {
         let mut phase2 = ascent_run! {
             relation root(NodeIdx, Pattern, Set<NodeIdx>) = roots;
             relation edge(PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16) = ascent.edge;
+            relation restricted(u16, RegSpec) = ascent.restricted;
 
             // given a pattern and a root we can have a Pattern::variables function
             // that populates variables required as needed.
@@ -294,7 +316,7 @@ impl PatternManager {
 
             // We need all the external edges between patterns, which must be
             // allocated vregs.
-            relation external(PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize);
+            relation external(PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16);
 
             // An edge is external if it is the result of a root node
             //external(a, b) <-- edge(a, b, _), root(b, _, _);
@@ -305,14 +327,113 @@ impl PatternManager {
             reachable(root, root) <-- root(root, _, _);
             reachable(root, a) <-- edge(e, ?Some(a), ?Some(root), _, _), root(root, _, _);
             reachable(root, b) <-- edge(e, ?Some(a), ?Some(b), _, _), reachable(root, b);
-            external(e, Some(*a), Some(*b), n) <-- edge(e, ?Some(a), ?Some(b), n, _), reachable(root, a), !reachable(root, b);
-            external(e, None, b, n) <-- edge(e, ?None, b, n, _);
-            external(e, a, None, n) <-- edge(e, a, ?None, n, _);
+            external(e, Some(*a), Some(*b), n, r) <-- edge(e, ?Some(a), ?Some(b), n, r), reachable(root, a), !reachable(root, b);
+            external(e, None, b, n, r) <-- edge(e, ?None, b, n, r);
+            external(e, a, None, n, r) <-- edge(e, a, ?None, n, r);
         };
 
+        let mut observed = BTreeSet::<u16>::new();
         for external in phase2.external {
             println!("external {:?}", external);
+            observed.insert(external.4);
         }
+
+        virt_map.retain(|k, v| observed.contains(&(*k as u16)));
+        self.roots = phase2.root;
+        self.toposorted = toposorted;
+    }
+
+    pub fn codegen(&mut self, token: &NodeOwner, region: &mut Region, ops: &mut Assembler) {
+        let mut edges = self.edges_row(region);
+        let Region { nodes, ports, sinks, .. } = region;
+
+        let constants = nodes.node_indices().flat_map(|n| {
+            (nodes[n].ro(token).as_ref() as &dyn Any).downcast_ref::<NodeVariant::Constant>().map(|c| (n, c.0))
+        }).collect::<Vec<_>>();
+
+        let vregs = self.virt_map.iter().map(|(i, vr)| (*i as u16, vr.backing.unwrap())).collect::<Vec<(_,_)>>();
+
+        let mut clock = Timestamp::new();
+        self.roots.sort_by(|a, b| nodes[a.0].time.cmp(&nodes[b.0].time));
+        let mut binder = ascent_run! {
+            struct VarBinder;
+             // Indicated that Edge from A->B is the Nth input of B, which uses Vreg for storage
+            relation edge(petgraph::stable_graph::EdgeIndex, Option<NodeIdx>, Option<NodeIdx>, usize, u16) =
+                edges;
+            // The physical register used for each vreg
+            relation vreg(u16, RegSpec) = vregs;
+            // Nodes that are constant values
+            relation constant(NodeIdx, isize) = constants;
+            // Output the annotations that a node was given
+            lattice pattern(NodeIdx, Pattern, Set<NodeIdx>) = self.roots.clone();
+            relation emit(NodeIdx, CodegenFn);
+
+            // emit constants
+            emit(c, {let r0 = r0.clone();
+                    let imm = imm.clone();
+                    CodegenFn(box move |ops| dynasm!(ops ;mov Rq(r0.num()), QWORD imm as i64))}) <--
+                edge(e, ?Some(c), _, 0, r),
+                vreg(r, r0),
+                constant(c, imm) if r0.class() == register_class::Q;
+
+            // emit jmps
+            emit(jmp, {let r0 = r0.clone();
+                    CodegenFn(box move |ops| dynasm!(ops ;jmp Rq(r0.num())))}) <--
+                edge(e, ?Some(c), ?Some(jmp), 0, r), pattern(jmp, Pattern::RegJmp, _),
+                vreg(r, r0);
+
+            // emit movs
+            emit(mov, {let r0 = r_in.clone(); let r1 = r_out.clone();
+                    CodegenFn(box move |ops| dynasm!(ops; mov Rq(r1.num()), Rq(r0.num()) ))}) <--
+                pattern(mov, Pattern::MoveRegReg, _),
+                edge(e1, _, Some(*mov), _, vr_in),
+                edge(e2, Some(*mov), _, _, vr_out),
+                vreg(vr_in, r_in),
+                vreg(vr_out, r_out),
+                if r_in.class() == register_class::Q && r_out.class() == register_class::Q;
+        };
+        binder.emit.sort_by(|a, b| nodes[a.0].time.cmp(&nodes[b.0].time));
+
+        use std::collections::HashSet;
+        use std::ops::BitAnd;
+        let emitted = binder.emit.iter().map(|emit| emit.0).collect::<HashSet<_>>();
+        let roots = binder.pattern.iter().map(|pat| pat.0).collect::<HashSet<_>>();
+        let missing = roots.difference(&emitted).collect::<Vec<_>>();
+        if missing.len() != 0 {
+            for miss in missing {
+                println!("{:?} missing {:?}", miss, nodes[*miss].variant.ro(token));
+                println!("pattern {:?}", binder.pattern.iter().filter(|e| e.0 == *miss).next().unwrap().1);
+            }
+            panic!();
+        }
+
+        for (root, emit) in binder.emit {
+            println!("{}, {}  - {:?}", clock, nodes[root].time, nodes[root].variant.ro(token));
+            emit.0(ops);
+            //pat.codegen(root, &binder, ops);
+            //assert!(clock <= nodes[*root].time, "{} under clock", nodes[*root].time);
+            clock = nodes[root].time;
+        }
+    }
+}
+
+struct CodegenFn(Box<dyn FnOnce(&mut Assembler) -> ()>);
+impl PartialEq for CodegenFn {
+    fn eq(&self, _: &Self) -> bool {
+        false
+    }
+}
+impl Eq for CodegenFn { }
+impl core::hash::Hash for CodegenFn {
+    fn hash<H>(&self, hasher: &mut H) where H: core::hash::Hasher {
+        use std::borrow::Borrow;
+        use core::ffi::c_void;
+        hasher.write_u64(self.0.borrow() as *const dyn FnOnce(&mut Assembler)->() as *const c_void as u64);
+    }
+}
+impl Clone for CodegenFn {
+    fn clone(&self) -> Self {
+        CodegenFn(box |op|{panic!("cloned")})
     }
 }
 

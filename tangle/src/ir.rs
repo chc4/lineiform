@@ -172,10 +172,12 @@ impl IR {
             println!("optimized vreg live ranges");
             r.allocate_physical_for_virtual(&mut virt_map);
             println!("allocated physical registers for virtual register");
-            r.replace_virtual_with_backing(&mut virt_map);
-            println!("replacing virtual registers with physical registers");
+            //r.replace_virtual_with_backing(&mut virt_map);
+            //println!("replacing virtual registers with physical registers");
             // Create a dependency graph for registers
             //let dg = r.create_register_dependencies();
+            patterner.virt_map = virt_map;
+            r.patterns = Some(patterner);
         }
     }
 

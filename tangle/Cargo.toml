@@ -16,6 +16,7 @@ rangemap = "0.1.11"
 frunk = "0.4.0"
 ascent = "0.3.0"
 qcell = "0.5.2"
+fixedbitset = "*"
 
 [dependencies.yaxpeax-x86]
 version = "1.0.4"

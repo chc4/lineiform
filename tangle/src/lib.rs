@@ -7,6 +7,7 @@ extern crate yaxpeax_x86;
 extern crate dynasmrt;
 extern crate ena;
 extern crate rangemap;
+extern crate fixedbitset;
 pub mod port;
 pub mod node;
 pub mod region;
