@@ -145,12 +145,19 @@ impl<'a, T: ?Sized> Eq for RefEquality<&'a T> where RefEquality<&'a T>: PartialE
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Pattern {
-    Constant16 = 0isize,
+    Constant8 = 0isize,
+    Constant16,
+    Constant32,
+    Constant64,
     Constant16Jmp,
     RegJmp,
     MoveRegReg,
+    Inc,
+    AddRegConstant8,
+    AddRegConstant16,
+    AddRegConstant32,
+    AddRegReg,
 }
-
 
 use ascent::Lattice;
 impl Lattice for Pattern {
@@ -175,6 +182,12 @@ fn variant<T: 'static + NodeBehavior>(token: &RefEquality<&NodeOwner>, n: &RefEq
     (n.0.ro(token.0).as_ref() as &dyn Any).downcast_ref::<T>().is_some()
 }
 
+fn operation(token: &RefEquality<&NodeOwner>, n: &RefEquality<Rc<NodeCell>>, op: Operation) -> bool {
+    (n.0.ro(token.0).as_ref() as &dyn Any).downcast_ref::<NodeVariant::Simple>().map(|n| n.0 == op) == Some(true)
+}
+
+
+
 #[derive(Default)]
 pub struct PatternManager {
     roots: Vec<(NodeIdx, Pattern, Set<NodeIdx>)>,
@@ -182,6 +195,7 @@ pub struct PatternManager {
     pub virt_map: VirtualRegisterMap,
 }
 
+use ascent::lattice::constant_propagation::ConstPropagation;
 ascent! {
     struct AscentProgram<'a>;
     /// Stage 1
@@ -195,15 +209,38 @@ ascent! {
     relation token(RefEquality<&'a NodeOwner>);
     // Output the annotations that a node was given
     lattice pattern(NodeIdx, Pattern, Set<NodeIdx>);
+    // Constant propogation; a node is a constant if it can be encoded as an N bit
+    // width immediate.
+    lattice constant(NodeIdx, u8, ConstPropagation<i64>);
+
+    constant(n, 8, ConstPropagation::Constant(*imm)) <--
+        constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i8>::try_into(*imm).is_ok();
 
     // Constant patterns
-    pattern(n, Pattern::Constant16, Set::singleton(*n)) <--
-        token(?t), kind(n, ?c), if variant::<NodeVariant::Constant>(t, c);
+    pattern(n, Pattern::Constant8, Set::singleton(*n)) <--
+        constant(n, 8, _);
+
+    // Inc patterns
+    pattern(n, Pattern::Inc, Set::singleton(*n)) <--
+        token(?t), kind(n, ?c), if operation(t, c, Operation::Inc);
+
+    // Add patterns
+    pattern(n, Pattern::AddRegReg, Set::singleton(*n)) <--
+        token(?t), kind(n, ?c), if operation(t, c, Operation::Add);
+
+    pattern(add, Pattern::AddRegConstant8, Set::singleton(*add).join(Set::singleton(*c))) <--
+        token(?t), kind(add, ?add_kind),
+        edge(e, ?Some(c), Some(*add), 1, _), constant(c, 8, _),
+        if operation(t, add_kind, Operation::Add);
 
     // Mov patterns
     // mov reg, _
     pattern(n, Pattern::MoveRegReg, Set::singleton(*n)) <--
         token(?t), kind(n, ?c), edge(e, _, Some(*n), 0, vreg), restricted(vreg, _),
+        if variant::<NodeVariant::Move>(t, c);
+
+    pattern(n, Pattern::MoveRegReg, Set::singleton(*n)) <--
+        token(?t), kind(n, ?c), edge(e, _, Some(*n), 0, vreg), !restricted(vreg, _),
         if variant::<NodeVariant::Move>(t, c);
 
     // Leave patterns
@@ -266,11 +303,16 @@ impl PatternManager {
         let toposorted = visit_nodes.clone().drain(..).enumerate().map(|(i, n)| (n, i)).collect::<HashMap<_,_>>();
         let visit_nodes = visit_nodes.drain(..).map(|n| (n, RefEquality(nodes[n].variant.clone()))).collect();
 
+        let constants = nodes.node_indices().filter_map(|n| {
+            nodes[n].as_variant::<NodeVariant::Constant>(token).map(|c| (n, 64, ConstPropagation::Constant(c.0 as i64)))
+        }).collect::<Vec<_>>();
+        dbg!(constants.clone());
         let mut ascent: AscentProgram::<'_> = AscentProgram::default();
         ascent.token = vec![(RefEquality(token),)];
         ascent.kind = visit_nodes;
         ascent.edge = edges;
         ascent.restricted = virt_map.iter().flat_map(|(i,v)| v.backing.map(|back| (*i as u16,back))).collect::<Vec<_>>();
+        ascent.constant = constants;
         ascent.run();
 
         println!("after ascent");
@@ -279,10 +321,11 @@ impl PatternManager {
             toposorted[&a.0].cmp(&toposorted[&b.0]).reverse()
             // for now we just return the largest pattern that matches first
             // later on this can be some shortest-path (lowest cost) thing ig
-            .then(a.2.len().cmp(&b.2.len()))
+            .then(a.2.len().cmp(&b.2.len()).reverse())
             .then(a.1.cmp(&b.1))
         );
         let mut roots = ascent.pattern.drain(..).flat_map(|(root, pat, include_set)| {
+            dbg!(root, pat);
             // for not we just get the first pattern that matches
 
             // If we already emitted the root, then it was a part of a pattern
@@ -369,28 +412,56 @@ impl PatternManager {
             relation emit(NodeIdx, CodegenFn);
 
             // emit constants
-            emit(c, {let r0 = r0.clone();
-                    let imm = imm.clone();
-                    CodegenFn(box move |ops| dynasm!(ops ;mov Rq(r0.num()), QWORD imm as i64))}) <--
-                edge(e, ?Some(c), _, 0, r),
-                vreg(r, r0),
-                constant(c, imm) if r0.class() == register_class::Q;
+            emit(c, CodegenFn(box move |ops| dynasm!(ops ;mov Rq(r0.num()), QWORD imm as i64))) <--
+                edge(e, ?Some(c), _, _, r),
+                vreg(r, ?&r0),
+                constant(c, ?&imm) if r0.class() == register_class::Q;
+
+            // emit adds
+            emit(add, CodegenFn(box move |ops| dynasm!(ops; add Rq(r_out.num()), Rq(r_in.num()) ))) <--
+                pattern(add, Pattern::AddRegReg, _),
+                edge(e2, _, Some(*add), 0, vr_out),
+                edge(e1, _, Some(*add), 1, vr_in),
+                vreg(vr_out, ?&r_out),
+                vreg(vr_in, ?&r_in),
+                if r_in.class() == register_class::Q && r_out.class() == register_class::Q;
+
+            emit(add, CodegenFn(box move |ops| dynasm!(ops; add Rq(r_out.num()), BYTE imm as i8 ))) <--
+                pattern(add, Pattern::AddRegConstant8, _),
+                edge(e2, _, Some(*add), 0, vr_out),
+                edge(e1, ?Some(c), Some(*add), 1, vr_in),
+                vreg(vr_out, ?&r_out),
+                constant(c, ?&imm),
+                if r_out.class() == register_class::Q;
+
+            // emit inc
+            emit(inc, CodegenFn(box move |ops| dynasm!(ops ;inc Rq(r0.num())))) <--
+                edge(e, ?Some(c), ?Some(inc), 0, r), pattern(inc, Pattern::Inc, _),
+                vreg(r, ?&r0),
+                if r0.class() == register_class::Q;
 
             // emit jmps
-            emit(jmp, {let r0 = r0.clone();
-                    CodegenFn(box move |ops| dynasm!(ops ;jmp Rq(r0.num())))}) <--
+            emit(jmp, CodegenFn(box move |ops| dynasm!(ops ;jmp Rq(r0.num())))) <--
                 edge(e, ?Some(c), ?Some(jmp), 0, r), pattern(jmp, Pattern::RegJmp, _),
-                vreg(r, r0);
+                vreg(r, ?&r0),
+                if r0.class() == register_class::Q;
 
             // emit movs
-            emit(mov, {let r0 = r_in.clone(); let r1 = r_out.clone();
-                    CodegenFn(box move |ops| dynasm!(ops; mov Rq(r1.num()), Rq(r0.num()) ))}) <--
+            emit(mov, CodegenFn(box |ops| () )) <--
                 pattern(mov, Pattern::MoveRegReg, _),
                 edge(e1, _, Some(*mov), _, vr_in),
                 edge(e2, Some(*mov), _, _, vr_out),
-                vreg(vr_in, r_in),
-                vreg(vr_out, r_out),
-                if r_in.class() == register_class::Q && r_out.class() == register_class::Q;
+                vreg(vr_in, ?&r_in),
+                vreg(vr_out, ?&r_out),
+                if r_in == r_out;
+
+            emit(mov, CodegenFn(box move |ops| dynasm!(ops; mov Rq(r_out.num()), Rq(r_in.num()) ))) <--
+                pattern(mov, Pattern::MoveRegReg, _),
+                edge(e1, _, Some(*mov), _, vr_in),
+                edge(e2, Some(*mov), _, _, vr_out),
+                vreg(vr_in, ?&r_in),
+                vreg(vr_out, ?&r_out),
+                if r_in != r_out && r_in.class() == register_class::Q && r_out.class() == register_class::Q;
         };
         binder.emit.sort_by(|a, b| nodes[a.0].time.cmp(&nodes[b.0].time));
 
