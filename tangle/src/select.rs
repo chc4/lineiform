@@ -46,7 +46,7 @@ use crate::ir::VirtualRegisterMap;
 use crate::node::{Node, NodeIdx, NodeVariant, NodeBehavior, Operation, NodeOwner, NodeCell};
 use crate::node::NodeVariant::*;
 use crate::port::{Storage, OptionalStorage, PortEdge};
-use crate::region::{Region, NodeGraph};
+use crate::region::{Region, NodeGraph, StateVariant};
 use crate::time::Timestamp;
 
 use petgraph::Direction;
@@ -157,6 +157,8 @@ pub enum Pattern {
     AddRegConstant16,
     AddRegConstant32,
     AddRegReg,
+    StoreStackReg,
+    LoadStackReg,
 }
 
 use ascent::Lattice;
@@ -207,6 +209,8 @@ ascent! {
     relation kind(NodeIdx, NodeRow);
     // Capture the NodeCell token for query use
     relation token(RefEquality<&'a NodeOwner>);
+    // Outgoing degree count for each node
+    relation outgoing(NodeIdx, u8);
     // Output the annotations that a node was given
     lattice pattern(NodeIdx, Pattern, Set<NodeIdx>);
     // Constant propogation; a node is a constant if it can be encoded as an N bit
@@ -230,29 +234,29 @@ ascent! {
 
     pattern(add, Pattern::AddRegConstant8, Set::singleton(*add).join(Set::singleton(*c))) <--
         token(?t), kind(add, ?add_kind),
-        edge(e, ?Some(c), Some(*add), 1, _), constant(c, 8, _),
+        edge(e, ?Some(c), Some(*add), 1, _), constant(c, 8, _), outgoing(c, 1),
         if operation(t, add_kind, Operation::Add);
 
     // Mov patterns
     // mov reg, _
     pattern(n, Pattern::MoveRegReg, Set::singleton(*n)) <--
-        token(?t), kind(n, ?c), edge(e, _, Some(*n), 0, vreg), restricted(vreg, _),
-        if variant::<NodeVariant::Move>(t, c);
-
-    pattern(n, Pattern::MoveRegReg, Set::singleton(*n)) <--
-        token(?t), kind(n, ?c), edge(e, _, Some(*n), 0, vreg), !restricted(vreg, _),
+        token(?t), kind(n, ?c),
         if variant::<NodeVariant::Move>(t, c);
 
     // Leave patterns
     // jmp constant
-    pattern(jmp, Pattern::Constant16Jmp, Set::singleton(*jmp).join(c_set.clone())) <--
-        token(?t), kind(jmp, ?jmp_kind),
-        edge(e, ?Some(c), Some(*jmp), 0, _), pattern(c, Pattern::Constant16, c_set),
-        if variant::<NodeVariant::Leave>(t, jmp_kind);
-
     pattern(jmp, Pattern::RegJmp, Set::singleton(*jmp)) <--
         token(?t), kind(jmp, ?jmp_kind),
         if variant::<NodeVariant::Leave>(t, jmp_kind);
+
+    // Store_ss pattern
+    pattern(store, Pattern::StoreStackReg, Set::singleton(*store)) <--
+        token(?t), kind(store, ?store_kind),
+        if operation(t, store_kind, Operation::StoreStack);
+
+    pattern(load, Pattern::LoadStackReg, Set::singleton(*load)) <--
+        token(?t), kind(load, ?load_kind),
+        if operation(t, load_kind, Operation::LoadStack);
 }
 
 impl PatternManager {
@@ -306,6 +310,9 @@ impl PatternManager {
         let constants = nodes.node_indices().filter_map(|n| {
             nodes[n].as_variant::<NodeVariant::Constant>(token).map(|c| (n, 64, ConstPropagation::Constant(c.0 as i64)))
         }).collect::<Vec<_>>();
+        let outgoing = nodes.node_indices().map(|n| {
+            (n, nodes.edges(n).count().try_into().unwrap())
+        }).collect::<Vec<_>>();
         dbg!(constants.clone());
         let mut ascent: AscentProgram::<'_> = AscentProgram::default();
         ascent.token = vec![(RefEquality(token),)];
@@ -313,6 +320,7 @@ impl PatternManager {
         ascent.edge = edges;
         ascent.restricted = virt_map.iter().flat_map(|(i,v)| v.backing.map(|back| (*i as u16,back))).collect::<Vec<_>>();
         ascent.constant = constants;
+        ascent.outgoing = outgoing;
         ascent.run();
 
         println!("after ascent");
@@ -386,15 +394,26 @@ impl PatternManager {
         self.toposorted = toposorted;
     }
 
-    pub fn codegen(&mut self, token: &NodeOwner, region: &mut Region, ops: &mut Assembler) {
+    pub fn codegen<'a>(&mut self, token: &NodeOwner, region: &mut Region, ops: &mut Assembler) {
         let mut edges = self.edges_row(region);
-        let Region { nodes, ports, sinks, .. } = region;
+        let Region { nodes, ports, sinks, states, .. } = region;
 
         let constants = nodes.node_indices().flat_map(|n| {
             (nodes[n].ro(token).as_ref() as &dyn Any).downcast_ref::<NodeVariant::Constant>().map(|c| (n, c.0))
         }).collect::<Vec<_>>();
 
         let vregs = self.virt_map.iter().map(|(i, vr)| (*i as u16, vr.backing.unwrap())).collect::<Vec<(_,_)>>();
+        use crate::petgraph::visit::IntoEdgeReferences;
+        // this is messy and state edges should probably work differently
+        let states_row = ports.edge_references().flat_map(|e| {
+            if let OptionalStorage(Some(Storage::Immaterial(Some(state)))) = ports[e.target()].storage {
+                ports[e.target()].node.map(|n| Some((n, state))).iter()
+                    .chain(ports[e.source()].node.map(|n| Some((n, state))).iter())
+                    .flatten().map(Clone::clone).collect::<Vec<_>>()
+            } else {
+                vec![]
+            }
+        }).collect::<Vec<_>>();
 
         let mut clock = Timestamp::new();
         self.roots.sort_by(|a, b| nodes[a.0].time.cmp(&nodes[b.0].time));
@@ -405,6 +424,8 @@ impl PatternManager {
                 edges;
             // The physical register used for each vreg
             relation vreg(u16, RegSpec) = vregs;
+            // Indicates that a Node uses the state variable S
+            relation state(NodeIdx, u16) = states_row;
             // Nodes that are constant values
             relation constant(NodeIdx, isize) = constants;
             // Output the annotations that a node was given
@@ -462,6 +483,26 @@ impl PatternManager {
                 vreg(vr_in, ?&r_in),
                 vreg(vr_out, ?&r_out),
                 if r_in != r_out && r_in.class() == register_class::Q && r_out.class() == register_class::Q;
+
+            // emit stack load
+            // XXX: this should probably do something else!
+            emit(load, { if let StateVariant::Stack(ss) = states[*state as usize].variant {
+                CodegenFn(box move |ops|
+                    dynasm!(ops; mov Rq(r_out.num()), QWORD [rsp+(ss*8).try_into().unwrap()]))
+            } else { panic!() } }) <--
+                pattern(load, Pattern::LoadStackReg, _),
+                state(load, ?state),
+                edge(e1, Some(*load), _, _, vr_out),
+                vreg(vr_out, ?&r_out);
+
+            emit(store, { if let StateVariant::Stack(ss) = states[*state as usize].variant {
+                CodegenFn(box move |ops|
+                    dynasm!(ops; mov QWORD [rsp+(ss*8).try_into().unwrap()], Rq(r_in.num())))
+            } else { panic!() } }) <--
+                pattern(store, Pattern::StoreStackReg, _),
+                state(store, ?state),
+                edge(e1, _, Some(*store), 1, vr_in),
+                vreg(vr_in, ?&r_in);
         };
         binder.emit.sort_by(|a, b| nodes[a.0].time.cmp(&nodes[b.0].time));
 
@@ -491,7 +532,7 @@ impl PatternManager {
 struct CodegenFn(Box<dyn FnOnce(&mut Assembler) -> ()>);
 impl PartialEq for CodegenFn {
     fn eq(&self, _: &Self) -> bool {
-        false
+        true
     }
 }
 impl Eq for CodegenFn { }
@@ -499,7 +540,8 @@ impl core::hash::Hash for CodegenFn {
     fn hash<H>(&self, hasher: &mut H) where H: core::hash::Hasher {
         use std::borrow::Borrow;
         use core::ffi::c_void;
-        hasher.write_u64(self.0.borrow() as *const dyn FnOnce(&mut Assembler)->() as *const c_void as u64);
+        //hasher.write_u64(self.0.borrow() as *const dyn FnOnce(&mut Assembler)->() as *const c_void as u64);
+        hasher.write_u64(0);
     }
 }
 impl Clone for CodegenFn {
