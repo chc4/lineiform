@@ -322,7 +322,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                     let c = self.constant(c.0 as isize);
                     self.store(oper_place, c, None);
                 },
-                _ => unimplemented!()
+                x => unimplemented!("pinned value {:?} = {:?}", oper_place, x)
             }
         }
 
@@ -673,7 +673,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
         // TODO: constant pooling? idk
         println!("adding constant node {}", c);
         let mut c = tangle::node::Node::constant(c);
-        self.f.add_body(c, &mut self.ir, |c, r| { c.outputs[0]}).1
+        self.f.add_body(c, &mut self.ir, |c, r| { c.outputs[0] }).1
     }
 
     fn add(&mut self, left: PortIdx, right: PortIdx) -> PortIdx {

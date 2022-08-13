@@ -9,7 +9,7 @@ use core::ops::{Deref};
 use crate::node::{NodeIdx};
 use crate::time::Timestamp;
 
-#[derive(Hash, PartialOrd, Ord, PartialEq, Eq, Clone, Copy, Debug, Default)]
+#[derive(Hash, PartialOrd, Ord, PartialEq, Eq, Clone, Copy, Default)]
 pub struct PortIdxToken(u32);
 pub type PortIdx = NodeIndex<PortIdxToken>;
 unsafe impl petgraph::matrix_graph::IndexType for PortIdxToken {
@@ -24,6 +24,12 @@ unsafe impl petgraph::matrix_graph::IndexType for PortIdxToken {
     #[inline(always)]
     fn max() -> Self {
         PortIdxToken(::std::u32::MAX)
+    }
+}
+
+impl core::fmt::Debug for PortIdxToken {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+        write!(fmt, "p{}", self.0)
     }
 }
 

@@ -11,7 +11,7 @@ use crate::region::{Region, RegionIdx, State, StateVariant};
 use crate::abi::{x86_64, Abi};
 
 use std::rc::Rc;
-#[derive(Hash, PartialOrd, Ord, PartialEq, Eq, Clone, Copy, Debug, Default)]
+#[derive(Hash, PartialOrd, Ord, PartialEq, Eq, Clone, Copy, Default)]
 pub struct NodeIdxToken(u32);
 pub type NodeIdx = NodeIndex<NodeIdxToken>;
 pub type NodeEdge = EdgeIndex<NodeIdxToken>;
@@ -27,6 +27,12 @@ unsafe impl petgraph::matrix_graph::IndexType for NodeIdxToken {
     #[inline(always)]
     fn max() -> Self {
         NodeIdxToken(::std::u32::MAX)
+    }
+}
+
+impl core::fmt::Debug for NodeIdxToken {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+        write!(fmt, "n{}", self.0)
     }
 }
 
