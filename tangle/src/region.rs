@@ -512,27 +512,7 @@ impl Region {
             self.ports[*p].time = Some(final_time.push());
         }
 
-        // sort the uses for virtual registers by timings for later
-        for (i, vreg) in virts {
-            vreg.ports.sort_by(|a, b| self.ports[*a].time.unwrap().partial_cmp(&self.ports[*b].time.unwrap()).unwrap());
-        }
-
     }
-
-    // Push and pull instructions forward or backwards inside their major timeslice
-    // in order to create disjoint ranges
-    pub fn optimize_vreg_live_ranges(&mut self, virts: &mut VirtualRegisterMap) {
-        for (i, vreg) in virts {
-            //let last = vreg.ports.last().unwrap();
-            //self.ports[*last].time.as_mut().map(|t| *t = t.push());
-            //self.ports[*last].node.map(|n| { let n = &mut self.nodes[n]; n.time = n.time.push() });
-
-            //let first = vreg.ports.first().unwrap();
-            //self.ports[*first].time.as_mut().map(|t| *t = t.pull());
-            //self.ports[*first].node.map(|n| { let n = &mut self.nodes[n]; n.time = n.time.pull() });
-        }
-    }
-
 
     pub fn allocate_physical_for_virtual(&mut self, virts: &mut VirtualRegisterMap) {
         // TODO: all of this should just be over virtual register and not ports
@@ -541,7 +521,6 @@ impl Region {
         // live for that timeslice on the physical register.
         let mut live: HashMap<RegSpec, RangeInclusiveMap<Timestamp, usize>> = HashMap::new();
 
-
         // TODO: split timestamps into (major, minor), so that we can schedule
         // instructions within the scheduled timeslice.
         // this is needed so that we can e.g. allow instructions in the same timeslice
@@ -549,15 +528,18 @@ impl Region {
 
         let mut last = Timestamp::new();
         // Add all the constrained registers first
-        for (key, reg) in &mut *virts {
+        'constrain: for (key, reg) in &mut *virts {
             if reg.backing.is_some() {
-                println!("---- constrained {}", key);
+                println!("---- constrained {} to {}", key, reg.backing.unwrap());
+                reg.ports.sort_by(|a, b| self.ports[*a].time.unwrap().partial_cmp(&self.ports[*b].time.unwrap()).unwrap());
                 let (start, end) = (
                     self.ports[*reg.ports.first().unwrap()].time.unwrap(),
                     self.ports[*reg.ports.last().unwrap()].time.unwrap()
                 );
                 last = max(last, end);
-                let range = start..=end;
+                let mut range = start..=end;
+                'time_range: loop {
+                println!("wants range {:?}", range);
                 let reg_live = live.entry(*REGMAP.get(&reg.backing.unwrap()).unwrap()).or_insert_with(|| {
                     println!("first allocation for constrained {} at {:?}", reg.backing.unwrap(), range); RangeInclusiveMap::new()
                 });
@@ -566,6 +548,24 @@ impl Region {
                 for gap in already {
                     println!("gap {:?}", gap);
                     if gap.start() != range.start() || gap.end() != range.end() {
+                        println!("gap start {:?}", reg_live.get(&gap.start().pull()));
+                        // if the conflict is the same major time, we can order
+                        // the entire instruction via minor time after the conflict
+                        // imposing a partial order on v1 last use < v2 first producer
+                        if gap.start().major == range.start().major {
+                            println!("pushing node start");
+                            // TODO: LOL IS THIS CORRECT
+                            let produce = &self.ports[*reg.ports.first().unwrap()];
+                            range = range.start().push()..=*range.end();
+                            // retime the entire node
+                            let produce_node = &mut self.nodes[produce.node.unwrap()];
+                            produce_node.time = produce_node.time.push();
+                            for p in produce_node.inputs.iter().chain(produce_node.outputs.iter()) {
+                                self.ports[*p].time = self.ports[*p].time.map(|t| t.push());
+                            }
+                            continue 'time_range;
+                        }
+
                         panic!("bad gap");
                     }
                     empty = true;
@@ -575,14 +575,19 @@ impl Region {
                 reg_live.insert(start..=end.push(), *key);
                 println!("allocated constrained {} register {} {:?}", *key, reg.backing.unwrap(), range);
                 // we were able to allocate the physical register requirement
-                continue;
+                continue 'constrain;
+                }
             }
         }
 
         // and then do reverse linear scan for any unconstrained virtual registers
-        let vregs = virts.clone();
-        let mut vregs = vregs.iter()
+        let mut vregs = virts.clone();
+        let mut vregs = vregs.drain()
             .filter(|(_, r)| r.backing.is_none() )
+            .map(|(i, mut r)| {
+                r.ports.sort_by(|a, b| self.ports[*a].time.unwrap().partial_cmp(&self.ports[*b].time.unwrap()).unwrap());
+                (i, r)
+            })
             .collect::<Vec<_>>();
         vregs.sort_by(|(_, v0), (_, v1)| {
             // We want registers with hints scheduled first, and registers with
@@ -626,9 +631,9 @@ impl Region {
                 }
                 if !empty { continue 'candidate };
                 // we have a free register for this time slice
-                reg_live.insert(start.pull()..=end.push(), *key);
-                virts.get_mut(key).unwrap().backing = Some(*candidate);
-                println!("allocated unconstrained {} register {} {:?}", *key, candidate, range);
+                reg_live.insert(start.pull()..=end.push(), key);
+                virts.get_mut(&key).unwrap().backing = Some(*candidate);
+                println!("allocated unconstrained {} register {} {:?}", key, candidate, range);
                 continue 'allocate;
             }
             panic!("couldn't allocate");

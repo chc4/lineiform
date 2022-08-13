@@ -1,5 +1,6 @@
 use crate::tracer::{self, Tracer};
 use tangle::ir::PortIdx;
+use tangle::node::Continuation;
 
 use crate::block::{Function};
 
@@ -312,29 +313,64 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                 },
                 EmitEffect::Jmp(p) => {
                     let mut tailcall = tangle::node::Node::leave();
-                    // TODO: add all the context registers here?
-                    self.f.add_body(tailcall, &mut self.ir, |tailcall, ir| {
+
+                    // create input ports for all values that need to be alive for the
+                    // jmp
+                    use tangle::port::Storage;
+                    let reg_ports = snap.iter().map(|(bound, alive)| {
+                        match alive {
+                            JitVariable::Variable(p) => {
+                                self.ir.in_region(self.f.region, |r, ir| {
+                                    let material = r.add_port();
+                                    match bound {
+                                        Location::Reg(bound_reg) =>
+                                            r.constrain(material, Storage::Physical(*bound_reg)),
+                                        Location::Stack(ss) =>
+                                            // stack slots just need to observe the
+                                            // state edge
+                                            r.constrain(material, Storage::Immaterial(None)),
+                                    }
+                                    (p, material)
+                                })
+                            },
+                            JitVariable::Known(c) => {
+                                panic!("constant pool")
+                            },
+                        }
+                    }).collect::<Vec<_>>();
+
+                    // add the tailcall node to the graph, and also bind as inputs
+                    // all the alive ports
+                    let (_, tailcall_o) = self.f.add_body(tailcall, &mut self.ir, |tailcall, ir| {
                         tailcall.connect_input(0, p, ir);
+                        for (i, (reg_port, input_port)) in reg_ports.iter().enumerate() {
+                            tailcall.add_input(*input_port, ir);
+                            tailcall.connect_input(1+i, **reg_port, ir);
+                        }
+                        tailcall.outputs[0]
                     });
+                    self.f.cont = Continuation::Jmp(tailcall_o);
                     break;
                 },
                 _ => unimplemented!("emit effect"),
             }
         }
 
-        for i in 0..O_n {
-            let p = self.f.add_return(&mut self.ir);
-            println!("adding return {} -> {:?}", i, p);
-            match abi_ret[i] {
-                AbiStorage::Register(r) => {
-                    let reg = self.port_for_register(r);
-                    self.ir.in_region(self.f.region,|r, ir| {
-                        r.connect_ports(reg, p)
-                    });
-                },
-                _ => unimplemented!(),
+        if self.f.cont == Continuation::Return {
+            for i in 0..O_n {
+                let p = self.f.add_return(&mut self.ir);
+                println!("adding return {} -> {:?}", i, p);
+                match abi_ret[i] {
+                    AbiStorage::Register(r) => {
+                        let reg = self.port_for_register(r);
+                        self.ir.in_region(self.f.region,|r, ir| {
+                            r.connect_ports(reg, p)
+                        });
+                    },
+                    _ => unimplemented!(),
+                }
+                // TODO
             }
-            // TODO
         }
 
         Ok(())

@@ -1,7 +1,7 @@
 use dynasmrt::x64::Assembler;
 use dynasmrt::{dynasm, DynasmApi};
 use yaxpeax_x86::long_mode::RegSpec;
-use yaxpeax_x86::long_mode::register_class;
+use yaxpeax_x86::long_mode::{register_class, Instruction};
 use petgraph::graph::NodeIndex;
 
 use crate::time::Timestamp;
@@ -40,6 +40,12 @@ pub enum Operation {
     StoreStack
 }
 
+#[derive(Debug, PartialEq)]
+pub enum Continuation {
+    Return,
+    Jmp(PortIdx),
+}
+
 pub mod NodeVariant {
     use super::{Operation, Region};
 
@@ -57,6 +63,7 @@ pub mod NodeVariant {
         pub stack_slots: Vec<PortIdx>,
         pub highwater: u8,
         pub region: RegionIdx,
+        pub cont: Continuation,
     } // "Lambda-Nodes"; procedures and functions
     impl<const A: usize, const O: usize> Function<A, O> {
         pub fn new<ABI: Abi + Default + 'static>(ir: &mut IR) -> Function<A, O> {
@@ -67,6 +74,7 @@ pub mod NodeVariant {
                 outs: 0,
                 stack_slots: vec![],
                 highwater: 0,
+                cont: Continuation::Return,
             }
         }
 
@@ -544,7 +552,6 @@ impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O
 
     fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
         assert_eq!(self.args as usize, A);
-        assert_eq!(self.outs as usize, O);
         if self.highwater != 0 {
             // allocate stack space
             dynasm!(ops
@@ -559,9 +566,17 @@ impl<const A: usize, const O: usize> NodeBehavior for NodeVariant::Function<A, O
                 ; add rsp, (self.highwater*8).try_into().unwrap()
             );
         }
-        dynasm!(ops
-            ; ret
-        );
+        match self.cont {
+            Continuation::Return => {
+                assert_eq!(self.outs as usize, O);
+                dynasm!(ops
+                    ; ret
+                )
+            },
+            Continuation::Jmp(o) => {
+                // TODO: assert that the o port is connected to a Leave node
+            },
+        }
     }
 }
 

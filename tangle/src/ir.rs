@@ -25,6 +25,7 @@ use crate::region::{Region, RegionIdx, RegionEdge};
 use crate::abi::Abi;
 //use crate::opt::PassRunner;
 use crate::select::PatternManager;
+use crate::node::Continuation;
 
 // yaxpeax decoder example
 mod decoder {
@@ -122,7 +123,9 @@ impl IR {
             NodeIndex::new(r.nodes.node_count())
         });
         assert_eq!(f.args as usize, A);
-        assert_eq!(f.outs as usize, O);
+        if f.cont == Continuation::Return {
+            assert_eq!(f.outs as usize, O);
+        }
         self.add_function(f);
         self.body = Some(body); // once told me
     }
@@ -168,8 +171,6 @@ impl IR {
             println!("created virtual registers");
             r.annotate_port_times_and_hints(&mut virt_map);
             println!("annoated port times and hints");
-            r.optimize_vreg_live_ranges(&mut virt_map);
-            println!("optimized vreg live ranges");
             r.allocate_physical_for_virtual(&mut virt_map);
             println!("allocated physical registers for virtual register");
             //r.replace_virtual_with_backing(&mut virt_map);
