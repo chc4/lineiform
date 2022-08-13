@@ -436,7 +436,7 @@ impl PatternManager {
             emit(c, CodegenFn(box move |ops| dynasm!(ops ;mov Rq(r0.num()), QWORD imm as i64))) <--
                 edge(e, ?Some(c), _, _, r),
                 vreg(r, ?&r0),
-                constant(c, ?&imm) if r0.class() == register_class::Q;
+                constant(c, ?&imm) if { println!("constant with r0 class {:?}", r0.class()); r0.class() } == register_class::Q;
 
             // emit adds
             emit(add, CodegenFn(box move |ops| dynasm!(ops; add Rq(r_out.num()), Rq(r_in.num()) ))) <--
