@@ -552,7 +552,7 @@ impl Region {
                         // if the conflict is the same major time, we can order
                         // the entire instruction via minor time after the conflict
                         // imposing a partial order on v1 last use < v2 first producer
-                        if gap.start().major == range.start().major {
+                        if gap.start().pull() == *range.start() {
                             println!("pushing node start");
                             // TODO: LOL IS THIS CORRECT
                             let produce = &self.ports[*reg.ports.first().unwrap()];
