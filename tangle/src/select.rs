@@ -201,8 +201,8 @@ use ascent::lattice::constant_propagation::ConstPropagation;
 ascent! {
     struct AscentProgram<'a>;
     /// Stage 1
-    // Indicated that Edge from A->B is the Nth input of B, which uses Vreg for storage
-    relation edge(petgraph::stable_graph::EdgeIndex, Option<NodeIdx>, Option<NodeIdx>, usize, u16);
+    // Indicated that Edge from nodes A->B is the Nth input of B, which uses Vreg for storage
+    relation edge(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16);
     // Indicates the storage of a Vreg is restricted to RegSpec
     relation restricted(u16, RegSpec);
     // Indicated what kind of operation a node is
@@ -260,7 +260,7 @@ ascent! {
 }
 
 impl PatternManager {
-    fn edges_row(&self, region: &Region) -> Vec<(petgraph::stable_graph::EdgeIndex, Option<NodeIdx>, Option<NodeIdx>, usize, u16)> {
+    fn edges_row(&self, region: &Region) -> Vec<(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16)> {
         let Region { nodes, ports, sinks, .. } = region;
         let mut edges = Vec::with_capacity(nodes.edge_count());
         // hook up all the edges to node inputs. this includes from the region sources
@@ -420,7 +420,7 @@ impl PatternManager {
         let mut binder = ascent_run! {
             struct VarBinder;
              // Indicated that Edge from A->B is the Nth input of B, which uses Vreg for storage
-            relation edge(petgraph::stable_graph::EdgeIndex, Option<NodeIdx>, Option<NodeIdx>, usize, u16) =
+            relation edge(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16) =
                 edges;
             // The physical register used for each vreg
             relation vreg(u16, RegSpec) = vregs;

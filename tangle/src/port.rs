@@ -9,6 +9,24 @@ use core::ops::{Deref};
 use crate::node::{NodeIdx};
 use crate::time::Timestamp;
 
+#[derive(Hash, PartialOrd, Ord, PartialEq, Eq, Clone, Copy, Debug, Default)]
+pub struct PortIdxToken(u32);
+pub type PortIdx = NodeIndex<PortIdxToken>;
+unsafe impl petgraph::matrix_graph::IndexType for PortIdxToken {
+    #[inline(always)]
+    fn new(x: usize) -> Self {
+        PortIdxToken(x as u32)
+    }
+    #[inline(always)]
+    fn index(&self) -> usize {
+        self.0 as usize
+    }
+    #[inline(always)]
+    fn max() -> Self {
+        PortIdxToken(::std::u32::MAX)
+    }
+}
+
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub enum EdgeVariant {
     State,
@@ -138,7 +156,6 @@ impl Port {
     }
 }
 
-pub type PortIdx = NodeIndex;
 use std::sync::Mutex;
 lazy_static::lazy_static! {
     static ref PORT_COUNT: Mutex<u32> = Mutex::new(0);
@@ -148,6 +165,6 @@ lazy_static::lazy_static! {
 pub struct Edge {
     pub variant: EdgeVariant,
 }
-pub type PortEdge = EdgeIndex;
+pub type PortEdge = EdgeIndex<PortIdxToken>;
 
 

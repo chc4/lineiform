@@ -30,8 +30,8 @@ pub struct State {
     pub producers: Vec<PortIdx>,
 }
 
-pub type NodeGraph = StableGraph<Node, (), petgraph::Directed>;
-pub type PortGraph = StableGraph<Port, Edge, petgraph::Directed>;
+pub type NodeGraph = StableGraph<Node, (), petgraph::Directed, crate::node::NodeIdxToken>;
+pub type PortGraph = StableGraph<Port, Edge, petgraph::Directed, crate::port::PortIdxToken>;
 #[derive(Default)]
 pub struct Region {
     pub nodes: NodeGraph,
@@ -233,6 +233,7 @@ impl Region {
 
     pub fn remove_nops(&mut self, token: &mut NodeOwner) {
         let mut removed = HashSet::new();
+        // just do a dumb set based thing, idk
         self.nodes.retain_nodes(|node, idx| {
             let mut s = node[idx].as_variant::<NodeVariant::Simple>(token);
             s.map_or_else(|| true, |s| if let Operation::Nop = s.0 {

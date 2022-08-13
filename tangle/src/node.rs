@@ -2,7 +2,7 @@ use dynasmrt::x64::Assembler;
 use dynasmrt::{dynasm, DynasmApi};
 use yaxpeax_x86::long_mode::RegSpec;
 use yaxpeax_x86::long_mode::{register_class, Instruction};
-use petgraph::graph::NodeIndex;
+use petgraph::graph::{NodeIndex, EdgeIndex};
 
 use crate::time::Timestamp;
 use crate::ir::{IR};
@@ -11,7 +11,24 @@ use crate::region::{Region, RegionIdx, State, StateVariant};
 use crate::abi::{x86_64, Abi};
 
 use std::rc::Rc;
-pub type NodeIdx = NodeIndex;
+#[derive(Hash, PartialOrd, Ord, PartialEq, Eq, Clone, Copy, Debug, Default)]
+pub struct NodeIdxToken(u32);
+pub type NodeIdx = NodeIndex<NodeIdxToken>;
+pub type NodeEdge = EdgeIndex<NodeIdxToken>;
+unsafe impl petgraph::matrix_graph::IndexType for NodeIdxToken {
+    #[inline(always)]
+    fn new(x: usize) -> Self {
+        NodeIdxToken(x as u32)
+    }
+    #[inline(always)]
+    fn index(&self) -> usize {
+        self.0 as usize
+    }
+    #[inline(always)]
+    fn max() -> Self {
+        NodeIdxToken(::std::u32::MAX)
+    }
+}
 
 use qcell::{TCell, TCellOwner};
 use qcell::{QCell, QCellOwner};

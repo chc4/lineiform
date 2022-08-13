@@ -198,7 +198,7 @@ impl IR {
         let mut ret = None;
         let mut owner = self.owner.take().unwrap();
         self.in_region(self.master_region, |r, ir| {
-            let mut n = StableGraph::new();
+            let mut n = crate::region::NodeGraph::default();
             std::mem::swap(&mut r.nodes, &mut n);
             ret = Some(n[ir.body.unwrap()].codegen(&owner, vec![], vec![], r, ir, &mut ops));
             std::mem::swap(&mut r.nodes, &mut n);
