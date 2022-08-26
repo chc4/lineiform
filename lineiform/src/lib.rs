@@ -21,6 +21,7 @@ use core::marker::PhantomData;
 use std::sync::Arc;
 use std::rc::Rc;
 use core::num::Wrapping;
+use core::pin::Pin;
 
 
 pub mod lift;
@@ -46,19 +47,20 @@ extern "C" fn c_fn<A, O>(
 
 use core::ffi::c_void;
 #[derive(Copy, Clone)]
-struct FastFn<A, O> {
+struct FastFn<A, O, F> {
     f: extern "C" fn(usize, data: *const c_void, A)->O,
+    f_body: Pin<F>,
 }
 
-impl<A, O> FnOnce<A> for FastFn<A, O> {
+impl<A, O, F> FnOnce<A> for FastFn<A, O, F> {
     type Output=O;
     extern "rust-call" fn call_once(self, args: A) -> O {
         unimplemented!();
     }
 }
 
-impl<A, O> FnMut<A> for FastFn<A, O> where FastFn<A, O>: FnOnce<A> {
-    extern "rust-call" fn call_mut(&mut self, args: A) -> <FastFn<A,O> as FnOnce<A>>::Output {
+impl<A, O, F> FnMut<A> for FastFn<A, O, F> where FastFn<A, O,F>: FnOnce<A> {
+    extern "rust-call" fn call_mut(&mut self, args: A) -> <FastFn<A,O,F> as FnOnce<A>>::Output {
         unimplemented!();
     }
 }
@@ -70,8 +72,8 @@ pub extern "C" fn break_here(a: usize) -> usize {
     black_box(a)
 }
 
-impl<A: std::fmt::Debug,O> Fn<A> for FastFn<A, O> where
-    FastFn<A, O>: FnOnce<A, Output=O>,
+impl<A: std::fmt::Debug,O,F> Fn<A> for FastFn<A, O, F> where
+    FastFn<A, O, F>: FnOnce<A, Output=O>,
 {
     extern "rust-call" fn call(&self, args: A) -> <Self as FnOnce<A>>::Output {
         println!("got arguments: {:?}", args);
@@ -105,11 +107,15 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
         [(); usize::div_ceil(size_of::<(extern fn(data: *const c_void, A)->O, *const c_void, A)>(), size_of::<usize>())]: Sized,
         [(); usize::div_ceil(size_of::<O>() ,size_of::<usize>())]: Sized
     {
+        // we pin the closure in place, because we need to be able to inline the pointer
+        // value when jitting and thus it can never move
+        let f_pinned = Box::pin(f);
+        let f_size = std::mem::size_of_val(f_pinned.as_ref().get_ref());
         // We are given a [data, trait] fat pointer for f.
         // We want to feed c_fn into our lifter, calling F::call as arg 1, with
         // data as our argument 2.
         let call: for <'a> extern "rust-call" fn(&'a F, (A,))->O = <F as Fn<(A,)>>::call;
-        let f_body = &f as *const _ as *const u8;
+        let f_body = f_pinned.as_ref().get_ref() as *const _ as *const u8;
         let call: extern fn(data: *const c_void, A)->O =
             unsafe { std::mem::transmute(call) };
         // We now compile c_fn(call, f_body, a: A) to a function that can throw
@@ -122,22 +128,28 @@ impl<A: std::fmt::Debug, O> Lineiform<A, O> {
                 (Location::Reg(RegSpec::rsi()), JitValue::Ref(
                         Rc::new(JitValue::Frozen {
                             addr: f_body,
-                            size: std::mem::size_of_val(&f),
+                            size: f_size,
                         }), 0)
                 ),
             ]);
+        let func_size = func.size;
         let mut inlined = Jit::new(&mut self.tracer);
         //inlined.assume(vec![call as *const u8, f_body as *const u8]);
         let (inlined, _size) = inlined.lower::<_, O>(func).unwrap();
 
         if true {
+            let orig_func_dis = self.tracer.disassemble(c_fn::<A,O> as *const (), func_size as usize).unwrap();
+            println!("original function:");
+            self.tracer.format(&orig_func_dis).unwrap();
+            //println!("\npinned rdi={:x} rsi={:x}", call as usize, f_body as usize);
+            //black_box(f_body);
+
             let new_func_dis = self.tracer.disassemble(inlined as *const (), _size as usize).unwrap();
-            println!("recompiled function:");
+            println!("\nrecompiled function:");
             self.tracer.format(&new_func_dis).unwrap();
         }
 
         // TODO: cache this? idk what our key is
-        std::mem::forget(f); // don't run destructor for the closure
-        FastFn { f: unsafe { std::mem::transmute(inlined) } }
+        FastFn { f: unsafe { std::mem::transmute(inlined) }, f_body: f_pinned }
     }
 }

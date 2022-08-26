@@ -313,6 +313,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
 
         // populate pinned values
         for (place, pin) in f.pinned {
+            println!("pinning {}", place);
             let oper_place = match place {
                 Location::Reg(r) => Operand::Register(r),
                 _ => unimplemented!()
@@ -320,6 +321,11 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
             match pin {
                 JitValue::Const(c) => {
                     let c = self.constant(c.0 as isize);
+                    self.store(oper_place, c, None);
+                },
+                JitValue::Ref(r, o) if let JitValue::Frozen { addr, size} = *r => {
+                    // for now just set it to a constant for the pointer
+                    let c = self.constant(addr as isize + o as isize);
                     self.store(oper_place, c, None);
                 },
                 x => unimplemented!("pinned value {:?} = {:?}", oper_place, x)
@@ -355,7 +361,10 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                     // create input ports for all values that need to be alive for the
                     // jmp
                     use tangle::port::Storage;
-                    let reg_ports = snap.iter().map(|(bound, alive)| {
+                    let reg_ports = snap.iter()
+                        .filter(|(bound, _)| **bound != Location::Reg(RegSpec::rsp()))
+                        .map(|(bound, alive)| {
+                            println!("materializing {} <- {:?} for jmp", bound, alive);
                         match alive {
                             JitVariable::Variable(p) => {
                                 self.ir.in_region(self.f.region, |r, ir| {
@@ -368,12 +377,26 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                                             // state edge
                                             r.constrain(material, Storage::Immaterial(None)),
                                     }
-                                    (p, material)
+                                    (*p, material)
                                 })
                             },
-                            JitVariable::Known(c) => {
-                                panic!("constant pool")
+                            JitVariable::Known(JitValue::Const(c)) => {
+                                let c = self.constant(c.0 as isize);
+
+                                self.ir.in_region(self.f.region, |r, ir| {
+                                    let material = r.add_port();
+                                    match bound {
+                                        Location::Reg(bound_reg) =>
+                                            r.constrain(material, Storage::Physical(*bound_reg)),
+                                        Location::Stack(ss) =>
+                                            // stack slots just need to observe the
+                                            // state edge
+                                            r.constrain(material, Storage::Immaterial(None)),
+                                    }
+                                    (c, material)
+                                })
                             },
+                            x => unimplemented!("jmp materialize {:?}", x),
                         }
                     }).collect::<Vec<_>>();
 
@@ -383,7 +406,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                         tailcall.connect_input(0, p, ir);
                         for (i, (reg_port, input_port)) in reg_ports.iter().enumerate() {
                             tailcall.add_input(*input_port, ir);
-                            tailcall.connect_input(1+i, **reg_port, ir);
+                            tailcall.connect_input(1+i, *reg_port, ir);
                         }
                         tailcall.outputs[0]
                     });
@@ -671,7 +694,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
 
     fn constant(&mut self, c: isize) -> PortIdx {
         // TODO: constant pooling? idk
-        println!("adding constant node {}", c);
+        println!("adding constant node 0x{:x}", c);
         let mut c = tangle::node::Node::constant(c);
         self.f.add_body(c, &mut self.ir, |c, r| { c.outputs[0] }).1
     }

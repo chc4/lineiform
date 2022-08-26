@@ -219,10 +219,22 @@ ascent! {
 
     constant(n, 8, ConstPropagation::Constant(*imm)) <--
         constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i8>::try_into(*imm).is_ok();
+    constant(n, 16, ConstPropagation::Constant(*imm)) <--
+        constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i16>::try_into(*imm).is_ok();
+    constant(n, 32, ConstPropagation::Constant(*imm)) <--
+        constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i32>::try_into(*imm).is_ok();
+    constant(n, 64, ConstPropagation::Constant(*imm)) <--
+        constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i64>::try_into(*imm).is_ok();
 
     // Constant patterns
     pattern(n, Pattern::Constant8, Set::singleton(*n)) <--
         constant(n, 8, _);
+    pattern(n, Pattern::Constant16, Set::singleton(*n)) <--
+        constant(n, 16, _);
+    pattern(n, Pattern::Constant32, Set::singleton(*n)) <--
+        constant(n, 32, _);
+    pattern(n, Pattern::Constant64, Set::singleton(*n)) <--
+        constant(n, 64, _);
 
     // Inc patterns
     pattern(n, Pattern::Inc, Set::singleton(*n)) <--
