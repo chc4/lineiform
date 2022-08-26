@@ -371,11 +371,12 @@ mod test {
         let clos = jit.speedup(move |()| {
             let mut acc = Wrapping(0);
             for i in 0..black_box(a).0 {
+                println!("i {} acc {}", i, acc);
                 acc += acc + Wrapping(1);
             }
             acc
         });
-        assert_eq!(clos(()), Wrapping(55 as i32 as u32));
+        assert_eq!(clos(()), Wrapping(1023 as i32 as u32));
         Ok(())
     }
 
