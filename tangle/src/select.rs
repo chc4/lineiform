@@ -66,7 +66,7 @@ use frunk::traits::{ToRef, ToMut};
 use ascent::{ascent, ascent_run};
 
 use dynasmrt::x64::Assembler;
-use dynasmrt::{dynasm, DynasmApi};
+use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi};
 
 use std::collections::{HashMap, BTreeSet};
 use std::any::type_name;
@@ -150,6 +150,8 @@ pub enum Pattern {
     Constant32,
     Constant64,
     Constant16Jmp,
+    BrEntry,
+    BrCall,
     RegJmp,
     MoveRegReg,
     Inc,
@@ -269,6 +271,15 @@ ascent! {
     pattern(load, Pattern::LoadStackReg, Set::singleton(*load)) <--
         token(?t), kind(load, ?load_kind),
         if operation(t, load_kind, Operation::LoadStack);
+
+    // basic block patterns
+    // jmp constant
+    pattern(jmp, Pattern::BrEntry, Set::singleton(*jmp)) <--
+        token(?t), kind(jmp, ?jmp_kind),
+        if variant::<NodeVariant::BrEntry>(t, jmp_kind);
+    pattern(jmp, Pattern::BrCall, Set::singleton(*jmp)) <--
+        token(?t), kind(jmp, ?jmp_kind),
+        if variant::<NodeVariant::BrCall>(t, jmp_kind);
 }
 
 impl PatternManager {
@@ -345,7 +356,7 @@ impl PatternManager {
             .then(a.1.cmp(&b.1))
         );
         let mut roots = ascent.pattern.drain(..).flat_map(|(root, pat, include_set)| {
-            dbg!(root, pat);
+            //dbg!(root, pat);
             // for not we just get the first pattern that matches
 
             // If we already emitted the root, then it was a part of a pattern
@@ -429,6 +440,7 @@ impl PatternManager {
 
         let mut clock = Timestamp::new();
         self.roots.sort_by(|a, b| nodes[a.0].time.cmp(&nodes[b.0].time));
+        let mut blocks = HashMap::new();
         let mut binder = ascent_run! {
             struct VarBinder;
              // Indicated that Edge from A->B is the Nth input of B, which uses Vreg for storage
@@ -478,6 +490,25 @@ impl PatternManager {
                 edge(e, ?Some(c), ?Some(jmp), 0, r), pattern(jmp, Pattern::RegJmp, _),
                 vreg(r, ?&r0),
                 if r0.class() == register_class::Q;
+
+            // emit basic blocks
+            emit(bentry, { let bb = *state as usize;
+                let label = *blocks.entry(bb).or_insert_with(|| ops.new_dynamic_label() );
+                CodegenFn(box move |ops| {
+                    dynasm!(ops ; => label)
+                })})  <--
+                pattern(bentry, Pattern::BrEntry, _),
+                state(bentry, ?state),
+                if matches!(states[*state as usize].variant, StateVariant::Block);
+            // emit jumps to basic blocks
+            emit(bcall, { let bb = *state as usize;
+                let label = blocks[&bb];
+                CodegenFn(box move |ops| {
+                    dynasm!(ops ; jmp => label)
+                })})  <--
+            pattern(bcall, Pattern::BrCall, _),
+            state(bcall, ?state),
+            if matches!(states[*state as usize].variant, StateVariant::Block);
 
             // emit movs
             emit(mov, CodegenFn(box |ops| () )) <--

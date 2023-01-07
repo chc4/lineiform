@@ -439,6 +439,50 @@ mod test {
     }
 
     #[test]
+    pub fn function_bb_simple() {
+        let mut ir = IR::new();
+        let mut f = Node::function::<1, 1>(&mut ir);
+        let input = f.add_argument(&mut ir);
+        let output = f.add_return(&mut ir);
+
+        // entry input: br_call bb1, input;
+        // bb1 bp0: add bp0, 2; mov output, bp0;
+
+        let mut bb = Node::bb();
+        let (bb0, bp_0) = f.add_body(bb, &mut ir, |bb, mut r| {
+            // create basic block parameter
+            (bb.sinks()[0], bb.add_output(&mut r))
+        }).1;
+
+        let mut two = Node::constant(2);
+        let mut add = Node::simple(Operation::Add);
+        let mut two_const = None;
+        f.add_body(two, &mut ir, |two, r| {
+            two_const = Some(two.sinks()[0]);
+        });
+        f.add_body(add, &mut ir, |add, r| {
+            add.connect_input(0, bp_0, r);
+            add.connect_input(1, two_const.unwrap(), r);
+            add.connect_output(0, output, r);
+        });
+
+        let mut bcall = Node::bcall();
+        f.add_body(bcall, &mut ir, |bcall, mut r| {
+            // call bb0
+            bcall.connect_input(0, bb0, r);
+            // with arg0 = input
+            let arg = r.add_port();
+            r.connect_ports(input, arg);
+            bcall.add_input(arg, &mut r);
+        });
+
+        ir.set_body(f);
+        let hello_fn: extern "C" fn(usize) -> usize = ir.compile_fn().unwrap().0;
+        assert_eq!(hello_fn(0), 2);
+        assert_eq!(hello_fn(1), 3);
+    }
+
+    #[test]
     pub fn function_use_stack() {
         let mut ir = IR::new();
         let mut f = Node::function::<1, 1>(&mut ir);

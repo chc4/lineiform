@@ -57,5 +57,6 @@ impl Abi for x86_64 {
                     ].drain(..).take(*n).collect::<Vec<_>>(),
                 _ => unimplemented!()
             }
-        }).flatten().collect()    }
+        }).flatten().collect()
+    }
 }

@@ -21,6 +21,7 @@ pub type RegionIdx = NodeIndex;
 #[derive(Debug, Clone)]
 pub enum StateVariant {
     Stack(u32),
+    Block,
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +437,9 @@ impl Region {
     pub fn observe_state_outputs(&mut self) {
         // connect all state variables to the region return
         for state in self.states.clone() {
+            if matches!(state.variant, StateVariant::Block) {
+                continue;
+            }
             let new_sink = self.add_sink();
             self.ports[new_sink].set_variant(EdgeVariant::State);
             let producer = *state.producers.last().unwrap();
@@ -676,9 +680,23 @@ impl Region {
     pub fn create_dependencies(&mut self) {
         let indices: Vec<_> = self.ports.edge_references().collect();
         for e in indices {
-            if let (Some(source), Some(sink)) = (self.ports[e.source()].node, self.ports[e.target()].node) {
+            let source = &self.ports[e.source()];
+            let mut invert = false;
+            if let Some(Storage::Immaterial(Some(state))) = source.storage.0 {
+                if matches!(self.states[state as usize].variant, StateVariant::Block) {
+                    // we got a block state edge. we want the block to be emitted
+                    // *after* the call.
+                    invert = true;
+                }
+            }
+
+            if let (Some(source), Some(sink)) = (source.node, self.ports[e.target()].node) {
                 if source == sink { continue }
-                self.nodes.add_edge(sink, source, ());
+                if invert {
+                    self.nodes.add_edge(source, sink, ());
+                } else {
+                    self.nodes.add_edge(sink, source, ());
+                }
             }
         }
     }

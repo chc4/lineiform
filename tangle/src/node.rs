@@ -150,9 +150,10 @@ pub mod NodeVariant {
             port
         }
     }
-    pub struct Global(pub Region); // "Delta-Nodes"; global variables
-    pub struct Loop(pub Region); // "Theta-Nodes"; do-while loops. Only ever tail-controlled.
-    pub struct Partition(pub Vec<Region>); // "Gamma-Nodes"; if-then-else statements and case-switch
+    #[derive(Debug)]
+    pub struct BrEntry; // "Block Entry"; header of a basic block, source of bb params
+    #[derive(Debug)]
+    pub struct BrCall; // "Block Call"; jump to a block entry, with arguments
     /// Tailcalls or jumps into native code are represented as Leave nodes.
     /// These nodes should have:
     ///     1) an input port for the address to jump to
@@ -161,8 +162,6 @@ pub mod NodeVariant {
     ///     3) an output port state edge that should be connected to the function return
     #[derive(Debug)]
     pub struct Leave;
-    // The paper also has "Phi-Nodes" (mutually recursive functions) and
-    // "Omega-Nodes" (translation units). We only ever JIT one function at a time.
 }
 
 pub use NodeVariant::*;
@@ -308,6 +307,62 @@ impl NodeBehavior for NodeVariant::Constant {
 
     fn tag(&self) -> String {
         self.0.to_string()
+    }
+}
+
+impl NodeBehavior for NodeVariant::BrEntry {
+    fn input_count(&self) -> usize {
+        0
+    }
+
+    fn output_count(&self) -> usize {
+        // Start with one port output, which is the block itself for use in br_call
+        1
+    }
+
+    fn ports_callback(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region) {
+        // set the block port as a state edge, of the block itself
+        let port = outputs[0];
+        let new_state = r.states.len();
+        r.states.push(State {
+            name: format!("bb{}", new_state),
+            variant: StateVariant::Block,
+            producers: vec![],
+        });
+
+        r.constrain(port, Storage::Immaterial(Some(new_state.try_into().unwrap())));
+        r.ports[port].set_variant(EdgeVariant::State);
+    }
+
+    fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        // block entries don't codegen to anything
+    }
+
+    fn tag(&self) -> String {
+        "br_entry".to_string()
+    }
+}
+
+impl NodeBehavior for NodeVariant::BrCall {
+    fn input_count(&self) -> usize {
+        // takes as its first input the block to jump to
+        1
+    }
+
+    fn output_count(&self) -> usize {
+        0
+    }
+
+    fn ports_callback(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region) {
+        r.ports[inputs[0]].set_variant(EdgeVariant::State);
+    }
+
+    fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        panic!()
+    }
+
+    fn tag(&self) -> String {
+        "br_call".to_string()
     }
 }
 
@@ -532,6 +587,7 @@ impl NodeBehavior for NodeVariant::Move {
             (Storage::Physical(r0), Storage::Immaterial(Some(state))) => {
                 let off = match r.states[*state as usize].variant {
                     StateVariant::Stack(o) => (o * 8).try_into().unwrap(),
+                    _ => panic!(),
                 };
                 match r0.class() {
                     register_class::Q => dynasm!(ops
@@ -543,6 +599,7 @@ impl NodeBehavior for NodeVariant::Move {
             (Storage::Immaterial(Some(state)), Storage::Physical(r1)) => {
                 let off = match r.states[*state as usize].variant {
                     StateVariant::Stack(o) => (o * 8).try_into().unwrap(),
+                    _ => panic!(),
                 };
                 match r1.class() {
                     register_class::Q => dynasm!(ops
@@ -649,6 +706,14 @@ impl Node {
 
     pub fn leave() -> NodeVariant::Leave {
         NodeVariant::Leave
+    }
+
+    pub fn bb() -> NodeVariant::BrEntry {
+        NodeVariant::BrEntry
+    }
+
+    pub fn bcall() -> NodeVariant::BrCall {
+        NodeVariant::BrCall
     }
 }
 
