@@ -150,6 +150,7 @@ pub enum Pattern {
     Constant32,
     Constant64,
     Constant16Jmp,
+    BrFuse,
     BrEntry,
     BrCall,
     RegJmp,
@@ -205,6 +206,8 @@ ascent! {
     /// Stage 1
     // Indicated that Edge from nodes A->B is the Nth input of B, which uses Vreg for storage
     relation edge(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16);
+    // Indicates there is a state edge from nodes A->B with stateid
+    relation state(crate::port::PortEdge, NodeIdx, NodeIdx, u16);
     // Indicates the storage of a Vreg is restricted to RegSpec
     relation restricted(u16, RegSpec);
     // Indicated what kind of operation a node is
@@ -280,25 +283,46 @@ ascent! {
     pattern(jmp, Pattern::BrCall, Set::singleton(*jmp)) <--
         token(?t), kind(jmp, ?jmp_kind),
         if variant::<NodeVariant::BrCall>(t, jmp_kind);
+
+    // fused brcall+entry with no other brcalls
+    pattern(call, Pattern::BrFuse, Set::singleton(*call).join(Set::singleton(*entry))) <--
+        token(?t), kind(call, ?call_kind), kind(entry, ?entry_kind),
+        // this is backwards due to Region::create_dependencies creating inverse dependencies
+        state(e, entry, call, block),
+        agg incoming = ascent::aggregators::count() in state(_, entry, _, block),
+        if variant::<NodeVariant::BrCall>(t, call_kind) && variant::<NodeVariant::BrEntry>(t, entry_kind) && incoming == 1;
 }
 
 impl PatternManager {
-    fn edges_row(&self, region: &Region) -> Vec<(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16)> {
+    fn edges_row(&self, region: &Region) -> (
+        Vec<(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16)>,
+        Vec<(crate::port::PortEdge, NodeIdx, NodeIdx, u16)>
+    ) {
         let Region { nodes, ports, sinks, .. } = region;
         let mut edges = Vec::with_capacity(nodes.edge_count());
+        let mut states = Vec::new();
         // hook up all the edges to node inputs. this includes from the region sources
         for local in nodes.node_indices() {
             for (i, p) in nodes[local].inputs.iter().enumerate() {
-                let vreg: u16 = match ports[*p].storage{
-                    OptionalStorage(Some(Storage::Immaterial(state))) => continue,
-                    OptionalStorage(Some(Storage::Virtual(vreg))) => vreg,
+                let vreg: Result<u16, u16> = match ports[*p].storage{
+                    OptionalStorage(Some(Storage::Immaterial(Some(state)))) => Err(state),
+                    OptionalStorage(Some(Storage::Virtual(vreg))) => Ok(vreg),
                     _ => panic!(),
                 };
                 for e in ports.edges_directed(*p, Direction::Outgoing) {
                     let neighbor_port = &ports[e.target()];
-                    let new_edge = (e.id(), neighbor_port.node, Some(local), i, vreg);
-                    println!("new edge {:?}", new_edge);
-                    edges.push(new_edge);
+                    match vreg {
+                        Ok(vreg) => {
+                            let new_edge = (e.id(), neighbor_port.node, Some(local), i, vreg);
+                            println!("new edge {:?}", new_edge);
+                            edges.push(new_edge);
+                        },
+                        Err(state) => { neighbor_port.node.map(|node| {
+                                let new_state = (e.id(), node, local, state);
+                                println!("new state {:?}", new_state);
+                                states.push(new_state);
+                        }); },
+                    }
                 }
             }
         }
@@ -316,11 +340,11 @@ impl PatternManager {
                 edges.push(new_edge);
              }
         }
-        edges
+        (edges, states)
     }
 
     pub fn run(&mut self, token: &NodeOwner, region: &mut Region, virt_map: &mut VirtualRegisterMap) {
-        let mut edges = self.edges_row(region);
+        let (mut edges, states) = self.edges_row(region);
         let Region { nodes, ports, sinks, .. } = region;
 
 
@@ -341,6 +365,7 @@ impl PatternManager {
         ascent.token = vec![(RefEquality(token),)];
         ascent.kind = visit_nodes;
         ascent.edge = edges;
+        ascent.state = states;
         ascent.restricted = virt_map.iter().flat_map(|(i,v)| v.backing.map(|back| (*i as u16,back))).collect::<Vec<_>>();
         ascent.constant = constants;
         ascent.outgoing = outgoing;
@@ -418,7 +443,7 @@ impl PatternManager {
     }
 
     pub fn codegen<'a>(&mut self, token: &NodeOwner, region: &mut Region, ops: &mut Assembler) {
-        let mut edges = self.edges_row(region);
+        let (mut edges, states) = self.edges_row(region);
         let Region { nodes, ports, sinks, states, .. } = region;
 
         let constants = nodes.node_indices().flat_map(|n| {
@@ -509,6 +534,9 @@ impl PatternManager {
             pattern(bcall, Pattern::BrCall, _),
             state(bcall, ?state),
             if matches!(states[*state as usize].variant, StateVariant::Block);
+            // emit fused brcall+entry
+            emit(bfused, CodegenFn(box |ops| () )) <--
+                pattern(bfused, Pattern::BrFuse, _);
 
             // emit movs
             emit(mov, CodegenFn(box |ops| () )) <--
