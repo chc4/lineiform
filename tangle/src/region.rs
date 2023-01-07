@@ -21,7 +21,7 @@ pub type RegionIdx = NodeIndex;
 #[derive(Debug, Clone)]
 pub enum StateVariant {
     Stack(u32),
-    Block,
+    Block(NodeIdx),
 }
 
 #[derive(Debug, Clone)]
@@ -249,9 +249,8 @@ impl Region {
     }
 
     /// Create and populate virtual registers for all ports
-    pub fn create_virtual_registers(&mut self, token: &mut NodeOwner) -> VirtualRegisterMap {
-        let mut reg = 0;
-        let mut virts: VirtualRegisterMap = HashMap::new();
+    pub fn create_virtual_registers(&mut self, virts: &mut VirtualRegisterMap, token: &mut NodeOwner) {
+        let mut reg = virts.len().try_into().unwrap();
         let mut ports = self.ports.clone();
         // Give all ports that have no incoming edges and no storage a new virtual register
         ports.clone().externals(Direction::Incoming).filter(|e| {
@@ -404,8 +403,6 @@ impl Region {
             // and add them to their virtual registers' port list
             virts.get_mut(&vreg.into()).unwrap().ports.push(p);
         }
-
-        virts
     }
 
     pub fn propogate_state_edges(&mut self) {
@@ -436,8 +433,11 @@ impl Region {
 
     pub fn observe_state_outputs(&mut self) {
         // connect all state variables to the region return
-        for state in self.states.clone() {
-            if matches!(state.variant, StateVariant::Block) {
+        for mut state in self.states.clone() {
+            if matches!(state.variant, StateVariant::Block(_)) {
+                let producer = *state.producers.first().unwrap();
+                // name the block state variant after the block's node id
+                state.variant = StateVariant::Block(self.ports[producer].node.unwrap());
                 continue;
             }
             let new_sink = self.add_sink();
@@ -667,6 +667,39 @@ impl Region {
         }
     }
 
+    pub fn connect_block_params(&mut self, virts: &mut VirtualRegisterMap, token: &NodeOwner) {
+        // we loop over all br_calls for a block, adding movs for all the parameters
+        let mut vreg = 0;
+        for state in &self.states {
+            if let StateVariant::Block(bb) = state.variant {
+                let first_vreg = vreg;
+                for producer in &state.producers {
+                    let producer_port = &self.ports[*producer];
+                    let Some(producer) = producer_port.node else { continue };
+                    if producer == bb { continue };
+                    let producer = &self.nodes[producer];
+                    let Some(call) = producer.as_variant::<NodeVariant::BrCall>(token) else { continue };
+                    // we have a br_call, move all the arguments for all the arguments
+                    for (i, argument) in producer.sources()[1..].iter().enumerate() {
+                        let use_reg = first_vreg+i;
+                        virts.entry(use_reg).or_insert_with(|| VirtualRegister { ports: vec![], hints: HashSet::new(), backing: None, allocated: false });
+                        self.ports[*argument].set_storage(Storage::Virtual(use_reg as u16));
+
+                        // create new virtual register for the block param
+                        //virts.insert(reg.into(), );
+                    }
+                }
+                for (i, param) in self.nodes[bb].sinks()[1..].iter().enumerate() {
+                    let use_reg = first_vreg+i;
+                    virts.get(&use_reg).expect("bb_entry has a parameter, but no arguments");
+                    vreg = max(vreg, use_reg);
+                    // and set the br_entry parameter to the same storage
+                    self.ports[*param].set_storage(Storage::Virtual(use_reg as u16));
+                }
+            }
+        }
+    }
+
     // Set the node that each port is attached to
     pub fn attach_ports(&mut self) {
         for n in self.nodes.node_indices() {
@@ -683,7 +716,7 @@ impl Region {
             let source = &self.ports[e.source()];
             let mut invert = false;
             if let Some(Storage::Immaterial(Some(state))) = source.storage.0 {
-                if matches!(self.states[state as usize].variant, StateVariant::Block) {
+                if matches!(self.states[state as usize].variant, StateVariant::Block(_)) {
                     // we got a block state edge. we want the block to be emitted
                     // *after* the call.
                     invert = true;

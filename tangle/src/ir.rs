@@ -154,12 +154,14 @@ impl IR {
             r.attach_ports();
             r.propogate_state_edges();
             r.observe_state_outputs();
+            let mut virt_map: VirtualRegisterMap = HashMap::new();
+            r.connect_block_params(&mut virt_map, self.owner.as_ref().unwrap());
             println!("propogated state edges");
 
             //r.move_constants_to_operands();
             r.remove_nops(self.owner.as_mut().unwrap());
             // Create virtual register storages for all nodes and ports
-            let mut virt_map = r.create_virtual_registers(self.owner.as_mut().unwrap());
+            r.create_virtual_registers(&mut virt_map, self.owner.as_mut().unwrap());
             r.create_dependencies(); // we have to re-add node dependencies for the inserted movs
 
             let mut patterner = PatternManager::default();

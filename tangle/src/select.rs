@@ -524,7 +524,7 @@ impl PatternManager {
                 })})  <--
                 pattern(bentry, Pattern::BrEntry, _),
                 state(bentry, ?state),
-                if matches!(states[*state as usize].variant, StateVariant::Block);
+                if matches!(states[*state as usize].variant, StateVariant::Block(_));
             // emit jumps to basic blocks
             emit(bcall, { let bb = *state as usize;
                 let label = blocks[&bb];
@@ -533,7 +533,7 @@ impl PatternManager {
                 })})  <--
             pattern(bcall, Pattern::BrCall, _),
             state(bcall, ?state),
-            if matches!(states[*state as usize].variant, StateVariant::Block);
+            if matches!(states[*state as usize].variant, StateVariant::Block(_));
             // emit fused brcall+entry
             emit(bfused, CodegenFn(box |ops| () )) <--
                 pattern(bfused, Pattern::BrFuse, _);
