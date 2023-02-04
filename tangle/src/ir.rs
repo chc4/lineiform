@@ -550,34 +550,48 @@ mod test {
         let output = f.add_return(&mut ir);
 
         // entry[input]: zero = 0; br_if zero, bb0, bb1, input;
-        // bb0[bp0]: add bp0, 1; mov output, bp0;
-        // bb1[bp0]: add bp0, 2; mov output, bp0;
+        // bb0[bp0]: add bp0, 1; call term, bp0;
+        // bb1[bp0]: add bp0, 2; call term, bp0;
+        // term[output]: ret output;
+        let term = f.add_body(Node::bb(), &mut ir, |bb, mut r| {
+            let arg = bb.add_output(r);
+            r.connect_ports(arg, output);
+            bb.sinks()[0]
+        }).1;
 
-        let mut bb = Node::bb();
-        let (bb0, bp_0) = f.add_body(bb, &mut ir, |bb, mut r| {
+        let (bb0, bp_0) = f.add_body(Node::bb(), &mut ir, |bb, mut r| {
             // create basic block parameter
             (bb.sinks()[0], bb.add_output(&mut r))
         }).1;
-        let mut bb = Node::bb();
-        let (bb1, bp_1) = f.add_body(bb, &mut ir, |bb, mut r| {
+        let (bb1, bp_1) = f.add_body(Node::bb(), &mut ir, |bb, mut r| {
             // create basic block parameter
             (bb.sinks()[0], bb.add_output(&mut r))
         }).1;
 
         let mut one = f.add_body(Node::constant(1), &mut ir, |n, r| { n.sinks()[0] }).1;
-        let mut add = Node::simple(Operation::Add);
-        f.add_body(add, &mut ir, |add, r| {
+        let add_0 = f.add_body(Node::simple(Operation::Add), &mut ir, |add, r| {
             add.connect_input(0, bp_0, r);
             add.connect_input(1, one, r);
-            add.connect_output(0, output, r);
+            add.sinks()[0]
+        }).1;
+        f.add_body(Node::bcall(), &mut ir, |call, r| {
+            call.connect_input(0, term, r);
+            let param = r.add_port();
+            r.connect_ports(add_0, param);
+            call.add_input(param, r);
         });
 
         let mut two = f.add_body(Node::constant(2), &mut ir, |n, r| { n.sinks()[0] }).1;
-        let mut add = Node::simple(Operation::Add);
-        f.add_body(add, &mut ir, |add, r| {
+        let add_1 = f.add_body(Node::simple(Operation::Add), &mut ir, |add, r| {
             add.connect_input(0, bp_1, r);
             add.connect_input(1, two, r);
-            add.connect_output(0, output, r);
+            add.sinks()[0]
+        }).1;
+        f.add_body(Node::bcall(), &mut ir, |call, r| {
+            call.connect_input(0, term, r);
+            let param = r.add_port();
+            r.connect_ports(add_1, param);
+            call.add_input(param, r);
         });
 
         let mut one = f.add_body(Node::constant(1), &mut ir, |n, r| { n.sinks()[0] }).1;
@@ -599,8 +613,6 @@ mod test {
         assert_eq!(hello_fn(0), 2);
         assert_eq!(hello_fn(1), 3);
     }
-
-
 
     #[test]
     pub fn function_use_stack() {

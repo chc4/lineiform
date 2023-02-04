@@ -141,31 +141,32 @@ impl<'a, 'b, T: ?Sized> PartialEq<RefEquality<&'b T>> for RefEquality<&'a T> {
 impl<T: ?Sized> Eq for RefEquality<Rc<T>> where RefEquality<Rc<T>>: PartialEq { }
 impl<'a, T: ?Sized> Eq for RefEquality<&'a T> where RefEquality<&'a T>: PartialEq { }
 
-
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct VReg(u16);
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(usize)]
 pub enum Pattern {
-    Constant8 = 0usize,
-    Constant16,
-    Constant32,
-    Constant64,
+    Constant8(VReg) = 0usize,
+    Constant16(VReg),
+    Constant32(VReg),
+    Constant64(VReg),
     Constant16Jmp,
     BrFuse,
-    BrEntry,
+    BrEntry(u16),
     BrCall(u16 /* state */),
 
     BrIf,
 
-    RegJmp,
-    MoveRegReg,
-    Inc,
-    AddRegConstant8,
+    RegJmp(VReg),
+    MoveRegReg(VReg, VReg),
+    Inc(VReg),
+    AddRegConstant8(VReg, i8),
     AddRegConstant16,
     AddRegConstant32,
-    AddRegReg,
-    StoreStackReg,
-    LoadStackReg,
+    AddRegReg(VReg, VReg),
+    StoreStackReg(u16, VReg),
+    LoadStackReg(u16, VReg),
 }
 
 use ascent::Lattice;
@@ -196,7 +197,6 @@ fn operation(token: &RefEquality<&NodeOwner>, n: &RefEquality<Rc<NodeCell>>, op:
 }
 
 
-
 #[derive(Default)]
 pub struct PatternManager {
     roots: Vec<(NodeIdx, Pattern, Set<NodeIdx>)>,
@@ -204,16 +204,81 @@ pub struct PatternManager {
     pub virt_map: VirtualRegisterMap,
 }
 
+
+// block layout:
+// recursively put all their children in entry, until you hit all the block call edges
+// pick a random target block, recursively put all reachable nodes from its parameters in the block
+// until you hit block call edges.
+// now you have all nodes in blocks, and a cfg of edges between blocks.
+// do reverse postorder traversal of the cfg to pick an order of blocks, if you find
+// backwards edges to blocks you already visited then you ignore them.
+// should probably sink any nodes in entry that don't depend on the function arguments to the
+// least common ancestor of all its uses...?
+// visit blocks in reverse order, compute timings for all the nodes in it
+// then do you just allocate registers for all the vregs using the timing as live ranges...?
+// like visit the last block, give it register allocations every time you visit a node
+// with a vreg that hasn't already been visited, then put all the blocks with edges to it
+// in a list and loop popping from the list, the register map after the end of the block is the
+// same reg map, union the hit for the vregs of the br_call arguments with the block parameters,
+// then just allocate in the block again.
+//
+// does this give too long of live ranges? i think you'd want to be able to give two blocks
+// that are in parallel and not sequential the same timings instead of sequential ones, so that
+// like both sides of an if can use the same live range for registers for spilling. care about that
+// once i actually need to optimize shit ig?
+// ENTRY
+// |  \
+// |  A
+// |  |
+// |  B
+// |  /
+// TERM
+// i think you want to like "stratify" a cfg into levels and then give all the blocks in a level
+// the same timings
+// wait this is just max(predecessors) again i think. woops.
+//
+// entry: one = 1; bb0: add a, one; bb1: add b, one;
+// one would be placed in entry correctly
+//
+// i probably want to get rid of the function-level sources and sinks and just have an entry and
+// exit block for functions pre-generated, and then the function arity is
+// entry[params]->exit[returns] and just validate that exit is empty.
+//
+// how does constant folding blocks away work? does it just need a way of marking edges in patterns
+// as not actually external, so that BrIf -> BrCall(bb0), not_used(bb1) sees bb1 isn't used and
+// doesn't count it as needed when doing node timings? this is also needed for all other constant
+// folding i think, which might be tedious and easy to mess up.
+// the paper this is based off of has the patterns always list their inputs, which is the opposite,
+// just the lattice update of (BrIf, [bb0, bb1]) -> (BrCall(bb0), [bb0]) would implicitly drop the bb1 edge and
+// cause it to be eliminated instead.
+// would need the outgoing(node, count) row to be updated whenever we do a pattern rewrite though
+// because nodes would be subsumed by patterns, removing observers - a BrIf->BrCall dropping an
+// observation of a block may make it go from 2->1, and now the only observer can fold into a
+// BrFuse and elide a jump
+//
+// if you have entry[A]: C = foo(A); bb0[B]: bar(B, C); [bar,B,C] might be assigned a pattern
+// that covers it. i think this isn't a valid constructions, because you should only be able to
+// depend on values that have transitively dependencies of your own block parameters, but we'd at
+// least want to make a validation pass for it because it sounds easy to accidentally mess up and
+// emit.
+//
+// i think actually *none* of the emit rules should have edge rules, and probably shouldn't even
+// have access to the row at all, with all the parameters needed for the emit rules being provided
+// as Pattern arguments. otherwise you can't do simplication rewrites of nodes like the
+// BrIf->BrCall because they'll be checking hardcoded ports that won't be correct. MovRegReg should
+// actually be MovRegReg(vreg, vreg), so that like a Mov+Mov->Mov rewrite that subsumes the second
+// one can actually provide the emission with the correct vregs.
+
 use ascent::lattice::constant_propagation::ConstPropagation;
 ascent! {
     struct AscentProgram<'a>;
     /// Stage 1
     // Indicated that Edge from nodes A->B is the Nth input of B, which uses Vreg for storage
-    relation edge(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16);
+    relation edge(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, VReg);
     // Indicates there is a state edge from nodes A->B with stateid
     relation state(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, Option<usize>, Option<usize>, u16);
     // Indicates the storage of a Vreg is restricted to RegSpec
-    relation restricted(u16, RegSpec);
+    relation restricted(VReg, RegSpec);
     // Indicated what kind of operation a node is
     relation kind(NodeIdx, NodeRow);
     // Capture the NodeCell token for query use
@@ -222,67 +287,84 @@ ascent! {
     relation outgoing(NodeIdx, u8);
     // Output the annotations that a node was given
     lattice pattern(NodeIdx, Pattern, Set<NodeIdx>);
-    // Constant propogation; a node is a constant if it can be encoded as an N bit
-    // width immediate.
+
+    // If we can emit a wider constant as a u8, do
+    pattern(n, Pattern::Constant8(*vreg), const_cover) <--
+        pattern(n, ?Pattern::Constant64(vreg), const_cover),
+        constant(n, value, ?ConstPropagation::Constant(imm)),
+        if TryInto::<i8>::try_into(*imm).is_ok();
+    //// Constant propogation; a node is a constant if it can be encoded as an N bit
+    //// width immediate.
     lattice constant(NodeIdx, u8, ConstPropagation<i64>);
 
-    constant(n, 8, ConstPropagation::Constant(*imm)) <--
-        constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i8>::try_into(*imm).is_ok();
-    constant(n, 16, ConstPropagation::Constant(*imm)) <--
-        constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i16>::try_into(*imm).is_ok();
-    constant(n, 32, ConstPropagation::Constant(*imm)) <--
-        constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i32>::try_into(*imm).is_ok();
-    constant(n, 64, ConstPropagation::Constant(*imm)) <--
-        constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i64>::try_into(*imm).is_ok();
+    //constant(n, 8, ConstPropagation::Constant(*imm)) <--
+    //    constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i8>::try_into(*imm).is_ok();
+    //constant(n, 16, ConstPropagation::Constant(*imm)) <--
+    //    constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i16>::try_into(*imm).is_ok();
+    //constant(n, 32, ConstPropagation::Constant(*imm)) <--
+    //    constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i32>::try_into(*imm).is_ok();
+    //constant(n, 64, ConstPropagation::Constant(*imm)) <--
+    //    constant(n, _, ?ConstPropagation::Constant(imm)), if TryInto::<i64>::try_into(*imm).is_ok();
 
-    // Constant patterns
-    pattern(n, Pattern::Constant8, Set::singleton(*n)) <--
-        constant(n, 8, _);
-    pattern(n, Pattern::Constant16, Set::singleton(*n)) <--
-        constant(n, 16, _);
-    pattern(n, Pattern::Constant32, Set::singleton(*n)) <--
-        constant(n, 32, _);
-    pattern(n, Pattern::Constant64, Set::singleton(*n)) <--
-        constant(n, 64, _);
+    //// Constant patterns
+    //pattern(n, Pattern::Constant8, Set::singleton(*n)) <--
+    //    constant(n, 8, _);
+    //pattern(n, Pattern::Constant16, Set::singleton(*n)) <--
+    //    constant(n, 16, _);
+    //pattern(n, Pattern::Constant32, Set::singleton(*n)) <--
+    //    constant(n, 32, _);
+    //pattern(n, Pattern::Constant64, Set::singleton(*n)) <--
+    //    constant(n, 64, _);
 
     // Inc patterns
-    pattern(n, Pattern::Inc, Set::singleton(*n)) <--
+    pattern(n, Pattern::Inc(*r0), Set::singleton(*n)) <--
+        edge(_, _, ?Some(n), 0, r0),
         token(?t), kind(n, ?c), if operation(t, c, Operation::Inc);
 
     // Add patterns
-    pattern(n, Pattern::AddRegReg, Set::singleton(*n)) <--
+    pattern(n, Pattern::AddRegReg(*left, *right), Set::singleton(*n)) <--
+        edge(_, _, ?Some(n), 0, left),
+        edge(_, _, Some(*n), 1, right),
         token(?t), kind(n, ?c), if operation(t, c, Operation::Add);
 
-    pattern(add, Pattern::AddRegConstant8, Set::singleton(*add).join(Set::singleton(*c))) <--
-        token(?t), kind(add, ?add_kind),
-        edge(e, ?Some(c), Some(*add), 1, _), constant(c, 8, _), outgoing(c, 1),
-        if operation(t, add_kind, Operation::Add);
+    //pattern(add, Pattern::AddRegConstant8(*left, *c_val as i8), add_cover.clone().join(Set::singleton(*c))) <--
+    //    token(?t), kind(add, ?add_kind),
+    //    pattern(add, ?Pattern::AddRegReg(left, right), add_cover),
+    //    edge(e, ?Some(c), Some(*add), 1, _), constant(c, 8, ?ConstPropagation::Constant(c_val)), outgoing(c, 1);
 
     // Mov patterns
     // mov reg, _
-    pattern(n, Pattern::MoveRegReg, Set::singleton(*n)) <--
+    pattern(n, Pattern::MoveRegReg(*r1, *r0,), Set::singleton(*n)) <--
+        edge(_, _, ?Some(n), 0, r0),
+        edge(_, Some(*n), _, _, r1),
         token(?t), kind(n, ?c),
         if variant::<NodeVariant::Move>(t, c);
 
     // Leave patterns
     // jmp constant
-    pattern(jmp, Pattern::RegJmp, Set::singleton(*jmp)) <--
+    pattern(jmp, Pattern::RegJmp(*r0), Set::singleton(*jmp)) <--
+        edge(_, _, ?Some(jmp), 0, r0),
         token(?t), kind(jmp, ?jmp_kind),
         if variant::<NodeVariant::Leave>(t, jmp_kind);
 
     // Store_ss pattern
-    pattern(store, Pattern::StoreStackReg, Set::singleton(*store)) <--
+    pattern(store, Pattern::StoreStackReg(*state, *r0), Set::singleton(*store)) <--
+        state(_, _, ?Some(store), _, Some(0), state),
+        edge(_, _, ?Some(n), 1, r0),
         token(?t), kind(store, ?store_kind),
         if operation(t, store_kind, Operation::StoreStack);
 
-    pattern(load, Pattern::LoadStackReg, Set::singleton(*load)) <--
+    pattern(load, Pattern::LoadStackReg(*state, *r0), Set::singleton(*load)) <--
+        state(_, _, ?Some(store), _, Some(0), state),
+        edge(_, ?Some(n), _, 0, r0),
         token(?t), kind(load, ?load_kind),
         if operation(t, load_kind, Operation::LoadStack);
 
     // basic block patterns
     // jmp constant
     // br_if with constant selector
-    pattern(jmp, Pattern::BrEntry, Set::singleton(*jmp)) <--
+    pattern(jmp, Pattern::BrEntry(*bb), Set::singleton(*jmp)) <--
+        state(_, ?Some(jmp), _, Some(0), _, bb),
         token(?t), kind(jmp, ?jmp_kind),
         if variant::<NodeVariant::BrEntry>(t, jmp_kind);
     pattern(jmp, Pattern::BrCall(*block), Set::singleton(*jmp)) <--
@@ -321,28 +403,27 @@ ascent! {
         pattern(c, const_pattern, c_cover),
         edge(e, Some(*c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(0)),
         state(_, _, Some(*bif), _, Some(1), bb0),
-        if variant::<NodeVariant::BrIf>(t, bif_kind)
-        && matches!(const_pattern,
-                    Pattern::Constant8 |
-                    Pattern::Constant16 |
-                    Pattern::Constant32 |
-                    Pattern::Constant64);
+        if variant::<NodeVariant::BrIf>(t, bif_kind),
+        if let (Pattern::Constant8(vreg)
+            |Pattern::Constant16(vreg)
+            |Pattern::Constant32(vreg)
+            |Pattern::Constant64(vreg)) = const_pattern;
+
     pattern(bif, Pattern::BrCall(*bb1), Set::singleton(*bif).join(c_cover.clone())) <--
         token(?t), kind(bif, ?bif_kind),
         pattern(c, const_pattern, c_cover),
         edge(e, Some(*c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1)),
         state(_, _, Some(*bif), _, Some(2), bb1),
-        if variant::<NodeVariant::BrIf>(t, bif_kind)
-        && matches!(const_pattern,
-                    Pattern::Constant8 |
-                    Pattern::Constant16 |
-                    Pattern::Constant32 |
-                    Pattern::Constant64);
+        if variant::<NodeVariant::BrIf>(t, bif_kind),
+        if let (Pattern::Constant8(vreg)
+            |Pattern::Constant16(vreg)
+            |Pattern::Constant32(vreg)
+            |Pattern::Constant64(vreg)) = const_pattern;
 
     // fused brcall+entry with no other brcalls
     pattern(call, Pattern::BrFuse, call_cover.clone().join(entry_cover.clone())) <--
         pattern(call, ?Pattern::BrCall(block), call_cover),
-        pattern(entry, Pattern::BrEntry, entry_cover),
+        pattern(entry, Pattern::BrEntry(*block), entry_cover),
         // this is backwards due to Region::create_dependencies creating inverse dependencies
         // this can't mention the port that the call uses, because it could be from a constant
         // br_if
@@ -353,7 +434,7 @@ ascent! {
 
 impl PatternManager {
     fn edges_row(&self, region: &Region) -> (
-        Vec<(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16)>,
+        Vec<(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, VReg)>,
         Vec<(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, Option<usize>, Option<usize>, u16)>
     ) {
         let Region { nodes, ports, sinks, .. } = region;
@@ -362,9 +443,9 @@ impl PatternManager {
         // hook up all the edges to node inputs. this includes from the region sources
         for local in nodes.node_indices() {
             for (i, p) in nodes[local].inputs.iter().enumerate() {
-                let vreg: Result<u16, u16> = match ports[*p].storage{
+                let vreg: Result<VReg, u16> = match ports[*p].storage{
                     OptionalStorage(Some(Storage::Immaterial(Some(state)))) => Err(state),
-                    OptionalStorage(Some(Storage::Virtual(vreg))) => Ok(vreg),
+                    OptionalStorage(Some(Storage::Virtual(vreg))) => Ok(VReg(vreg)),
                     _ => panic!(),
                 };
                 for e in ports.edges_directed(*p, Direction::Outgoing) {
@@ -390,9 +471,9 @@ impl PatternManager {
         }
         // we also hook up edges to the region sinks
         for (i, output) in sinks.iter().enumerate() {
-            let vreg: u16 = match ports[*output].storage{
+            let vreg: VReg = match ports[*output].storage{
                 OptionalStorage(Some(Storage::Immaterial(state))) => continue,
-                OptionalStorage(Some(Storage::Virtual(vreg))) => vreg,
+                OptionalStorage(Some(Storage::Virtual(vreg))) => VReg(vreg),
                 _ => panic!(),
             };
             for e in ports.edges_directed(*output, Direction::Outgoing) {
@@ -417,19 +498,24 @@ impl PatternManager {
         let visit_nodes = visit_nodes.drain(..).map(|n| (n, RefEquality(nodes[n].variant.clone()))).collect();
 
         let constants = nodes.node_indices().filter_map(|n| {
-            nodes[n].as_variant::<NodeVariant::Constant>(token).map(|c| (n, 64, ConstPropagation::Constant(c.0 as i64)))
+            nodes[n].as_variant::<NodeVariant::Constant>(token).and_then(|c| {
+                let Some(Storage::Virtual(vreg)) = ports[nodes[n].sinks()[0]].storage.0 else { return None };
+                Some((n, Pattern::Constant64(VReg(vreg)), Set::singleton(n)))
+            })
+                //(n, 64, ConstPropagation::Constant(c.0 as i64)))
         }).collect::<Vec<_>>();
         let outgoing = nodes.node_indices().map(|n| {
             (n, nodes.edges(n).count().try_into().unwrap())
         }).collect::<Vec<_>>();
-        dbg!(constants.clone());
+        //dbg!(constants.clone());
         let mut ascent: AscentProgram::<'_> = AscentProgram::default();
+        ascent.pattern = constants; // feed in the constants as initial patterns
         ascent.token = vec![(RefEquality(token),)];
         ascent.kind = visit_nodes;
         ascent.edge = edges;
         ascent.state = states;
-        ascent.restricted = virt_map.iter().flat_map(|(i,v)| v.backing.map(|back| (*i as u16,back))).collect::<Vec<_>>();
-        ascent.constant = constants;
+        ascent.restricted = virt_map.iter().flat_map(|(i,v)| v.backing.map(|back| ((VReg(*i as u16),back)))).collect::<Vec<_>>();
+        //ascent.constant = constants;
         ascent.outgoing = outgoing;
         ascent.run();
 
@@ -468,8 +554,8 @@ impl PatternManager {
 
         let mut phase2 = ascent_run! {
             relation root(NodeIdx, Pattern, Set<NodeIdx>) = roots;
-            relation edge(PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16) = ascent.edge;
-            relation restricted(u16, RegSpec) = ascent.restricted;
+            relation edge(PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, VReg) = ascent.edge;
+            relation restricted(VReg, RegSpec) = ascent.restricted;
 
             // given a pattern and a root we can have a Pattern::variables function
             // that populates variables required as needed.
@@ -477,7 +563,7 @@ impl PatternManager {
 
             // We need all the external edges between patterns, which must be
             // allocated vregs.
-            relation external(PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16);
+            relation external(PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, VReg);
 
             // An edge is external if it is the result of a root node
             //external(a, b) <-- edge(a, b, _), root(b, _, _);
@@ -493,13 +579,13 @@ impl PatternManager {
             external(e, a, None, n, r) <-- edge(e, a, ?None, n, r);
         };
 
-        let mut observed = BTreeSet::<u16>::new();
+        let mut observed = BTreeSet::<VReg>::new();
         for external in phase2.external {
             println!("external {:?}", external);
             observed.insert(external.4);
         }
 
-        virt_map.retain(|k, v| observed.contains(&(*k as u16)));
+        virt_map.retain(|k, v| observed.contains(&VReg(*k as u16)));
         self.roots = phase2.root;
         self.toposorted = toposorted;
     }
@@ -514,7 +600,7 @@ impl PatternManager {
             (nodes[n].ro(token).as_ref() as &dyn Any).downcast_ref::<NodeVariant::Constant>().map(|c| (n, c.0))
         }).collect::<Vec<_>>();
 
-        let vregs = self.virt_map.iter().map(|(i, vr)| (*i as u16, vr.backing.unwrap())).collect::<Vec<(_,_)>>();
+        let vregs = self.virt_map.iter().map(|(i, vr)| (VReg(*i as u16), vr.backing.unwrap())).collect::<Vec<(_,_)>>();
         use crate::petgraph::visit::IntoEdgeReferences;
         // this is messy and state edges should probably work differently
         //let states_row = ports.edge_references().flat_map(|e| {
@@ -533,13 +619,13 @@ impl PatternManager {
         let mut binder = ascent_run! {
             struct VarBinder;
              // Indicated that Edge from A->B is the Nth input of B, which uses Vreg for storage
-            relation edge(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16) =
-                edges;
+            //relation edge(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, VReg) =
+            //    edges;
             // The physical register used for each vreg
-            relation vreg(u16, RegSpec) = vregs;
+            relation vreg(VReg, RegSpec) = vregs;
             // Indicates that Edge from A->B is the Nth output of A and Mth input of B, and uses State
-            relation state(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, Option<usize>, Option<usize>, u16) =
-                states;
+            //relation state(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, Option<usize>, Option<usize>, u16) =
+            //    states;
             // Nodes that are constant values
             relation constant(NodeIdx, isize) = constants;
             // Output the annotations that a node was given
@@ -548,48 +634,49 @@ impl PatternManager {
 
             // emit constants
             emit(c, CodegenFn(box move |ops| dynasm!(ops ;mov Rq(r0.num()), QWORD imm as i64))) <--
-                edge(e, ?Some(c), _, _, r),
-                vreg(r, ?&r0),
+                //edge(e, ?Some(c), _, _, r),
+                pattern(c, const_pattern, _),
+                if let (Pattern::Constant8(vreg)
+                    |Pattern::Constant16(vreg)
+                    |Pattern::Constant32(vreg)
+                    |Pattern::Constant64(vreg)) = const_pattern,
+                vreg(vreg, ?&r0),
                 constant(c, ?&imm) if { println!("constant with r0 class {:?}", r0.class()); r0.class() } == register_class::Q;
 
             // emit adds
             emit(add, CodegenFn(box move |ops| dynasm!(ops; add Rq(r_out.num()), Rq(r_in.num()) ))) <--
-                pattern(add, Pattern::AddRegReg, _),
-                edge(e2, _, Some(*add), 0, vr_out),
-                edge(e1, _, Some(*add), 1, vr_in),
+                pattern(add, ?Pattern::AddRegReg(vr_out, vr_in), _),
                 vreg(vr_out, ?&r_out),
                 vreg(vr_in, ?&r_in),
+                //edge(_, _, Some(*add), 0, vr_out_),
+                //edge(_, _, Some(*add), 1, vr_in_),
                 if r_in.class() == register_class::Q && r_out.class() == register_class::Q;
+                //if { dbg!(vr_out_, vr_out, vr_in_, vr_in); true };
 
-            emit(add, CodegenFn(box move |ops| dynasm!(ops; add Rq(r_out.num()), BYTE imm as i8 ))) <--
-                pattern(add, Pattern::AddRegConstant8, _),
-                edge(e2, _, Some(*add), 0, vr_out),
-                edge(e1, ?Some(c), Some(*add), 1, vr_in),
-                vreg(vr_out, ?&r_out),
-                constant(c, ?&imm),
-                if r_out.class() == register_class::Q;
+            //emit(add, { let imm = *imm; CodegenFn(box move |ops| dynasm!(ops; add Rq(r_out.num()), BYTE imm as i8 ))}) <--
+            //    pattern(add, ?Pattern::AddRegConstant8(vr_out, imm), _),
+            //    vreg(vr_out, ?&r_out),
+            //    if r_out.class() == register_class::Q;
 
             // emit inc
             emit(inc, CodegenFn(box move |ops| dynasm!(ops ;inc Rq(r0.num())))) <--
-                edge(e, ?Some(c), ?Some(inc), 0, r), pattern(inc, Pattern::Inc, _),
+                pattern(inc, ?Pattern::Inc(r), _),
                 vreg(r, ?&r0),
                 if r0.class() == register_class::Q;
 
             // emit jmps
             emit(jmp, CodegenFn(box move |ops| dynasm!(ops ;jmp Rq(r0.num())))) <--
-                edge(e, ?Some(c), ?Some(jmp), 0, r), pattern(jmp, Pattern::RegJmp, _),
+                pattern(jmp, ?Pattern::RegJmp(r), _),
                 vreg(r, ?&r0),
                 if r0.class() == register_class::Q;
 
             // emit basic blocks
-            emit(bentry, { let bb = *state as usize;
+            emit(bentry, { let bb = *bb as usize;
                 let label = *blocks.entry(bb).or_insert_with(|| ops.new_dynamic_label() );
                 CodegenFn(box move |ops| {
                     dynasm!(ops ; => label)
                 })})  <--
-                pattern(bentry, Pattern::BrEntry, _),
-                state(_, Some(*bentry), _, Some(0), _, ?state),
-                if matches!(states_map[*state as usize].variant, StateVariant::Block(_));
+                pattern(bentry, ?Pattern::BrEntry(bb), _);
             // emit jumps to basic blocks
             emit(bcall, { let bb = *bb as usize;
                 let label = blocks[&bb];
@@ -631,17 +718,13 @@ impl PatternManager {
 
             // emit movs
             emit(mov, CodegenFn(box |ops| () )) <--
-                pattern(mov, Pattern::MoveRegReg, _),
-                edge(e1, _, Some(*mov), _, vr_in),
-                edge(e2, Some(*mov), _, _, vr_out),
+                pattern(mov, ?Pattern::MoveRegReg(vr_out, vr_in), _),
                 vreg(vr_in, ?&r_in),
                 vreg(vr_out, ?&r_out),
                 if r_in == r_out;
 
             emit(mov, CodegenFn(box move |ops| dynasm!(ops; mov Rq(r_out.num()), Rq(r_in.num()) ))) <--
-                pattern(mov, Pattern::MoveRegReg, _),
-                edge(e1, _, Some(*mov), _, vr_in),
-                edge(e2, Some(*mov), _, _, vr_out),
+                pattern(mov, ?Pattern::MoveRegReg(vr_out, vr_in), _),
                 vreg(vr_in, ?&r_in),
                 vreg(vr_out, ?&r_out),
                 if r_in != r_out && r_in.class() == register_class::Q && r_out.class() == register_class::Q;
@@ -652,18 +735,14 @@ impl PatternManager {
                 CodegenFn(box move |ops|
                     dynasm!(ops; mov Rq(r_out.num()), QWORD [rsp+(ss*8).try_into().unwrap()]))
             } else { panic!() } }) <--
-                pattern(load, Pattern::LoadStackReg, _),
-                state(e, _, Some(*load), _, Some(0), ?state),
-                edge(e1, Some(*load), _, _, vr_out),
+                pattern(load, ?Pattern::LoadStackReg(state, vr_out), _),
                 vreg(vr_out, ?&r_out);
 
             emit(store, { if let StateVariant::Stack(ss) = states_map[*state as usize].variant {
                 CodegenFn(box move |ops|
                     dynasm!(ops; mov QWORD [rsp+(ss*8).try_into().unwrap()], Rq(r_in.num())))
             } else { panic!() } }) <--
-                pattern(store, Pattern::StoreStackReg, _),
-                state(e, _, Some(*store), _, Some(0), ?state),
-                edge(e1, _, Some(*store), 1, vr_in),
+                pattern(store, ?Pattern::StoreStackReg(state, vr_in), _),
                 vreg(vr_in, ?&r_in);
         };
         binder.emit.sort_by(|a, b| nodes[a.0].time.cmp(&nodes[b.0].time));
