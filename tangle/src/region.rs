@@ -670,9 +670,10 @@ impl Region {
     pub fn connect_block_params(&mut self, virts: &mut VirtualRegisterMap, token: &NodeOwner) {
         // we loop over all br_calls for a block, adding movs for all the parameters
         let mut vreg = 0;
-        for state in &self.states {
+        for state in &self.states.clone() {
             if let StateVariant::Block(bb) = state.variant {
                 let first_vreg = vreg;
+                let params = &self.nodes[bb].sinks()[1..];
                 for producer in &state.producers {
                     let producer_port = &self.ports[*producer];
                     let Some(producer) = producer_port.node else { continue };
@@ -682,11 +683,12 @@ impl Region {
                     // we have a br_call, move all the arguments for all the arguments
                     for (i, argument) in producer.sources()[1..].iter().enumerate() {
                         let use_reg = first_vreg+i;
-                        virts.entry(use_reg).or_insert_with(|| VirtualRegister { ports: vec![], hints: HashSet::new(), backing: None, allocated: false });
-                        self.ports[*argument].set_storage(Storage::Virtual(use_reg as u16));
-
                         // create new virtual register for the block param
-                        //virts.insert(reg.into(), );
+                        virts.entry(use_reg).or_insert_with(|| VirtualRegister { ports: vec![], hints: HashSet::new(), backing: None, allocated: false });
+                        //self.ports[*argument].set_storage(Storage::Virtual(use_reg as u16));
+                        // XXX: does regalloc actually handle inputs connects from two outputs rn?
+                        // probably not!
+                        self.connect_ports(*argument, params[i]);
                     }
                 }
                 for (i, param) in self.nodes[bb].sinks()[1..].iter().enumerate() {
@@ -694,7 +696,7 @@ impl Region {
                     virts.get(&use_reg).expect("bb_entry has a parameter, but no arguments");
                     vreg = max(vreg, use_reg);
                     // and set the br_entry parameter to the same storage
-                    self.ports[*param].set_storage(Storage::Virtual(use_reg as u16));
+                    //self.ports[*param].set_storage(Storage::Virtual(use_reg as u16));
                 }
             }
         }

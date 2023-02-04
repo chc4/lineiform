@@ -14,7 +14,7 @@ pub struct Function<ARG, OUT> {
     pub offset: (usize, usize),
     pub size: usize,
     pub instructions: Arc<Vec<Instruction>>,
-    pub pinned: Vec<(Location, JitValue)>,
+    pub pinned: Arc<Vec<(Location, JitValue)>>,
     _phantom: PhantomData<(ARG, OUT)>, //fn(data: *const c_void, ARG)->OUT
 }
 
@@ -41,7 +41,7 @@ pub enum BlockError {
 ///but the issue has ~0 traffic and no RFC, so I'm not holding my breath...
 impl<A, O> Function<A, O> {
     pub fn assume_args(mut self, pinning: Vec<(Location, JitValue)>) -> Self {
-        self.pinned = pinning;
+        self.pinned = Arc::new(pinning);
         self
     }
 
@@ -76,7 +76,7 @@ impl<A, O> Function<A, O> {
             offset: (f_off, inst_off),
             size: f_sym.st_size as usize,
             instructions: instructions,
-            pinned: Vec::new(),
+            pinned: Arc::new(Vec::new()),
             _phantom: PhantomData,
         })
     }

@@ -326,7 +326,7 @@ impl NodeBehavior for NodeVariant::BrEntry {
         let new_state = r.states.len();
         r.states.push(State {
             name: format!("bb{}", new_state),
-            variant: StateVariant::Block(NodeIdx::new(0)),
+            variant: StateVariant::Block(NodeIdx::new(0)), // this gets filled in by Region::observe_state_edges
             producers: vec![],
         });
 

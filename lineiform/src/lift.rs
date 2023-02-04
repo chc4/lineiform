@@ -243,7 +243,7 @@ pub struct Jit<'a> {
 #[derive(Debug)]
 enum EmitEffect {
     Advance,
-    Jmp(PortIdx),
+    Jmp(JitValue),
     Branch(PortIdx, PortIdx, usize),
     Call(usize),
     Ret(Option<usize>),
@@ -287,8 +287,6 @@ impl<'a> Jit<'a> {
 
 impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
     /// Translate a Function into Cranelift IR.
-    /// Calling conventions here are a bit weird: essentially we only ever build
-    ///
     fn translate<'a, A, O>
     (&mut self, f: Function<A, O>, jit: &mut Jit<'a>) -> Result<(), LiftError> {
         println!("translate for {}->{}", A_n, O_n);
@@ -320,18 +318,64 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
             };
             match pin {
                 JitValue::Const(c) => {
-                    let c = self.constant(c.0 as isize);
-                    self.store(oper_place, c, None);
+                    self.context.bound.insert(place, JitVariable::Known(JitValue::Const(c)));
+                    //let c = self.constant(c.0 as isize);
+                    //self.store(oper_place, c, None);
                 },
                 JitValue::Ref(r, o) if let JitValue::Frozen { addr, size} = *r => {
                     // for now just set it to a constant for the pointer
-                    let c = self.constant(addr as isize + o as isize);
-                    self.store(oper_place, c, None);
+                    self.context.bound.insert(place, JitVariable::Known(JitValue::Const(
+                        Wrapping((addr as isize + o as isize) as usize)
+                    )));
+                    //let c = self.constant(addr as isize + o as isize);
+                    //self.store(oper_place, c, None);
                 },
                 x => unimplemented!("pinned value {:?} = {:?}", oper_place, x)
             }
         }
 
+        // jit all the basic blocks
+        let mut need = vec![JitPath(f, f.region, variables)];
+        while let Some(next) = need.pop() {
+            let mut new = function_translator.translate(next)?;
+            need.append(&mut new);
+        }
+
+        // add function return values
+        if self.f.cont == Continuation::Return {
+            for i in 0..O_n {
+                let p = self.f.add_return(&mut self.ir);
+                println!("adding return {} -> {:?}", i, p);
+                match abi_ret[i] {
+                    AbiStorage::Register(r) => {
+                        let reg = self.port_for_register(ip, r);
+                        self.ir.in_region(self.f.region,|r, ir| {
+                            r.connect_ports(reg, p)
+                        });
+                    },
+                    _ => unimplemented!(),
+                }
+                // TODO
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct FunctionTranslator<'a, A, O> {
+    ir: &'a mut IR,
+    context: Context,
+    region: RegionIdx,
+    f: &'a mut Function<A, O>,
+}
+
+pub struct JitPath<A, O>(Function<A,O>, RegionIdx, Context);
+
+impl FunctionTranslator<'a, A, O> {
+    fn translate(&mut self, JitPath(f, blk, ctx): JitPath<A, O>) -> Result<(), LiftError> {
+        self.context = ctx;
+        self.region = blk;
         let mut base = (f.base as usize) + f.offset.0;
         let mut ip = base;
         println!("starting emitting @ base+0x{:x}", ip - jit.tracer.get_base()?);
@@ -356,6 +400,21 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                     i += 1;
                 },
                 EmitEffect::Jmp(p) => {
+                    if let JitValue::Const(c) = p {
+                        // TODO: for now we only care about tailcalls; if it's
+                        // inside the function region then it's internal flow control
+                        // and we will handle it later once we implement RVSDG
+                        // irreducable cfg; we will analyze the cfg before lifting
+                        // and build branches+tail controlled loop nodes for internal
+                        // jumps.
+                        // a jump table with an internal jump label might not work
+                        // with that? it would probably just turn into something
+                        // duplicated and not break, though.
+                        if target >= (f.base as usize) && target < (f.base as usize) + f.size {
+                            unimplemented!("internal jmp");
+                        }
+                        return 
+                    }
                     let mut tailcall = tangle::node::Node::leave();
 
                     // create input ports for all values that need to be alive for the
@@ -402,7 +461,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
 
                     // add the tailcall node to the graph, and also bind as inputs
                     // all the alive ports
-                    let (_, tailcall_o) = self.f.add_body(tailcall, &mut self.ir, |tailcall, ir| {
+                    let (_, tailcall_o) = self.ir.in_region(self.region, &mut self.ir, |tailcall, ir| {
                         tailcall.connect_input(0, p, ir);
                         for (i, (reg_port, input_port)) in reg_ports.iter().enumerate() {
                             tailcall.add_input(*input_port, ir);
@@ -425,24 +484,6 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
             }
         }
 
-        if self.f.cont == Continuation::Return {
-            for i in 0..O_n {
-                let p = self.f.add_return(&mut self.ir);
-                println!("adding return {} -> {:?}", i, p);
-                match abi_ret[i] {
-                    AbiStorage::Register(r) => {
-                        let reg = self.port_for_register(ip, r);
-                        self.ir.in_region(self.f.region,|r, ir| {
-                            r.connect_ports(reg, p)
-                        });
-                    },
-                    _ => unimplemented!(),
-                }
-                // TODO
-            }
-        }
-
-        Ok(())
     }
 
     fn emit(&mut self, ip: usize, inst: &Instruction) -> Result<EmitEffect, LiftError> {
@@ -450,6 +491,18 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
         let ms = inst.mem_size().and_then(|m| m.bytes_size());
         match inst.opcode() {
             Opcode::MOV => {
+                // If we have a mov that purely swaps registers, we can simply
+                // copy over the values instead of having to introduce an extraneous
+                // mov; this may save us work when doing optimizations.
+                match (inst.operand(0), inst.operand(1)) {
+                    (Operand::Register(r0), Operand::Register(r1)) => {
+                        println!("simple mov");
+                        self.context.bound.insert(Location::Reg(r0),
+                            self.context.bound.get(&Location::Reg(r1)).unwrap().clone());
+                        return Ok(EmitEffect::Advance)
+                    },
+                    _ => ()
+                };
                 // we need to support mov dword [eax+4], rcx and vice versa, so
                 // both the load and store need a mem_size for memory width.
                 let val = self.port_for(ip, inst.operand(1), ms);
@@ -508,14 +561,21 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                 }
             },
             Opcode::JMP => {
+                // We use jump_target, which calls operand_value, because if we
+                // can get a JitValue::Const for jump target immediately we should.
+                // This allows us to immediately start JITting tailcall closures
+                // without having to stop lifting, do an optimization pass, and
+                // then notice we have a jmp with a constant operand and lift
+                // again in the optimizer; that leads to a non-trivial amount of
+                // overhead, including emitting a lot of unneeded ports and edges
+                // for a Leave instruction.
                 let target = self.jump_target(inst.operand(0), ip, ms);
                 // If we know where the jump is going, we can try to inline
                 if let JitValue::Const(c) = target {
                     println!("known jump location: 0x{:x}", c.0);
-                    unimplemented!();
-                    //return Ok(EmitEffect::Jmp(c.0));
+                    return Ok(EmitEffect::Jmp(target));
                 } else if let JitValue::Value(v) = target {
-                    return Ok(EmitEffect::Jmp(v));
+                    return Ok(EmitEffect::Jmp(target));
                 }
             },
             Opcode::LEA => {
@@ -614,7 +674,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
                 Operand::RegDeref(_) |
                 Operand::RegDisp(_, _)
             ) => {
-                JitValue::Value(self.port_for(ip, absolute, ms))
+                self.operand_value(absolute, ip, ms)
             },
             relative @ (
                 Operand::ImmediateI8(_)  |
@@ -634,6 +694,21 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
         target
     }
 
+    /// Get the JitValue of an operand, of the correct width; if it can be represented
+    /// as a JitValue::Const attempt to do so. This function should be used sparingly
+    /// since baking too many constants in a JIT method may be inefficient.
+    fn operand_value(&mut self, op: Operand, ip: usize, ms: Option<u8>) -> JitValue {
+        let src = match op {
+            Operand::Register(r) => self.context.bound.get(&Location::Reg(r)).unwrap(),
+            _ => todo!(),
+        };
+        match src {
+            JitVariable::Known(val) => val.clone(),
+            x => unimplemented!("{:?}", x)
+        }
+    }
+
+    /// Return a port representing the current live value of the required register
     fn port_for_register(&mut self, ip: usize, reg: RegSpec) -> PortIdx {
         assert!(reg != RegSpec::rip());
         assert!(reg != RegSpec::rsp());
@@ -699,6 +774,7 @@ impl<const A_n: usize, const O_n: usize> JitFunction<A_n, O_n> {
         self.f.add_body(c, &mut self.ir, |c, r| { c.outputs[0] }).1
     }
 
+    // TODO: correct width of operands and output
     fn add(&mut self, left: PortIdx, right: PortIdx) -> PortIdx {
         let mut add_node = tangle::node::Node::simple(tangle::node::Operation::Add);
         self.f.add_body(add_node, &mut self.ir, |add_node, r| {
