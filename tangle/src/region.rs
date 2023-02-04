@@ -679,9 +679,13 @@ impl Region {
                     let Some(producer) = producer_port.node else { continue };
                     if producer == bb { continue };
                     let producer = &self.nodes[producer];
-                    let Some(call) = producer.as_variant::<NodeVariant::BrCall>(token) else { continue };
-                    // we have a br_call, move all the arguments for all the arguments
-                    for (i, argument) in producer.sources()[1..].iter().enumerate() {
+                    let args_start = if let Some(call) = producer.as_variant::<NodeVariant::BrCall>(token) {
+                        call.input_count()
+                    } else if let Some(bif) = producer.as_variant::<NodeVariant::BrIf>(token) {
+                        bif.input_count()
+                    } else { continue };
+                    // we have a block call, move all the arguments for all the arguments
+                    for (i, argument) in producer.sources()[args_start..].iter().enumerate() {
                         let use_reg = first_vreg+i;
                         // create new virtual register for the block param
                         virts.entry(use_reg).or_insert_with(|| VirtualRegister { ports: vec![], hints: HashSet::new(), backing: None, allocated: false });
@@ -691,13 +695,13 @@ impl Region {
                         self.connect_ports(*argument, params[i]);
                     }
                 }
-                for (i, param) in self.nodes[bb].sinks()[1..].iter().enumerate() {
-                    let use_reg = first_vreg+i;
-                    virts.get(&use_reg).expect("bb_entry has a parameter, but no arguments");
-                    vreg = max(vreg, use_reg);
-                    // and set the br_entry parameter to the same storage
-                    //self.ports[*param].set_storage(Storage::Virtual(use_reg as u16));
-                }
+                //for (i, param) in self.nodes[bb].sinks()[1..].iter().enumerate() {
+                //    let use_reg = first_vreg+i;
+                //    virts.get(&use_reg).expect("bb_entry has a parameter, but no arguments");
+                //    vreg = max(vreg, use_reg);
+                //    // and set the br_entry parameter to the same storage
+                //    //self.ports[*param].set_storage(Storage::Virtual(use_reg as u16));
+                //}
             }
         }
     }

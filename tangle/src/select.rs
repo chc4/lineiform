@@ -152,6 +152,12 @@ pub enum Pattern {
     Constant16Jmp,
     BrFuse,
     BrEntry,
+
+    BrIf0,
+    BrIf1,
+    BrIfDirectly,
+    BrIf,
+
     BrCall,
     RegJmp,
     MoveRegReg,
@@ -207,7 +213,7 @@ ascent! {
     // Indicated that Edge from nodes A->B is the Nth input of B, which uses Vreg for storage
     relation edge(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16);
     // Indicates there is a state edge from nodes A->B with stateid
-    relation state(crate::port::PortEdge, NodeIdx, NodeIdx, u16);
+    relation state(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, Option<usize>, Option<usize>, u16);
     // Indicates the storage of a Vreg is restricted to RegSpec
     relation restricted(u16, RegSpec);
     // Indicated what kind of operation a node is
@@ -277,6 +283,7 @@ ascent! {
 
     // basic block patterns
     // jmp constant
+    // br_if with constant selector
     pattern(jmp, Pattern::BrEntry, Set::singleton(*jmp)) <--
         token(?t), kind(jmp, ?jmp_kind),
         if variant::<NodeVariant::BrEntry>(t, jmp_kind);
@@ -284,19 +291,43 @@ ascent! {
         token(?t), kind(jmp, ?jmp_kind),
         if variant::<NodeVariant::BrCall>(t, jmp_kind);
 
+    // branch patterns
+    // br_if
+    pattern(bif, Pattern::BrIf, Set::singleton(*bif)) <--
+        token(?t), kind(bif, ?bif_kind),
+        if variant::<NodeVariant::BrIf>(t, bif_kind);
+    // br_if with a selector that is never observed otherwise; that means we can
+    // avoid materializing the value in a register.
+    pattern(bif, Pattern::BrIfDirectly, Set::singleton(*bif).join(Set::singleton(*selector))) <--
+        token(?t), kind(bif, ?bif_kind),
+        edge(e, ?Some(selector), Some(*bif), 0, _), outgoing(selector, 1),
+        if variant::<NodeVariant::BrIf>(t, bif_kind);
+
+    //// br_if with constant selector
+    //// it doesn't cover the constant, because we emit the direct branch even if there
+    //// is another use of the selector.
+    //pattern(bif, Pattern::BrIf0, Set::singleton(*bif)) <--
+    //    token(?t), kind(bif, ?bif_kind),
+    //    edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(0)),
+    //    if variant::<NodeVariant::BrIf>(t, bif_kind);
+    //pattern(bif, Pattern::BrIf1, Set::singleton(*bif)) <--
+    //    token(?t), kind(bif, ?bif_kind),
+    //    edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1)),
+    //    if variant::<NodeVariant::BrIf>(t, bif_kind);
+
     // fused brcall+entry with no other brcalls
     pattern(call, Pattern::BrFuse, Set::singleton(*call).join(Set::singleton(*entry))) <--
         token(?t), kind(call, ?call_kind), kind(entry, ?entry_kind),
         // this is backwards due to Region::create_dependencies creating inverse dependencies
-        state(e, entry, call, block),
-        agg incoming = ascent::aggregators::count() in state(_, entry, _, block),
+        state(e, Some(*entry), Some(*call), Some(0), Some(0), block),
+        agg incoming = ascent::aggregators::count() in state(_, Some(*entry), _, Some(0), _, block),
         if variant::<NodeVariant::BrCall>(t, call_kind) && variant::<NodeVariant::BrEntry>(t, entry_kind) && incoming == 1;
 }
 
 impl PatternManager {
     fn edges_row(&self, region: &Region) -> (
         Vec<(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, usize, u16)>,
-        Vec<(crate::port::PortEdge, NodeIdx, NodeIdx, u16)>
+        Vec<(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, Option<usize>, Option<usize>, u16)>
     ) {
         let Region { nodes, ports, sinks, .. } = region;
         let mut edges = Vec::with_capacity(nodes.edge_count());
@@ -317,11 +348,15 @@ impl PatternManager {
                             println!("new edge {:?}", new_edge);
                             edges.push(new_edge);
                         },
-                        Err(state) => { neighbor_port.node.map(|node| {
-                                let new_state = (e.id(), node, local, state);
-                                println!("new state {:?}", new_state);
-                                states.push(new_state);
-                        }); },
+                        Err(state) => {
+                            let output_idx = neighbor_port.node.map(|node| {
+                                nodes[node].outputs.iter().enumerate().find(|(i, p)| **p == e.target())
+                                .unwrap().0
+                            });
+                            let new_state = (e.id(), neighbor_port.node, Some(local), output_idx, Some(i), state);
+                            println!("new state {:?}", new_state);
+                            states.push(new_state);
+                        },
                     }
                 }
             }
@@ -443,8 +478,10 @@ impl PatternManager {
     }
 
     pub fn codegen<'a>(&mut self, token: &NodeOwner, region: &mut Region, ops: &mut Assembler) {
-        let (mut edges, states) = self.edges_row(region);
+        let (mut edges, states_row) = self.edges_row(region);
         let Region { nodes, ports, sinks, states, .. } = region;
+        let states_map = states;
+        let states = states_row;
 
         let constants = nodes.node_indices().flat_map(|n| {
             (nodes[n].ro(token).as_ref() as &dyn Any).downcast_ref::<NodeVariant::Constant>().map(|c| (n, c.0))
@@ -453,15 +490,15 @@ impl PatternManager {
         let vregs = self.virt_map.iter().map(|(i, vr)| (*i as u16, vr.backing.unwrap())).collect::<Vec<(_,_)>>();
         use crate::petgraph::visit::IntoEdgeReferences;
         // this is messy and state edges should probably work differently
-        let states_row = ports.edge_references().flat_map(|e| {
-            if let OptionalStorage(Some(Storage::Immaterial(Some(state)))) = ports[e.target()].storage {
-                ports[e.target()].node.map(|n| Some((n, state))).iter()
-                    .chain(ports[e.source()].node.map(|n| Some((n, state))).iter())
-                    .flatten().map(Clone::clone).collect::<Vec<_>>()
-            } else {
-                vec![]
-            }
-        }).collect::<Vec<_>>();
+        //let states_row = ports.edge_references().flat_map(|e| {
+        //    if let OptionalStorage(Some(Storage::Immaterial(Some(state)))) = ports[e.target()].storage {
+        //        ports[e.target()].node.map(|n| Some((n, state))).iter()
+        //            //.chain(ports[e.source()].node.map(|n| Some((n, state))).iter())
+        //            .flatten().map(|(n, state)| (n, state, nodes[n].sources().iter().find(|)).map(Clone::clone).collect::<Vec<_>>()
+        //    } else {
+        //        vec![]
+        //    }
+        //}).collect::<Vec<_>>();
 
         let mut clock = Timestamp::new();
         self.roots.sort_by(|a, b| nodes[a.0].time.cmp(&nodes[b.0].time));
@@ -473,8 +510,9 @@ impl PatternManager {
                 edges;
             // The physical register used for each vreg
             relation vreg(u16, RegSpec) = vregs;
-            // Indicates that a Node uses the state variable S
-            relation state(NodeIdx, u16) = states_row;
+            // Indicates that Edge from A->B is the Nth output of A and Mth input of B, and uses State
+            relation state(crate::port::PortEdge, Option<NodeIdx>, Option<NodeIdx>, Option<usize>, Option<usize>, u16) =
+                states;
             // Nodes that are constant values
             relation constant(NodeIdx, isize) = constants;
             // Output the annotations that a node was given
@@ -523,8 +561,8 @@ impl PatternManager {
                     dynasm!(ops ; => label)
                 })})  <--
                 pattern(bentry, Pattern::BrEntry, _),
-                state(bentry, ?state),
-                if matches!(states[*state as usize].variant, StateVariant::Block(_));
+                state(_, Some(*bentry), _, Some(0), _, ?state),
+                if matches!(states_map[*state as usize].variant, StateVariant::Block(_));
             // emit jumps to basic blocks
             emit(bcall, { let bb = *state as usize;
                 let label = blocks[&bb];
@@ -532,11 +570,27 @@ impl PatternManager {
                     dynasm!(ops ; jmp => label)
                 })})  <--
             pattern(bcall, Pattern::BrCall, _),
-            state(bcall, ?state),
-            if matches!(states[*state as usize].variant, StateVariant::Block(_));
+            state(_, _, Some(*bcall), _, Some(0), ?state),
+            if matches!(states_map[*state as usize].variant, StateVariant::Block(_));
             // emit fused brcall+entry
             emit(bfused, CodegenFn(box |ops| () )) <--
                 pattern(bfused, Pattern::BrFuse, _);
+
+            //// emit br_if with materialized selector
+            //emit(bif, { let bb = *state as usize;
+            //    let label = blocks[&bb];
+            //    CodegenFn(box move |ops| {
+            //        dynasm!(ops
+            //            ; test Rq(r0.num()), 0
+            //            ; jnz b1
+            //            ; jmp b0
+            //        )
+            //    })
+            //}) <--
+            //pattern(bif, Pattern::BrIf, _),
+            //state(bif, ?state),
+            //if matches!(states[*state as usize].variant, StateVariant::Block(_));
+            //    }
 
             // emit movs
             emit(mov, CodegenFn(box |ops| () )) <--
@@ -557,21 +611,21 @@ impl PatternManager {
 
             // emit stack load
             // XXX: this should probably do something else!
-            emit(load, { if let StateVariant::Stack(ss) = states[*state as usize].variant {
+            emit(load, { if let StateVariant::Stack(ss) = states_map[*state as usize].variant {
                 CodegenFn(box move |ops|
                     dynasm!(ops; mov Rq(r_out.num()), QWORD [rsp+(ss*8).try_into().unwrap()]))
             } else { panic!() } }) <--
                 pattern(load, Pattern::LoadStackReg, _),
-                state(load, ?state),
+                state(e, _, Some(*load), _, Some(0), ?state),
                 edge(e1, Some(*load), _, _, vr_out),
                 vreg(vr_out, ?&r_out);
 
-            emit(store, { if let StateVariant::Stack(ss) = states[*state as usize].variant {
+            emit(store, { if let StateVariant::Stack(ss) = states_map[*state as usize].variant {
                 CodegenFn(box move |ops|
                     dynasm!(ops; mov QWORD [rsp+(ss*8).try_into().unwrap()], Rq(r_in.num())))
             } else { panic!() } }) <--
                 pattern(store, Pattern::StoreStackReg, _),
-                state(store, ?state),
+                state(e, _, Some(*store), _, Some(0), ?state),
                 edge(e1, _, Some(*store), 1, vr_in),
                 vreg(vr_in, ?&r_in);
         };

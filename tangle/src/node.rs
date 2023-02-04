@@ -154,6 +154,8 @@ pub mod NodeVariant {
     pub struct BrEntry; // "Block Entry"; header of a basic block, source of bb params
     #[derive(Debug)]
     pub struct BrCall; // "Block Call"; jump to a block entry, with arguments
+    #[derive(Debug)]
+    pub struct BrIf; // "Branch If"; jump to either the first or second block's entry, with arguments, depending on the switch value.
     /// Tailcalls or jumps into native code are represented as Leave nodes.
     /// These nodes should have:
     ///     1) an input port for the address to jump to
@@ -365,6 +367,33 @@ impl NodeBehavior for NodeVariant::BrCall {
         "br_call".to_string()
     }
 }
+
+impl NodeBehavior for NodeVariant::BrIf {
+    fn input_count(&self) -> usize {
+        // takes as its first input the switch value, and the second and third as the 0 or 1 switch
+        // case.
+        3
+    }
+
+    fn output_count(&self) -> usize {
+        0
+    }
+
+    fn ports_callback(&mut self, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region) {
+        r.ports[inputs[1]].set_variant(EdgeVariant::State);
+        r.ports[inputs[2]].set_variant(EdgeVariant::State);
+    }
+
+    fn codegen(&self, token: &NodeOwner, inputs: Vec<PortIdx>, outputs: Vec<PortIdx>, r: &mut Region, ir: &mut IR, ops: &mut Assembler) {
+        panic!()
+    }
+
+    fn tag(&self) -> String {
+        "br_if".to_string()
+    }
+}
+
+
 
 impl NodeBehavior for NodeVariant::Simple {
     fn input_count(&self) -> usize {
@@ -715,6 +744,11 @@ impl Node {
     pub fn bcall() -> NodeVariant::BrCall {
         NodeVariant::BrCall
     }
+
+    pub fn bif() -> NodeVariant::BrIf {
+        NodeVariant::BrIf
+    }
+
 }
 
 
