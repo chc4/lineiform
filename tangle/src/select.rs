@@ -1,4 +1,4 @@
-#![deny(unreachable_code)]
+//#![deny(unreachable_code)]
 
 //! This is a graph pattern matcher based loosely off "Generating Instruction
 //! Selectors For Large Pattern Sets", Markus Schlegel.
@@ -144,21 +144,19 @@ impl<'a, T: ?Sized> Eq for RefEquality<&'a T> where RefEquality<&'a T>: PartialE
 
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(usize)]
 pub enum Pattern {
-    Constant8 = 0isize,
+    Constant8 = 0usize,
     Constant16,
     Constant32,
     Constant64,
     Constant16Jmp,
     BrFuse,
     BrEntry,
+    BrCall(u16 /* state */),
 
-    BrIf0,
-    BrIf1,
-    BrIfDirectly,
     BrIf,
 
-    BrCall,
     RegJmp,
     MoveRegReg,
     Inc,
@@ -287,8 +285,9 @@ ascent! {
     pattern(jmp, Pattern::BrEntry, Set::singleton(*jmp)) <--
         token(?t), kind(jmp, ?jmp_kind),
         if variant::<NodeVariant::BrEntry>(t, jmp_kind);
-    pattern(jmp, Pattern::BrCall, Set::singleton(*jmp)) <--
+    pattern(jmp, Pattern::BrCall(*block), Set::singleton(*jmp)) <--
         token(?t), kind(jmp, ?jmp_kind),
+        state(e, _, Some(*jmp), _, Some(0), block),
         if variant::<NodeVariant::BrCall>(t, jmp_kind);
 
     // branch patterns
@@ -298,30 +297,35 @@ ascent! {
         if variant::<NodeVariant::BrIf>(t, bif_kind);
     // br_if with a selector that is never observed otherwise; that means we can
     // avoid materializing the value in a register.
-    pattern(bif, Pattern::BrIfDirectly, Set::singleton(*bif).join(Set::singleton(*selector))) <--
+    //pattern(bif, Pattern::BrIfDirectly, Set::singleton(*bif).join(Set::singleton(*selector))) <--
+    //    token(?t), kind(bif, ?bif_kind),
+    //    edge(e, ?Some(selector), Some(*bif), 0, _), outgoing(selector, 1),
+    //    if variant::<NodeVariant::BrIf>(t, bif_kind);
+
+    // br_if with constant selector
+    // it doesn't cover the constant, because we emit the direct branch even if there
+    // is another use of the selector.
+    pattern(bif, Pattern::BrCall(*bb0), Set::singleton(*bif)) <--
         token(?t), kind(bif, ?bif_kind),
-        edge(e, ?Some(selector), Some(*bif), 0, _), outgoing(selector, 1),
+        edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(0)),
+        state(_, _, Some(*bif), _, Some(1), bb0),
+        if variant::<NodeVariant::BrIf>(t, bif_kind);
+    pattern(bif, Pattern::BrCall(*bb1), Set::singleton(*bif)) <--
+        token(?t), kind(bif, ?bif_kind),
+        state(_, _, Some(*bif), _, Some(2), bb1),
+        edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1)),
         if variant::<NodeVariant::BrIf>(t, bif_kind);
 
-    //// br_if with constant selector
-    //// it doesn't cover the constant, because we emit the direct branch even if there
-    //// is another use of the selector.
-    //pattern(bif, Pattern::BrIf0, Set::singleton(*bif)) <--
-    //    token(?t), kind(bif, ?bif_kind),
-    //    edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(0)),
-    //    if variant::<NodeVariant::BrIf>(t, bif_kind);
-    //pattern(bif, Pattern::BrIf1, Set::singleton(*bif)) <--
-    //    token(?t), kind(bif, ?bif_kind),
-    //    edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1)),
-    //    if variant::<NodeVariant::BrIf>(t, bif_kind);
-
     // fused brcall+entry with no other brcalls
-    pattern(call, Pattern::BrFuse, Set::singleton(*call).join(Set::singleton(*entry))) <--
-        token(?t), kind(call, ?call_kind), kind(entry, ?entry_kind),
+    pattern(call, Pattern::BrFuse, call_cover.clone().join(entry_cover.clone())) <--
+        pattern(call, ?Pattern::BrCall(block), call_cover),
+        pattern(entry, Pattern::BrEntry, entry_cover),
         // this is backwards due to Region::create_dependencies creating inverse dependencies
-        state(e, Some(*entry), Some(*call), Some(0), Some(0), block),
+        // this can't mention the port that the call uses, because it could be from a constant
+        // br_if
+        state(e, Some(*entry), Some(*call), Some(0), _, block),
         agg incoming = ascent::aggregators::count() in state(_, Some(*entry), _, Some(0), _, block),
-        if variant::<NodeVariant::BrCall>(t, call_kind) && variant::<NodeVariant::BrEntry>(t, entry_kind) && incoming == 1;
+        if incoming == 1;
 }
 
 impl PatternManager {
@@ -564,14 +568,12 @@ impl PatternManager {
                 state(_, Some(*bentry), _, Some(0), _, ?state),
                 if matches!(states_map[*state as usize].variant, StateVariant::Block(_));
             // emit jumps to basic blocks
-            emit(bcall, { let bb = *state as usize;
+            emit(bcall, { let bb = *bb as usize;
                 let label = blocks[&bb];
                 CodegenFn(box move |ops| {
                     dynasm!(ops ; jmp => label)
                 })})  <--
-            pattern(bcall, Pattern::BrCall, _),
-            state(_, _, Some(*bcall), _, Some(0), ?state),
-            if matches!(states_map[*state as usize].variant, StateVariant::Block(_));
+            pattern(bcall, ?Pattern::BrCall(bb), _);
             // emit fused brcall+entry
             emit(bfused, CodegenFn(box |ops| () )) <--
                 pattern(bfused, Pattern::BrFuse, _);
@@ -591,6 +593,18 @@ impl PatternManager {
             //state(bif, ?state),
             //if matches!(states[*state as usize].variant, StateVariant::Block(_));
             //    }
+            //emit(bif, { let bb0 = *bb0 as usize;
+            //    let bb0 = blocks[&bb0];
+            //    let bb1 = *bb1 as usize;
+            //    let bb1 = blocks[&bb1];
+            //    dbg!(bb0, bb1, vr_selector, r_selector);
+            //    unimplemented!()
+            //}) <--
+            //pattern(bif, Pattern::BrIfDirectly, _),
+            //edge(e0, _, Some(*bif), 0, vr_selector),
+            //vreg(vr_selector, ?&r_selector),
+            //state(e1, _, Some(*bif), _, Some(1), bb0),
+            //state(e2, _, Some(*bif), _, Some(2), bb1);
 
             // emit movs
             emit(mov, CodegenFn(box |ops| () )) <--
