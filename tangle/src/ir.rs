@@ -543,6 +543,66 @@ mod test {
     }
 
     #[test]
+    pub fn function_bb_if_always_1() {
+        let mut ir = IR::new();
+        let mut f = Node::function::<1, 1>(&mut ir);
+        let input = f.add_argument(&mut ir);
+        let output = f.add_return(&mut ir);
+
+        // entry[input]: zero = 0; br_if zero, bb0, bb1, input;
+        // bb0[bp0]: add bp0, 1; mov output, bp0;
+        // bb1[bp0]: add bp0, 2; mov output, bp0;
+
+        let mut bb = Node::bb();
+        let (bb0, bp_0) = f.add_body(bb, &mut ir, |bb, mut r| {
+            // create basic block parameter
+            (bb.sinks()[0], bb.add_output(&mut r))
+        }).1;
+        let mut bb = Node::bb();
+        let (bb1, bp_1) = f.add_body(bb, &mut ir, |bb, mut r| {
+            // create basic block parameter
+            (bb.sinks()[0], bb.add_output(&mut r))
+        }).1;
+
+        let mut one = f.add_body(Node::constant(1), &mut ir, |n, r| { n.sinks()[0] }).1;
+        let mut add = Node::simple(Operation::Add);
+        f.add_body(add, &mut ir, |add, r| {
+            add.connect_input(0, bp_0, r);
+            add.connect_input(1, one, r);
+            add.connect_output(0, output, r);
+        });
+
+        let mut two = f.add_body(Node::constant(2), &mut ir, |n, r| { n.sinks()[0] }).1;
+        let mut add = Node::simple(Operation::Add);
+        f.add_body(add, &mut ir, |add, r| {
+            add.connect_input(0, bp_1, r);
+            add.connect_input(1, two, r);
+            add.connect_output(0, output, r);
+        });
+
+        let mut one = f.add_body(Node::constant(1), &mut ir, |n, r| { n.sinks()[0] }).1;
+
+        let mut bif = Node::bif();
+        f.add_body(bif, &mut ir, |bif, mut r| {
+            // br_if zero, bb0, bb1
+            bif.connect_input(0, one, r);
+            bif.connect_input(1, bb0, r);
+            bif.connect_input(2, bb1, r);
+            // with arg0 = input
+            let arg = r.add_port();
+            r.connect_ports(input, arg);
+            bif.add_input(arg, &mut r);
+        });
+
+        ir.set_body(f);
+        let hello_fn: extern "C" fn(usize) -> usize = ir.compile_fn().unwrap().0;
+        assert_eq!(hello_fn(0), 2);
+        assert_eq!(hello_fn(1), 3);
+    }
+
+
+
+    #[test]
     pub fn function_use_stack() {
         let mut ir = IR::new();
         let mut f = Node::function::<1, 1>(&mut ir);

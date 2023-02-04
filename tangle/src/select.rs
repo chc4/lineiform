@@ -315,6 +315,29 @@ ascent! {
         state(_, _, Some(*bif), _, Some(2), bb1),
         edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1)),
         if variant::<NodeVariant::BrIf>(t, bif_kind);
+    // patterns that we can fold the selector entirely, and are on the only observer of it.
+    pattern(bif, Pattern::BrCall(*bb0), Set::singleton(*bif).join(c_cover.clone())) <--
+        token(?t), kind(bif, ?bif_kind),
+        pattern(c, const_pattern, c_cover),
+        edge(e, Some(*c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(0)),
+        state(_, _, Some(*bif), _, Some(1), bb0),
+        if variant::<NodeVariant::BrIf>(t, bif_kind)
+        && matches!(const_pattern,
+                    Pattern::Constant8 |
+                    Pattern::Constant16 |
+                    Pattern::Constant32 |
+                    Pattern::Constant64);
+    pattern(bif, Pattern::BrCall(*bb1), Set::singleton(*bif).join(c_cover.clone())) <--
+        token(?t), kind(bif, ?bif_kind),
+        pattern(c, const_pattern, c_cover),
+        edge(e, Some(*c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1)),
+        state(_, _, Some(*bif), _, Some(2), bb1),
+        if variant::<NodeVariant::BrIf>(t, bif_kind)
+        && matches!(const_pattern,
+                    Pattern::Constant8 |
+                    Pattern::Constant16 |
+                    Pattern::Constant32 |
+                    Pattern::Constant64);
 
     // fused brcall+entry with no other brcalls
     pattern(call, Pattern::BrFuse, call_cover.clone().join(entry_cover.clone())) <--
