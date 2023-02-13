@@ -156,7 +156,7 @@ pub enum Pattern {
     BrEntry(u16),
     BrCall(u16 /* state */),
 
-    BrIf,
+    BrIf(u16, u16),
 
     RegJmp(VReg),
     MoveRegReg(VReg, VReg),
@@ -169,7 +169,7 @@ pub enum Pattern {
     LoadStackReg(u16, VReg),
 }
 
-use ascent::Lattice;
+use ascent::{Lattice, Dual};
 impl Lattice for Pattern {
     fn meet(self, other: Self) -> Self {
         self.min(other)
@@ -287,6 +287,48 @@ ascent! {
     relation outgoing(NodeIdx, u8);
     // Output the annotations that a node was given
     lattice pattern(NodeIdx, Pattern, Set<NodeIdx>);
+    // Basic blocks, and which nodes are contained with them.
+    lattice block(u16, Set<NodeIdx>);
+    // Basic blocks that can be merged together, because the only edge out of pred
+    // is to succ and the only edge into succ is from pred.
+    relation block_merge(NodeIdx, NodeIdx);
+    // Control flow edges from BB0 -> BB1,BBn exists. This needs to handle removing
+    // edges while the query runs, since if we are able to constant fold an edge
+    // then we meet the set instead of union. This is fine because, due to being
+    // basic blocks, there are never two producers of control flow edges in a block.
+    lattice cfg(u16, Option<Dual<Set<u16>>>);
+
+    // Blocks all start at entry nodes
+    block(bb, entry_set.clone()) <--
+          pattern(entry, ?Pattern::BrEntry(bb), entry_set);
+    // Propagate block membership downward
+    block(bb, start.clone().join(Set::singleton(*next))) <--
+        block(bb, start),
+        for &node in start.iter(),
+        pattern(node, node_pat, _),
+        if !matches!(node_pat, Pattern::BrCall(_) | Pattern::BrIf(_, _)),
+        edge(e, Some(*node), ?Some(next), _, _);
+    // Propagate block membership upward. This probably should be different, since
+    // when we dedup node we'll have values that are used in two different blocks,
+    // and it instead needs to be put in the block that dominates both instead...
+    // Without dedup we don't have a problem, since uses of values shouldn't cross
+    // blocks except as block params
+    block(bb, dst.clone().join(Set::singleton(*src))) <--
+        block(bb, dst),
+        for &node in dst.iter(),
+        edge(e, ?Some(src), Some(node), _, _),
+        pattern(node, node_pat, _);
+
+    // BrCalls to blocks are from the block the call is within
+    cfg(bb0, Some(Dual(Set::singleton(*bb1)))) <--
+        pattern(bcall, ?Pattern::BrCall(bb1), _),
+        block(bb0, bb_0_nodes),
+        if bb_0_nodes.contains(bcall);
+    // BrIf to blocks are from the block the if is within
+    cfg(bb0, Some(Dual(Set::singleton(*bb1).join(Set::singleton(*bb2))))) <--
+        pattern(bif, ?Pattern::BrIf(bb1, bb2), _),
+        block(bb0, bb_0_nodes),
+        if bb_0_nodes.contains(bif);
 
     // If we can emit a wider constant as a u8, do
     pattern(n, Pattern::Constant8(*vreg), const_cover) <--
@@ -327,10 +369,10 @@ ascent! {
         edge(_, _, Some(*n), 1, right),
         token(?t), kind(n, ?c), if operation(t, c, Operation::Add);
 
-    //pattern(add, Pattern::AddRegConstant8(*left, *c_val as i8), add_cover.clone().join(Set::singleton(*c))) <--
-    //    token(?t), kind(add, ?add_kind),
-    //    pattern(add, ?Pattern::AddRegReg(left, right), add_cover),
-    //    edge(e, ?Some(c), Some(*add), 1, _), constant(c, 8, ?ConstPropagation::Constant(c_val)), outgoing(c, 1);
+    pattern(add, Pattern::AddRegConstant8(*left, *c_val as i8), add_cover.clone().join(Set::singleton(*c))) <--
+        token(?t), kind(add, ?add_kind),
+        pattern(add, ?Pattern::AddRegReg(left, right), add_cover),
+        edge(e, ?Some(c), Some(*add), 1, _), constant(c, 8, ?ConstPropagation::Constant(c_val)), outgoing(c, 1);
 
     // Mov patterns
     // mov reg, _
@@ -374,8 +416,10 @@ ascent! {
 
     // branch patterns
     // br_if
-    pattern(bif, Pattern::BrIf, Set::singleton(*bif)) <--
+    pattern(bif, Pattern::BrIf(*bb0, *bb1), Set::singleton(*bif)) <--
         token(?t), kind(bif, ?bif_kind),
+        state(_, _, Some(*bif), _, Some(1), bb0),
+        state(_, _, Some(*bif), _, Some(2), bb1),
         if variant::<NodeVariant::BrIf>(t, bif_kind);
     // br_if with a selector that is never observed otherwise; that means we can
     // avoid materializing the value in a register.
@@ -387,38 +431,36 @@ ascent! {
     // br_if with constant selector
     // it doesn't cover the constant, because we emit the direct branch even if there
     // is another use of the selector.
-    pattern(bif, Pattern::BrCall(*bb0), Set::singleton(*bif)) <--
+    pattern(bif, Pattern::BrCall(*bb0), bif_set.clone()) <--
         token(?t), kind(bif, ?bif_kind),
-        edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(0)),
-        state(_, _, Some(*bif), _, Some(1), bb0),
-        if variant::<NodeVariant::BrIf>(t, bif_kind);
-    pattern(bif, Pattern::BrCall(*bb1), Set::singleton(*bif)) <--
+        pattern(bif, ?Pattern::BrIf(bb0, bb1), bif_set),
+        edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(0));
+    pattern(bif, Pattern::BrCall(*bb1), bif_set.clone()) <--
         token(?t), kind(bif, ?bif_kind),
-        state(_, _, Some(*bif), _, Some(2), bb1),
-        edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1)),
-        if variant::<NodeVariant::BrIf>(t, bif_kind);
+        pattern(bif, ?Pattern::BrIf(bb0, bb1), bif_set),
+        edge(e, ?Some(c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1));
     // patterns that we can fold the selector entirely, and are on the only observer of it.
-    pattern(bif, Pattern::BrCall(*bb0), Set::singleton(*bif).join(c_cover.clone())) <--
-        token(?t), kind(bif, ?bif_kind),
-        pattern(c, const_pattern, c_cover),
-        edge(e, Some(*c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(0)),
-        state(_, _, Some(*bif), _, Some(1), bb0),
-        if variant::<NodeVariant::BrIf>(t, bif_kind),
-        if let (Pattern::Constant8(vreg)
-            |Pattern::Constant16(vreg)
-            |Pattern::Constant32(vreg)
-            |Pattern::Constant64(vreg)) = const_pattern;
+    //pattern(bif, Pattern::BrCall(*bb0), Set::singleton(*bif).join(c_cover.clone())) <--
+    //    token(?t), kind(bif, ?bif_kind),
+    //    pattern(c, const_pattern, c_cover),
+    //    edge(e, Some(*c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(0)),
+    //    state(_, _, Some(*bif), _, Some(1), bb0),
+    //    if variant::<NodeVariant::BrIf>(t, bif_kind),
+    //    if let (Pattern::Constant8(vreg)
+    //        |Pattern::Constant16(vreg)
+    //        |Pattern::Constant32(vreg)
+    //        |Pattern::Constant64(vreg)) = const_pattern;
 
-    pattern(bif, Pattern::BrCall(*bb1), Set::singleton(*bif).join(c_cover.clone())) <--
-        token(?t), kind(bif, ?bif_kind),
-        pattern(c, const_pattern, c_cover),
-        edge(e, Some(*c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1)),
-        state(_, _, Some(*bif), _, Some(2), bb1),
-        if variant::<NodeVariant::BrIf>(t, bif_kind),
-        if let (Pattern::Constant8(vreg)
-            |Pattern::Constant16(vreg)
-            |Pattern::Constant32(vreg)
-            |Pattern::Constant64(vreg)) = const_pattern;
+    //pattern(bif, Pattern::BrCall(*bb1), Set::singleton(*bif).join(c_cover.clone())) <--
+    //    token(?t), kind(bif, ?bif_kind),
+    //    pattern(c, const_pattern, c_cover),
+    //    edge(e, Some(*c), Some(*bif), 0, _), constant(c, _, ConstPropagation::Constant(1)),
+    //    state(_, _, Some(*bif), _, Some(2), bb1),
+    //    if variant::<NodeVariant::BrIf>(t, bif_kind),
+    //    if let (Pattern::Constant8(vreg)
+    //        |Pattern::Constant16(vreg)
+    //        |Pattern::Constant32(vreg)
+    //        |Pattern::Constant64(vreg)) = const_pattern;
 
     // fused brcall+entry with no other brcalls
     pattern(call, Pattern::BrFuse, call_cover.clone().join(entry_cover.clone())) <--
@@ -520,6 +562,12 @@ impl PatternManager {
         ascent.run();
 
         println!("after ascent");
+        for block in ascent.block {
+            println!("block {} - {:?}", block.0, block.1.iter());
+        }
+        for cfg in ascent.cfg {
+            println!("cfg {} -> {:?}", cfg.0, cfg.1.unwrap().iter());
+        }
         let mut emitted: Option<BTreeSet<_>> = None;
         ascent.pattern.sort_by(|a, b|
             toposorted[&a.0].cmp(&toposorted[&b.0]).reverse()
@@ -653,10 +701,10 @@ impl PatternManager {
                 if r_in.class() == register_class::Q && r_out.class() == register_class::Q;
                 //if { dbg!(vr_out_, vr_out, vr_in_, vr_in); true };
 
-            //emit(add, { let imm = *imm; CodegenFn(box move |ops| dynasm!(ops; add Rq(r_out.num()), BYTE imm as i8 ))}) <--
-            //    pattern(add, ?Pattern::AddRegConstant8(vr_out, imm), _),
-            //    vreg(vr_out, ?&r_out),
-            //    if r_out.class() == register_class::Q;
+            emit(add, { let imm = *imm; CodegenFn(box move |ops| dynasm!(ops; add Rq(r_out.num()), BYTE imm as i8 ))}) <--
+                pattern(add, ?Pattern::AddRegConstant8(vr_out, imm), _),
+                vreg(vr_out, ?&r_out),
+                if r_out.class() == register_class::Q;
 
             // emit inc
             emit(inc, CodegenFn(box move |ops| dynasm!(ops ;inc Rq(r0.num())))) <--
